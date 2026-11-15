@@ -61,7 +61,8 @@ func Mount(ctx context.Context, vol *vfs.Volume, mountpoint string) error {
 // root at 1.
 type server struct {
 	fuseutil.NotImplementedFileSystem
-	vol *vfs.Volume
+	vol   *vfs.Volume
+	group *committer
 
 	mu      sync.Mutex
 	next    fuseops.HandleID
@@ -69,7 +70,7 @@ type server struct {
 }
 
 func newServer(vol *vfs.Volume) *server {
-	return &server{vol: vol, next: 1, handles: map[fuseops.HandleID]*vfs.File{}}
+	return &server{vol: vol, group: newCommitter(vol), next: 1, handles: map[fuseops.HandleID]*vfs.File{}}
 }
 
 func attrs(in vfs.Inode) fuseops.InodeAttributes {
@@ -262,11 +263,11 @@ func (s *server) WriteFile(ctx context.Context, op *fuseops.WriteFileOp) error {
 // A commit is not abandoned halfway because the kernel interrupted the call: it is
 // repeatable and safe to finish, so it runs to its end.
 func (s *server) SyncFile(ctx context.Context, _ *fuseops.SyncFileOp) error {
-	return errno(commit(ctx, s.vol))
+	return errno(s.group.commit(ctx))
 }
 
 func (s *server) FlushFile(ctx context.Context, _ *fuseops.FlushFileOp) error {
-	return errno(commit(context.WithoutCancel(ctx), s.vol)) // close(2) is not restarted: wait for the commit
+	return errno(s.group.commit(context.WithoutCancel(ctx))) // close(2) is not restarted: wait for the commit
 }
 
 func (s *server) ReleaseFileHandle(_ context.Context, op *fuseops.ReleaseFileHandleOp) error {

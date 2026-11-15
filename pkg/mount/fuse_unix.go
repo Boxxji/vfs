@@ -54,32 +54,37 @@ func Mount(ctx context.Context, vol *vfs.Volume, mountpoint string) error {
 	}()
 
 	var serveErr error
-	if err := bzfs.New(conn, nil).Serve(&root{vol: vol, base: ctx}); err != nil {
+	if err := bzfs.New(conn, nil).Serve(&root{s: newSession(ctx, vol)}); err != nil {
 		serveErr = fmt.Errorf("fuse.Serve: %w", err)
 	}
 	return finish(vol, serveErr)
 }
 
-// root is the file system. base is the Mount context: the work of a read runs on
-// it, not on the request that asked, so an interrupted request abandons only its wait.
-type root struct {
-	vol  *vfs.Volume
-	base context.Context
-}
+// root is the file system.
+type root struct{ s *session }
 
 var _ bzfs.FS = (*root)(nil)
 
 func (r *root) Root() (bzfs.Node, error) {
-	return &node{vol: r.vol, base: r.base, ino: vfs.RootInode, parent: vfs.RootInode}, nil
+	return r.s.node(vfs.RootInode, vfs.RootInode), nil
 }
 
 // node is a file or directory, named by its inode.
+//
+// A node is built only by session.node, so it always carries the session: the
+// Volume, the mount's context and the committer. A struct literal would leave the
+// context nil, and a store client that uses its context would panic on the first read.
 type node struct {
-	vol    *vfs.Volume
-	base   context.Context
+	s      *session
 	ino    vfs.InodeID
 	parent vfs.InodeID // for ".."; every inode has one name, so one parent
 }
+
+// node returns the node of an inode of this mount.
+func (s *session) node(ino, parent vfs.InodeID) *node { return &node{s: s, ino: ino, parent: parent} }
+
+// handle returns the handle of a file opened on this mount.
+func (s *session) handle(f *vfs.File) *handle { return &handle{s: s, file: f} }
 
 var (
 	_ bzfs.Node               = (*node)(nil)
@@ -108,7 +113,7 @@ func attr(a *fuse.Attr, in vfs.Inode) {
 }
 
 func (n *node) Attr(ctx context.Context, a *fuse.Attr) error {
-	in, err := n.vol.Stat(ctx, n.ino)
+	in, err := n.s.vol.Stat(ctx, n.ino)
 	if err != nil {
 		return errno(err)
 	}
@@ -117,15 +122,15 @@ func (n *node) Attr(ctx context.Context, a *fuse.Attr) error {
 }
 
 func (n *node) Lookup(ctx context.Context, name string) (bzfs.Node, error) {
-	in, err := n.vol.Lookup(ctx, n.ino, name)
+	in, err := n.s.vol.Lookup(ctx, n.ino, name)
 	if err != nil {
 		return nil, errno(err)
 	}
-	return &node{vol: n.vol, ino: in.ID, parent: n.ino}, nil
+	return n.s.node(in.ID, n.ino), nil
 }
 
 func (n *node) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
-	ents, err := n.vol.ReadDir(ctx, n.ino)
+	ents, err := n.s.vol.ReadDir(ctx, n.ino)
 	if err != nil {
 		return nil, errno(err)
 	}
@@ -147,30 +152,30 @@ func (n *node) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 
 func (n *node) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (bzfs.Node, error) {
 	ctx = context.WithoutCancel(ctx) // not answered EINTR: see errno.go
-	in, err := n.vol.Mkdir(ctx, n.ino, req.Name, req.Mode.Perm())
+	in, err := n.s.vol.Mkdir(ctx, n.ino, req.Name, req.Mode.Perm())
 	if err != nil {
 		return nil, errno(err)
 	}
-	return &node{vol: n.vol, ino: in.ID, parent: n.ino}, nil
+	return n.s.node(in.ID, n.ino), nil
 }
 
 func (n *node) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.CreateResponse) (bzfs.Node, bzfs.Handle, error) {
 	ctx = context.WithoutCancel(ctx) // not answered EINTR: see errno.go
-	in, err := n.vol.Create(ctx, n.ino, req.Name, req.Mode.Perm())
+	in, err := n.s.vol.Create(ctx, n.ino, req.Name, req.Mode.Perm())
 	if err != nil {
 		return nil, nil, errno(err)
 	}
-	f, err := n.vol.Open(ctx, in.ID)
+	f, err := n.s.vol.Open(ctx, in.ID)
 	if err != nil {
 		return nil, nil, errno(err)
 	}
 	attr(&resp.Attr, in)
-	return &node{vol: n.vol, base: n.base, ino: in.ID, parent: n.ino}, &handle{vol: n.vol, base: n.base, file: f}, nil
+	return n.s.node(in.ID, n.ino), n.s.handle(f), nil
 }
 
 func (n *node) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 	ctx = context.WithoutCancel(ctx) // not answered EINTR: see errno.go
-	return errno(n.vol.Remove(ctx, n.ino, req.Name))
+	return errno(n.s.vol.Remove(ctx, n.ino, req.Name))
 }
 
 // Rename, Link and Symlink are not built: they answer "not supported".
@@ -192,11 +197,11 @@ func (n *node) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 		return unsupported
 	}
 	if req.Valid.Size() {
-		if err := n.vol.Truncate(ctx, n.ino, req.Size); err != nil {
+		if err := n.s.vol.Truncate(ctx, n.ino, req.Size); err != nil {
 			return errno(err)
 		}
 	}
-	in, err := n.vol.Stat(ctx, n.ino)
+	in, err := n.s.vol.Stat(ctx, n.ino)
 	if err != nil {
 		return errno(err)
 	}
@@ -206,7 +211,7 @@ func (n *node) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 
 func (n *node) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenResponse) (bzfs.Handle, error) {
 	ctx = context.WithoutCancel(ctx) // not answered EINTR: see errno.go
-	in, err := n.vol.Stat(ctx, n.ino)
+	in, err := n.s.vol.Stat(ctx, n.ino)
 	if err != nil {
 		return nil, errno(err)
 	}
@@ -214,25 +219,24 @@ func (n *node) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenR
 		return n, nil // served by ReadDirAll
 	}
 	if req.Flags&fuse.OpenFlags(os.O_TRUNC) != 0 {
-		if err := n.vol.Truncate(ctx, n.ino, 0); err != nil {
+		if err := n.s.vol.Truncate(ctx, n.ino, 0); err != nil {
 			return nil, errno(err)
 		}
 	}
-	f, err := n.vol.Open(ctx, n.ino)
+	f, err := n.s.vol.Open(ctx, n.ino)
 	if err != nil {
 		return nil, errno(err)
 	}
-	return &handle{vol: n.vol, base: n.base, file: f}, nil
+	return n.s.handle(f), nil
 }
 
 func (n *node) Fsync(ctx context.Context, _ *fuse.FsyncRequest) error {
-	return errno(commit(ctx, n.vol))
+	return errno(n.s.group.commit(ctx))
 }
 
 // handle is an open file.
 type handle struct {
-	vol  *vfs.Volume
-	base context.Context
+	s    *session
 	file *vfs.File
 }
 
@@ -246,7 +250,7 @@ var (
 
 func (h *handle) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse) error {
 	size, off := req.Size, req.Offset
-	data, err := own(context.WithoutCancel(ctx), h.base, func(c context.Context) ([]byte, error) {
+	data, err := own(context.WithoutCancel(ctx), h.s.base, func(c context.Context) ([]byte, error) {
 		buf := make([]byte, size)
 		n, err := h.file.ReadAt(c, buf, off)
 		if err != nil && !errors.Is(err, io.EOF) {
@@ -279,7 +283,7 @@ func (h *handle) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.W
 // runs on a context of its own either way. Fsync, which callers do restart, abandons
 // only its wait.
 func (h *handle) Flush(ctx context.Context, _ *fuse.FlushRequest) error {
-	return errno(commit(context.WithoutCancel(ctx), h.vol))
+	return errno(h.s.group.commit(context.WithoutCancel(ctx)))
 }
 
 func (h *handle) Release(context.Context, *fuse.ReleaseRequest) error {

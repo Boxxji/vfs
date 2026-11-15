@@ -87,7 +87,7 @@ func TestTreeForcedCuts(t *testing.T) {
 			if !strings.HasPrefix(k, "meta/") {
 				continue
 			}
-			plain, err := unseal(plainCipher{}, []byte("test"), frame)
+			plain, err := unseal(plainCipher{}, bind("test"), frame)
 			if err != nil {
 				t.Fatal(err)
 			}

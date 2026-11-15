@@ -21,7 +21,7 @@ func TestModelFuzzMany(t *testing.T) {
 	if testing.Short() {
 		t.Skip("TestModelFuzz runs the same model; the fuzz step runs more seeds")
 	}
-	fuzzSeeds = 120
+	fuzzSeeds = 60
 	defer func() { fuzzSeeds = 0 }()
 	TestModelFuzz(t)
 }

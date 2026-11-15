@@ -32,64 +32,88 @@ func expected(t *testing.T) (one, two map[string]string) {
 	return one, snapshot(t, v)
 }
 
-// TestFailureAtEveryWrite: a Flush that fails at its Nth write, for every N it
-// makes, leaves the store at the previous Head: a fresh Open sees exactly state
-// one, whatever chunks, packs and shards the failed Flush managed to upload. A
-// retry on the same Volume then commits state two.
+// TestFailureAtEveryWrite: a Flush that fails at any one of its writes leaves the
+// store at the previous Head: a fresh Open sees exactly state one, whatever chunks,
+// packs and shards the failed Flush managed to upload. A retry on the same Volume
+// then commits state two.
+//
+// Every Volume draws its own identity and chunking seed, so the number of shards a
+// commit writes differs from one Volume to the next. The writes are therefore named
+// by kind and by their number within the kind (the second shard, the pack, the
+// Head), and for each kind the sweep goes on until it reaches a number the commit
+// does not make, which is then a commit that simply succeeds.
 func TestFailureAtEveryWrite(t *testing.T) {
 	one, two := expected(t)
 
-	// Count the writes of the Flush that moves from one to two.
-	writes := func(failAt int) (*storetest.Mem, vfs.Cipher, *vfs.Volume, *int, *error) {
-		mem := storetest.NewMem()
+	kind := func(key string) string {
+		switch {
+		case strings.HasPrefix(key, "pack/"):
+			return "pack"
+		case strings.HasPrefix(key, "meta/"):
+			return "shard"
+		}
+		return "head"
+	}
+	// run commits state two on a fresh Volume, failing the nth write of a kind (n 0
+	// fails none). It reports how many writes of the kind the commit made.
+	run := func(want string, nth int) (made int, mem *storetest.Mem, c vfs.Cipher, v *vfs.Volume, err error, boom error) {
+		mem = storetest.NewMem()
 		hook := &storetest.Hook{Backend: mem}
-		c := vfsAge(t)
+		c = vfsAge(t)
 		if err := vfs.Create(ctx, cfg(hook, c, 0)); err != nil {
 			t.Fatal(err)
 		}
-		v, err := vfs.Attach(ctx, cfg(hook, c, 1))
-		if err != nil {
-			t.Fatal(err)
+		v, aerr := vfs.Attach(ctx, cfg(hook, c, 1))
+		if aerr != nil {
+			t.Fatal(aerr)
 		}
 		stateOne(t, v)
 		flush(t, v)
 		stateTwo(t, v)
-		n := 0
-		var boom error = errors.New("injected")
+		boom = errors.New("injected")
 		hook.Before = func(op, key string) error {
-			n++
-			if n == failAt {
+			if kind(key) != want {
+				return nil
+			}
+			made++
+			if made == nth {
 				return boom
 			}
 			return nil
 		}
-		return mem, c, v, &n, &boom
+		err = v.Flush(ctx)
+		return made, mem, c, v, err, boom
 	}
 
-	_, _, v, n, _ := writes(0)
-	flush(t, v)
-	total := *n
+	total := 0
+	for _, want := range []string{"pack", "shard", "head"} {
+		for nth := 1; ; nth++ {
+			made, mem, c, v, err, boom := run(want, nth)
+			if made < nth { // the commit has fewer writes of this kind: it was not failed
+				if err != nil {
+					t.Fatalf("%s write %d never came, yet Flush = %v", want, nth, err)
+				}
+				sameSnapshot(t, fmt.Sprintf("a commit with %d %s writes", made, want), snapshot(t, reopen(t, mem, c)), two)
+				if nth == 1 {
+					t.Fatalf("a commit that makes no %s write: the sweep proves nothing about it", want)
+				}
+				break
+			}
+			total++
+			if !errors.Is(err, boom) {
+				t.Fatalf("%s write %d: Flush = %v, want the injected error", want, nth, err)
+			}
+			sameSnapshot(t, fmt.Sprintf("failure at %s write %d", want, nth), snapshot(t, reopen(t, mem, c)), one)
+
+			// The Volume kept its changes: a retry commits them.
+			flush(t, v)
+			sameSnapshot(t, fmt.Sprintf("retry after %s write %d", want, nth), snapshot(t, reopen(t, mem, c)), two)
+		}
+	}
 	if total < 4 {
-		t.Fatalf("the flush made only %d writes; the sweep would prove little", total)
+		t.Fatalf("only %d writes were failed; the sweep would prove little", total)
 	}
-	t.Logf("the flush from state one to state two makes %d writes", total)
-
-	for failAt := 1; failAt <= total; failAt++ {
-		// Under -short try the first write, the last two and every fourth between:
-		// the full sweep runs without it.
-		if testing.Short() && failAt > 1 && failAt < total-1 && failAt%4 != 0 {
-			continue
-		}
-		mem, c, v, _, boom := writes(failAt)
-		if err := v.Flush(ctx); !errors.Is(err, *boom) {
-			t.Fatalf("write %d/%d: Flush = %v, want the injected error", failAt, total, err)
-		}
-		sameSnapshot(t, fmt.Sprintf("failure at write %d/%d", failAt, total), snapshot(t, reopen(t, mem, c)), one)
-
-		// The Volume kept its changes: a retry commits them.
-		flush(t, v)
-		sameSnapshot(t, fmt.Sprintf("retry after write %d/%d", failAt, total), snapshot(t, reopen(t, mem, c)), two)
-	}
+	t.Logf("%d writes failed in turn, one at a time (pack, shards, Head)", total)
 }
 
 // TestLostAcknowledgementOfHead: the Head write lands but its reply is lost. The
@@ -224,6 +248,11 @@ func TestSigkill(t *testing.T) {
 	}{
 		{"pack", one}, {"packed", one}, {"shard", one}, {"sharded", one}, {"head", one}, {"landed", two},
 	} {
+		// Under -short the three stages that differ in kind: before anything, the Head
+		// not yet written, and the Head written. The rest run without it.
+		if testing.Short() && (tc.stage == "packed" || tc.stage == "shard" || tc.stage == "sharded") {
+			continue
+		}
 		t.Run(tc.stage, func(t *testing.T) {
 			dir := t.TempDir()
 			key := newKey(t)

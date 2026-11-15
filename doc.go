@@ -55,7 +55,7 @@
 //	                                         returns only after the Head advanced.
 //	Fsync (FUSE FSYNC)                     the same as Flush: a full commit. There is no
 //	                                         cheaper durable point. An interrupted caller
-//	                                         gets EINTR and the commit still lands.
+//	                                         gets EINTR and the commit lands or fails on its own terms.
 //	Flush on the FUSE front (every close)  the same as Flush: a full commit.
 //	Release on the FUSE front              nothing.
 //	end of a mount                         one Flush, then the mount returns.

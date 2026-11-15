@@ -50,7 +50,18 @@ func openFile(_ context.Context, u *url.URL) (backend.Backend, error) {
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return nil, fmt.Errorf("file backend: mkdir %q: %w", root, err)
 	}
-	return &fileBackend{root: root}, nil
+	// A Head is sealed to the place's name, so every spelling of one directory
+	// (a trailing slash, a dot segment, a double slash, a symlink) must give one
+	// name: the absolute path with symlinks resolved.
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return nil, fmt.Errorf("file backend: %q: %w", root, err)
+	}
+	real, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return nil, fmt.Errorf("file backend: %q: %w", root, err)
+	}
+	return &fileBackend{root: real}, nil
 }
 
 func (f *fileBackend) keyPath(key string) string {

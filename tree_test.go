@@ -55,7 +55,7 @@ func (c plainCipher) Open(s []byte, id string) ([]byte, error) {
 // smallTree returns a tree that cuts nodes of about 300 bytes, so a few thousand
 // records stand five or six levels tall.
 func smallTree(be *storetest.Mem) *tree {
-	t := newTree(&shards{be: be, c: plainCipher{}, aad: []byte("test"), cache: newLRU[ref, *node](1 << 30)})
+	t := newTree(&shards{be: be, c: plainCipher{}, aad: bind("test"), cache: newLRU[ref, *node](1 << 30)}, [32]byte{1})
 	t.target, t.max = 300, 3000
 	return t
 }

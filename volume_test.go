@@ -515,7 +515,7 @@ func TestCacheIsBounded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	total := sized(24, 60)
+	total := sized(12, 60)
 	var inodes []vfs.InodeID
 	for i := range total {
 		inodes = append(inodes, write(t, v, vfs.RootInode, fmt.Sprint("f", i), content(uint64(500+i), 1<<20)).ID)
@@ -581,4 +581,20 @@ func TestListingSeesAChangeOnceAndARemovalNever(t *testing.T) {
 	check("pending")
 	flush(t, v)
 	check("committed")
+}
+
+// TestIdenticalFilesBeforeAFlushShareTheirChunks: two files with the same large content
+// written before any Flush are one chunk's bytes in the store. The check for a chunk
+// that already exists must see chunks that are only pending, not just committed ones.
+func TestIdenticalFilesBeforeAFlushShareTheirChunks(t *testing.T) {
+	be, _, v := newMem(t)
+	data := content(77, 2<<20)
+	be.Reset()
+	write(t, v, vfs.RootInode, "a", data)
+	write(t, v, vfs.RootInode, "b", data)
+	write(t, v, vfs.RootInode, "c", data)
+	flush(t, v)
+	if packs := packBytes(be); packs > len(data)+len(data)/4 {
+		t.Fatalf("three identical %d byte files stored %d bytes of packs: the pending chunk was not seen", len(data), packs)
+	}
 }

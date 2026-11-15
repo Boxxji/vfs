@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -101,7 +102,7 @@ func testVolume(t *testing.T) (*gate, *vfs.Volume, vfs.Cipher, *storetest.Mem) {
 		t.Fatal(err)
 	}
 	mem := storetest.NewMem()
-	g := newGate(mem)
+	g := newGate(storetest.Strict{Backend: mem})
 	c := vfs.Hybrid(k)
 	bg := context.Background()
 	if err := vfs.Create(bg, vfs.Config{Backend: g, Cipher: c}); err != nil {
@@ -138,7 +139,7 @@ func TestCommitSurvivesItsCaller(t *testing.T) {
 	g.armed.Store(true)
 	req, interrupt := context.WithCancel(bg)
 	result := make(chan error, 1)
-	go func() { result <- errno(commit(req, v)) }()
+	go func() { result <- errno(newCommitter(v).commit(req)) }()
 	select {
 	case <-g.reached:
 	case <-time.After(20 * time.Second):
@@ -159,7 +160,7 @@ func TestCommitSurvivesItsCaller(t *testing.T) {
 	case <-time.After(20 * time.Second):
 		t.Fatal("the commit did not land once its caller was gone")
 	}
-	if err := commit(bg, v); err != nil { // the restarted call: nothing is left to commit
+	if err := newCommitter(v).commit(bg); err != nil { // the restarted call: nothing is left to commit
 		t.Fatalf("the restarted commit: %v", err)
 	}
 	ro, err := vfs.Open(bg, vfs.Config{Backend: mem, Cipher: c})
@@ -192,7 +193,7 @@ func TestCloseWaitsForItsCommit(t *testing.T) {
 	}
 	defer f.Close()
 	defer g.free()
-	h := &handle{vol: v, base: bg, file: f}
+	h := newSession(bg, v).handle(f)
 
 	g.armed.Store(true)
 	req, interrupt := context.WithCancel(bg)
@@ -258,7 +259,7 @@ func TestReadWaitsForItsData(t *testing.T) {
 	}
 	defer file.Close()
 	defer g.free()
-	h := &handle{vol: cold, base: bg, file: file}
+	h := newSession(bg, cold).handle(file)
 
 	g.armed.Store(true)
 	req, interrupt := context.WithCancel(bg)
@@ -290,5 +291,133 @@ func TestReadWaitsForItsData(t *testing.T) {
 	}
 	if string(resp.Data) != string(data[:50_000]) {
 		t.Fatalf("the read returned %d wrong bytes", len(resp.Data))
+	}
+}
+
+// TestInterruptedFsyncRetriesDoNotPileUp: a caller retries fsync(2) on every EINTR
+// while the store is stalled. The commits are shared: however many retries arrive,
+// one commit is running and at most one more is waiting to start, never one per retry.
+func TestInterruptedFsyncRetriesDoNotPileUp(t *testing.T) {
+	g, v, c, mem := testVolume(t)
+	bg := context.Background()
+	in, err := v.Create(bg, vfs.RootInode, "f", 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := v.Open(bg, in.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	defer g.free()
+	if _, err := f.WriteAt(bg, make([]byte, 100_000), 0); err != nil {
+		t.Fatal(err)
+	}
+	cm := newCommitter(v)
+	base := runtime.NumGoroutine()
+	g.armed.Store(true)
+	first, cancelFirst := context.WithCancel(bg)
+	go func() { _ = cm.commit(first) }()
+	select {
+	case <-g.reached:
+	case <-time.After(20 * time.Second):
+		t.Fatal("the commit never reached the Head")
+	}
+	cancelFirst()
+	const retries = 5000
+	for range retries {
+		req, cancel := context.WithTimeout(bg, time.Microsecond)
+		_ = cm.commit(req) // answered EINTR
+		cancel()
+	}
+	if held := runtime.NumGoroutine() - base; held > 8 {
+		t.Fatalf("%d interrupted retries left %d goroutines running commits: the work is not shared", retries, held)
+	}
+
+	// The store answers: the writes are committed once, by the flights that were
+	// there, and every caller after that finds nothing left.
+	g.free()
+	if err := cm.commit(bg); err != nil {
+		t.Fatalf("a commit after the store answered: %v", err)
+	}
+	ro, err := vfs.Open(bg, vfs.Config{Backend: mem, Cipher: c})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := ro.Resolve(bg, "/f"); err != nil || got.Size != 100_000 {
+		t.Fatalf("the write is not in the store: %+v %v", got, err)
+	}
+	if heads := mem.Puts()["head"]; heads > 4 {
+		t.Fatalf("%d Head writes for one write and %d retries", heads, retries)
+	}
+}
+
+// TestSessionRefusesANilContext: a session without the mount's context would hand
+// every node a nil one, and the first read of a chunk against a real store would
+// panic. It cannot be built.
+func TestSessionRefusesANilContext(t *testing.T) {
+	_, v, _, _ := testVolume(t)
+	defer func() {
+		if recover() == nil {
+			t.Fatal("a session was built without a context")
+		}
+	}()
+	newSession(nil, v)
+}
+
+// TestLookedUpFileReadsOnTheMountContext: the kernel finds every file that is not new
+// to the mount session with Lookup and reads it through the node Lookup returns. The
+// store here panics on a nil context, as every real store's client does; the
+// directory backend would never have noticed.
+func TestLookedUpFileReadsOnTheMountContext(t *testing.T) {
+	_, v, c, mem := testVolume(t)
+	bg := context.Background()
+	in, err := v.Create(bg, vfs.RootInode, "f", 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := v.Open(bg, in.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := make([]byte, 300_000)
+	for i := range want {
+		want[i] = byte(i * 7)
+	}
+	if _, err := f.WriteAt(bg, want, 0); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	if err := v.Flush(bg); err != nil {
+		t.Fatal(err)
+	}
+	// A fresh server over the same store: nothing cached.
+	v2, err := vfs.Attach(bg, vfs.Config{Backend: storetest.Strict{Backend: mem}, Cipher: c, Round: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := newSession(bg, v2).node(vfs.RootInode, vfs.RootInode)
+	// What the kernel does for open("/f"): LOOKUP, OPEN, READ.
+	found, err := root.Lookup(bg, "f")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := found.(*node).Open(bg, &fuse.OpenRequest{}, &fuse.OpenResponse{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := &fuse.ReadResponse{}
+	if err := h.(*handle).Read(bg, &fuse.ReadRequest{Size: 50_000, Offset: 0}, resp); err != nil {
+		t.Fatalf("read of a file found by Lookup: %v", err)
+	}
+	if string(resp.Data) != string(want[:50_000]) {
+		t.Fatalf("read of a file found by Lookup returned %d wrong bytes", len(resp.Data))
+	}
+	dir, err := root.Mkdir(bg, &fuse.MkdirRequest{Name: "d", Mode: 0o755})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dir.(*node).Lookup(bg, "nothing"); err == nil {
+		t.Fatal("a lookup in a new directory found a file that is not there")
 	}
 }

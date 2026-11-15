@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"sort"
+	"sync"
 
 	"github.com/zeebo/blake3"
 )
@@ -15,9 +16,12 @@ import (
 // whole tree. Every node is an immutable shard.
 //
 // Where a node ends is decided by the entries themselves, not by position: an
-// entry ends its node when a hash of its key falls under a threshold
+// entry ends its node when a keyed hash of its key falls under a threshold
 // proportional to its size, so nodes average nodeTarget bytes whatever the record
-// sizes are. Because a boundary depends only on the entries up to it, a change
+// sizes are. The hash is keyed from the Volume's seed: without the key a guest who
+// picks the names of files can pick names that each end their own node, and
+// multiply the metadata a commit writes by hundreds. Because a boundary depends
+// only on the entries up to it, a change
 // disturbs only the nodes it touches: later boundaries fall where they did, the
 // untouched nodes are reused by ref, and the new tree is identical to one built
 // from scratch from the same records. A commit therefore writes the changed
@@ -44,15 +48,37 @@ type tree struct {
 	sh     *shards
 	target uint64
 	max    int
+	key    [32]byte // keys the boundary hash: derived from the Volume's seed
+	hashes sync.Pool
 }
 
-func newTree(sh *shards) *tree { return &tree{sh: sh, target: nodeTarget, max: nodeMax} }
+// boundaryKey derives the key of the boundary hash from a Volume's seed.
+func boundaryKey(seed [32]byte) (key [32]byte) {
+	blake3.DeriveKey("hanzoai/vfs tree boundaries", seed[:], key[:])
+	return key
+}
 
-// ends reports whether e ends its node at level: a function of the entry alone.
+func newTree(sh *shards, seed [32]byte) *tree {
+	t := &tree{sh: sh, target: nodeTarget, max: nodeMax, key: boundaryKey(seed)}
+	t.hashes.New = func() any {
+		h, _ := blake3.NewKeyed(t.key[:])
+		return h
+	}
+	return t
+}
+
+// ends reports whether e ends its node at level: a function of the entry and the
+// tree's key alone.
 func (t *tree) ends(level int, e entry) bool {
-	h := blake3.Sum256(append([]byte{byte(level)}, e.key...))
+	h := t.hashes.Get().(*blake3.Hasher)
+	h.Reset()
+	_, _ = h.Write([]byte{byte(level)})
+	_, _ = h.Write(e.key)
+	var sum [32]byte
+	h.Sum(sum[:0])
+	t.hashes.Put(h)
 	size := uint64(len(e.key)+len(e.val)) + 4
-	return uint64(binary.LittleEndian.Uint32(h[:4]))*t.target < size<<32
+	return uint64(binary.LittleEndian.Uint32(sum[:4]))*t.target < size<<32
 }
 
 // builder cuts a stream of entries into nodes at one level, storing each.

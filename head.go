@@ -2,7 +2,11 @@ package vfs
 
 import (
 	"context"
+	"encoding/binary"
+	"errors"
 	"fmt"
+
+	"github.com/zeebo/blake3"
 )
 
 // headKey is the one mutable object of a Volume. Everything else is written
@@ -53,21 +57,43 @@ func unmarshalHead(b []byte) (Head, error) {
 	return h, r.done()
 }
 
+// bindLen is the length of what every object is sealed to.
+const bindLen = 32
+
+// bind returns what an object is sealed to: the BLAKE3 digest of its kind and of the
+// fields that name it, each framed by its length. It is a fixed length and
+// injective, so no context is a prefix of another and two different contexts never
+// share a digest; a reader compares it for equality.
+func bind(kind string, fields ...[]byte) []byte {
+	h := blake3.New()
+	_, _ = h.WriteString("hanzoai/vfs seal context")
+	frame := func(p []byte) {
+		_, _ = h.Write(binary.AppendUvarint(nil, uint64(len(p))))
+		_, _ = h.Write(p)
+	}
+	frame([]byte(kind))
+	for _, f := range fields {
+		frame(f)
+	}
+	return h.Sum(nil)
+}
+
 // What each kind of sealed object is sealed to. A Head is sealed to the place it
 // lives (the backend's name), so a Volume copied to another place does not open
-// there until it is re-sealed; shards and chunks are sealed to the Volume, so they
-// move with it, and a chunk is sealed to its own id as well.
-func headAAD(place string) []byte { return []byte("vfs head " + place) }
+// there until Reseal; shards and chunks are sealed to the Volume, so they move with
+// it, and a chunk is sealed to its own id as well.
+func headAAD(place string) []byte { return bind("head", []byte(place)) }
 
-func shardAAD(id volumeID) []byte { return append([]byte("vfs shard "), id[:]...) }
+func shardAAD(id volumeID) []byte { return bind("shard", id[:]) }
 
-func chunkAAD(id volumeID, c chunkID) []byte {
-	return append(append([]byte("vfs chunk "), id[:]...), c[:]...)
-}
+func chunkAAD(id volumeID, c chunkID) []byte { return bind("chunk", id[:], c[:]) }
 
 // readHead opens a fenced Head payload.
 func (v *Volume) readHead(payload []byte) (Head, error) {
 	plain, err := unseal(v.c, headAAD(v.be.String()), payload)
+	if errors.Is(err, errContext) {
+		return Head{}, fmt.Errorf("vfs: open head at %s: %w (a Head is sealed to the place it was written at: if the Volume was moved, Reseal it)", v.be, err)
+	}
 	if err != nil {
 		return Head{}, fmt.Errorf("vfs: open head: %w", err)
 	}

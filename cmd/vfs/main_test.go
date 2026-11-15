@@ -65,10 +65,25 @@ func TestCLIRoundTrip(t *testing.T) {
 	if _, err := vfsRun(t, "", "get", be, "/deep/er/file.bin"); err == nil || !strings.Contains(err.Error(), "no key") {
 		t.Fatalf("get with no key = %v", err)
 	}
-	// The key comes from standard input only: an environment variable is ignored.
-	t.Setenv("VFS_AGE_KEY", key)
-	if _, err := vfsRun(t, "", "get", be, "/deep/er/file.bin"); err == nil {
-		t.Fatal("the key was read from the environment")
+	// The key comes from standard input only: the command reads no environment
+	// variable at all.
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range files {
+		if strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		src, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, call := range []string{"os.Getenv", "os.LookupEnv", "os.Environ", "os.ExpandEnv"} {
+			if strings.Contains(string(src), call) {
+				t.Errorf("%s calls %s: the command must read no environment variable", name, call)
+			}
+		}
 	}
 	if _, err := vfsRun(t, key, "get", be, "/nope"); !strings.Contains(errString(err), fs.ErrNotExist.Error()) {
 		t.Fatalf("get of absent = %v", err)

@@ -768,5 +768,103 @@
   "pkg": "./pkg/mount",
   "run": "TestCloseWaitsForItsCommit",
   "tags": "fuse"
+ },
+ {
+  "name": "mount: a session without a mount context",
+  "file": "pkg/mount/errno.go",
+  "old": "return &session{vol: vol, base: base, group: newCommitter(vol)}",
+  "new": "return &session{vol: vol, group: newCommitter(vol)}",
+  "pkg": "./pkg/mount",
+  "run": "TestLookedUpFileReadsOnTheMountContext|TestReadWaitsForItsData",
+  "tags": "fuse"
+ },
+ {
+  "name": "seal: the context is not compared",
+  "file": "cipher.go",
+  "old": "if len(plain) < bindLen || subtle.ConstantTimeCompare(plain[:bindLen], aad) != 1 {",
+  "new": "if len(plain) < bindLen || subtle.ConstantTimeCompare(plain[:bindLen], aad) != 1 && false {",
+  "pkg": ".",
+  "run": "TestHeadContextIsExact|TestSwappedHeadIsRefused|TestSealedToItsContext"
+ },
+ {
+  "name": "head: the context ignores the place",
+  "file": "head.go",
+  "old": "func headAAD(place string) []byte { return bind(\"head\", []byte(place)) }",
+  "new": "func headAAD(place string) []byte { return bind(\"head\") }",
+  "pkg": ".",
+  "run": "TestHeadContextIsExact|TestSwappedHeadIsRefused|TestContextsDoNotCollide"
+ },
+ {
+  "name": "tree: boundaries are unkeyed",
+  "file": "tree.go",
+  "old": "key: boundaryKey(seed)}",
+  "new": "key: [32]byte{}}",
+  "pkg": ".",
+  "run": "TestGroundNamesDoNotBloatTheTree|TestBoundariesDependOnTheSeed"
+ },
+ {
+  "name": "seal: a Cipher that returns its input is accepted",
+  "file": "cipher.go",
+  "old": "if bytes.Contains(sealed, aad) {",
+  "new": "if false && bytes.Contains(sealed, aad) {",
+  "pkg": ".",
+  "run": "TestCipherThatStopsSealingIsCaughtAtEverySeal"
+ },
+ {
+  "name": "cipher: the tag is not verified",
+  "file": "cipher.go",
+  "old": "if subtle.ConstantTimeCompare(got, tag(c.tags[keyID], body)) != 1 {",
+  "new": "if subtle.ConstantTimeCompare(got, tag(c.tags[keyID], body)) != 1 && false {",
+  "pkg": ".",
+  "run": "TestRecipientAloneCannotForge"
+ },
+ {
+  "name": "file backend: the place is not canonical",
+  "file": "pkg/backend/file/file.go",
+  "old": "return &fileBackend{root: real}, nil",
+  "new": "_ = real\n\treturn &fileBackend{root: root}, nil",
+  "pkg": ".",
+  "run": "TestPlaceSpellings"
+ },
+ {
+  "name": "mount: every fsync retry starts a commit",
+  "file": "pkg/mount/errno.go",
+  "old": "\tif c.run == nil {\n\t\tc.run = &flight{done: make(chan struct{})}",
+  "new": "\tif true {\n\t\tc.run = &flight{done: make(chan struct{})}",
+  "pkg": "./pkg/mount",
+  "run": "TestInterruptedFsyncRetriesDoNotPileUp",
+  "tags": "fuse"
+ },
+ {
+  "name": "backend: a URL parse error prints the URL",
+  "file": "pkg/backend/backend.go",
+  "old": "is not a URL\", redact(raw))",
+  "new": "is not a URL\", raw)",
+  "pkg": ".",
+  "run": "TestBackendOpenParseErrorHidesUserinfo"
+ },
+ {
+  "name": "s3 backend: an absent key on a conditional write is not a conflict",
+  "file": "pkg/backend/s3/s3.go",
+  "old": "if hs3.ToErrorResponse(err).Code == \"NoSuchKey\" {",
+  "new": "if false {",
+  "pkg": "./pkg/backend/s3",
+  "run": "TestAbsentKeyOnAConditionalWriteIsAConflict"
+ },
+ {
+  "name": "volume: a pending chunk is not seen",
+  "file": "pack.go",
+  "old": "_, ok, err := v.get(ctx, keyChunk(id))",
+  "new": "_, ok, err := v.t.get(ctx, v.root, keyChunk(id))",
+  "pkg": ".",
+  "run": "TestIdenticalFilesBeforeAFlushShareTheirChunks"
+ },
+ {
+  "name": "volume: Reseal keeps the old place",
+  "file": "volume.go",
+  "old": "return seal(cfg.Cipher, headAAD(cfg.Backend.String()), plain)",
+  "new": "return seal(cfg.Cipher, headAAD(from), plain)",
+  "pkg": ".",
+  "run": "TestResealMovesAVolume"
  }
 ]

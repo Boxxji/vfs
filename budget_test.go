@@ -29,7 +29,7 @@ func TestObjectBudget150GiB(t *testing.T) {
 	meanChunk := float64(len(sample)) / float64(len(ns))
 	// Measured with the age cipher in TestAgeFrameOverhead: bytes a sealed chunk
 	// adds to its plaintext, at a typical 600 KB chunk.
-	const ageOverhead = 1700 + 600_000/4096*1
+	const ageOverhead = 1760 + 600_000/4096*1
 
 	type class struct {
 		files int
@@ -54,7 +54,7 @@ func TestObjectBudget150GiB(t *testing.T) {
 	} {
 		t.Run(dist.name, func(t *testing.T) {
 			be := &discard{}
-			tr := newTree(&shards{be: be, c: plainCipher{}, aad: []byte("test"), cache: newLRU[ref, *node](64 << 20)})
+			tr := newTree(&shards{be: be, c: plainCipher{}, aad: bind("test"), cache: newLRU[ref, *node](64 << 20)}, [32]byte{1})
 			var ino, nChunks, files int
 			var bytesTotal float64
 			var pending []entry
@@ -129,12 +129,12 @@ func TestAgeFrameOverhead(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, n := range []int{minChunk, 1 << 20, maxChunk} {
-		frame, err := seal(Hybrid(k), nil, make([]byte, n))
+		frame, err := seal(Hybrid(k), bind("test"), make([]byte, n))
 		if err != nil {
 			t.Fatal(err)
 		}
-		over := len(frame) - n
-		want := 1660 + 16*((n+65535)/65536)
+		over := len(frame) - n              // the frame less the chunk: the context is sealed with it
+		want := 1724 + 16*((n+65535)/65536) // the header, the context (32) and the tag (32), and the age tag per 64 KiB
 		t.Logf("a %d byte chunk seals to %d bytes: +%d (model %d)", n, len(frame), over, want)
 		if over < want-40 || over > want+40 {
 			t.Fatalf("overhead %d bytes, model says %d: update ageOverhead in TestObjectBudget150GiB", over, want)

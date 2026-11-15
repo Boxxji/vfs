@@ -16,10 +16,11 @@ import (
 )
 
 var (
-	// ErrStaleRound is returned when a newer Round holds the Volume: this writer
-	// was fenced. Changes it had not committed will never land. A commit whose
-	// acknowledgement was lost may nevertheless be in the successor's tree; see the
-	// package documentation.
+	// ErrStaleRound is returned when the Round does not hold the Volume: a commit by
+	// a Round below the recorded one (this writer was fenced, and changes it had not
+	// committed will never land), or an Attach at a Round that does not exceed the
+	// recorded one. A commit whose acknowledgement was lost may nevertheless be in
+	// the successor's tree; see the package documentation.
 	ErrStaleRound = fence.ErrStaleRound
 
 	// ErrTooBig is returned for a file larger than MaxSize.
@@ -37,7 +38,7 @@ var (
 type Config struct {
 	Backend backend.Backend // the Volume's prefix; the Volume owns it and Close closes it
 	Cipher  Cipher          // seals and opens every object
-	Round   uint64          // Attach: the Round to claim; must exceed the recorded one, and be above 0
+	Round   uint64          // Attach, Reseal: the Round to claim; must exceed the recorded one, and be above 0
 
 	Cache   int64 // bytes of shards and chunks kept decoded; default 256 MiB
 	Dirty   int64 // bytes of unsettled writes (each separate write counts a fixed overhead too) before they are chunked and uploaded; default 64 MiB
@@ -103,7 +104,7 @@ func newVolume(cfg Config) *Volume {
 		c:      cfg.Cipher,
 		fence:  fence.New(cfg.Backend, maxHead),
 		cfg:    cfg,
-		t:      newTree(sh),
+		t:      newTree(sh, [32]byte{}),
 		chunks: newLRU[chunkID, []byte](cfg.Cache / 2),
 		over:   newOverlay(),
 		files:  map[InodeID]*fileState{},
@@ -116,6 +117,7 @@ func (v *Volume) adopt(h Head) {
 	v.head, v.seq = h, h.Seq
 	v.root, v.next = h.Root, InodeID(h.Next)
 	v.id, v.gear = h.ID, newGear(h.Seed)
+	v.t = newTree(v.t.sh, h.Seed)
 	v.t.sh.aad = shardAAD(h.ID)
 }
 
@@ -181,6 +183,12 @@ func Open(ctx context.Context, cfg Config) (*Volume, error) {
 // seals the predecessor's last committed Head at the new Round, atomically, and
 // opens the Volume at that Head, so nothing the predecessor committed is lost and
 // nothing it tries to commit afterwards lands.
+//
+// After any error from Attach other than a refusal for a Round that is too low,
+// the claim may or may not have landed (a reply can be lost). A caller that retries
+// MUST use a higher Round: a retry at the same Round is told ErrStaleRound, since
+// the Round is by then recorded, and only a claim whose own retry finds its own
+// bytes within one call is recognised as landed.
 func Attach(ctx context.Context, cfg Config) (*Volume, error) {
 	cfg, err := cfg.valid()
 	if err != nil {
@@ -210,11 +218,46 @@ func Attach(ctx context.Context, cfg Config) (*Volume, error) {
 	return v, nil
 }
 
+// Reseal rewrites the Head of the Volume at cfg.Backend so that it is sealed to
+// that place, and claims the Volume there at cfg.Round, which must exceed the
+// recorded Round and be above 0 and below 2^64-1. from is the place the Head is
+// sealed to now: the String of the Backend it was last written through. A Head is
+// bound to its place, and every other object to the Volume, so moving a Volume to
+// another bucket or prefix is: copy every object, then Reseal. It fences the copy
+// only; a writer still attached at the old place is not told, so stop it first. A
+// failed Reseal is retried at a higher Round.
+func Reseal(ctx context.Context, cfg Config, from string) error {
+	cfg, err := cfg.valid()
+	if err != nil {
+		return err
+	}
+	if cfg.Round == 0 || cfg.Round == math.MaxUint64 {
+		return fmt.Errorf("%w: Reseal needs a Round above 0 and below 2^64-1", fs.ErrInvalid)
+	}
+	v := newVolume(cfg)
+	return v.fence.Rewrite(ctx, headKey, cfg.Round, func(payload []byte, recorded uint64) ([]byte, error) {
+		if payload == nil {
+			return nil, fmt.Errorf("vfs: no volume at %s: %w", cfg.Backend, fs.ErrNotExist)
+		}
+		if cfg.Round <= recorded {
+			return nil, fmt.Errorf("%w: round %d does not exceed the recorded %d", ErrStaleRound, cfg.Round, recorded)
+		}
+		plain, err := unseal(cfg.Cipher, headAAD(from), payload)
+		if err != nil {
+			return nil, fmt.Errorf("vfs: open head sealed for %s: %w", from, err)
+		}
+		if _, err := unmarshalHead(plain); err != nil {
+			return nil, fmt.Errorf("vfs: head sealed for %s: %w", from, err)
+		}
+		return seal(cfg.Cipher, headAAD(cfg.Backend.String()), plain)
+	})
+}
+
 // Stats is a snapshot of a Volume for observability.
 type Stats struct {
 	Backend    string
 	Round      uint64 // 0 when read-only
-	Seq        uint64 // commits since Create
+	Seq        uint64 // the Seq of the committed Head: it counts commit attempts and can skip, so it is not a count of commits
 	Inodes     uint64 // inode numbers handed out
 	CacheBytes int64
 	CacheMax   int64

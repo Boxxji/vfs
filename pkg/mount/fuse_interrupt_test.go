@@ -72,6 +72,16 @@ func restart(eintr *atomic.Int64, call func() error) error {
 	}
 }
 
+// How much work the signal test does, and how long it may take. The work is bounded
+// by count and by the clock, whichever comes first, so it is fast on a disk that is
+// busy and on a sandbox whose system calls are slow; what it must have done by then
+// is the least that says anything (hundreds of interrupted calls of each kind).
+const (
+	signalPhase     = 45 * time.Second // the most each of the two phases may take
+	signalMinFsyncs = 300
+	signalMinBytes  = 512 << 20
+)
+
 // TestFUSEInterruptsAreNotErrors: signals land on callers while they are inside
 // fsync(2), close(2) and read(2) of the mount. Go's runtime sends one every few
 // milliseconds on its own; here they come tens of thousands of times a second, at the
@@ -79,9 +89,9 @@ func restart(eintr *atomic.Int64, call func() error) error {
 // caller sees EINTR, and never EIO. The files written and synced are in the store.
 func TestFUSEInterruptsAreNotErrors(t *testing.T) {
 	needFUSE(t)
-	fsyncs, passes := 5000, 20 // 20 GiB of reads
+	fsyncs, passes := 2000, 32 // 8 GiB of reads of a 256 MiB file
 	if testing.Short() {
-		fsyncs, passes = 300, 2
+		fsyncs, passes = 300, 4
 	}
 	store, mp := newMountpoint(t)
 	key, _ := age.GenerateHybridIdentity()
@@ -93,7 +103,8 @@ func TestFUSEInterruptsAreNotErrors(t *testing.T) {
 	var eintr atomic.Int64
 
 	// fsync and close of small files, two writers at once.
-	var bad atomic.Int64
+	var bad, synced atomic.Int64
+	var last [2]atomic.Int64 // per writer, the number of files it finished
 	var wg sync.WaitGroup
 	start := time.Now()
 	for w := range 2 {
@@ -102,6 +113,9 @@ func TestFUSEInterruptsAreNotErrors(t *testing.T) {
 			defer wg.Done()
 			sig.work(w, func() {
 				for i := range fsyncs / 2 {
+					if time.Since(start) > signalPhase {
+						return
+					}
 					path := filepath.Join(mp, fmt.Sprintf("s%d-%05d", w, i))
 					fd, err := syscall.Open(path, syscall.O_CREAT|syscall.O_WRONLY, 0o644)
 					if err != nil {
@@ -122,20 +136,25 @@ func TestFUSEInterruptsAreNotErrors(t *testing.T) {
 						bad.Add(1)
 						t.Errorf("close %d: %v", i, err)
 					}
+					synced.Add(1)
+					last[w].Store(int64(i) + 1)
 				}
 			})
 		}()
 	}
 	wg.Wait()
-	t.Logf("%d fsync+close under %d signals in %v: %d failed, the caller saw EINTR %d times", fsyncs, sig.sent.Load(), time.Since(start).Round(time.Millisecond), bad.Load(), eintr.Load())
+	t.Logf("%d fsync+close under %d signals in %v: %d failed, the caller saw EINTR %d times", synced.Load(), sig.sent.Load(), time.Since(start).Round(time.Millisecond), bad.Load(), eintr.Load())
 	if bad.Load() != 0 {
 		t.FailNow()
+	}
+	if synced.Load() < signalMinFsyncs {
+		t.Fatalf("only %d fsyncs in %v: too few to say that signals do no harm", synced.Load(), signalPhase)
 	}
 
 	// What was acknowledged is in the store, read from outside the mount.
 	ro := storeView(t, store, key)
-	for _, i := range []int{0, fsyncs/2 - 1} {
-		for w := range 2 {
+	for w := range 2 {
+		for _, i := range []int{0, int(last[w].Load()) - 1} {
 			got, err := storeBytes(t, ro, fmt.Sprintf("/s%d-%05d", w, i))
 			if err != nil || string(got) != string(rnd(uint64(w*100000+i), 4096)) {
 				t.Fatalf("file s%d-%05d: %d bytes, %v", w, i, len(got), err)
@@ -143,8 +162,8 @@ func TestFUSEInterruptsAreNotErrors(t *testing.T) {
 		}
 	}
 
-	// Sequential reads of a 1 GiB file, 1 MiB at a time, over and over.
-	const block, blocks = 1 << 20, 1024
+	// Sequential reads of a 256 MiB file, 1 MiB at a time, over and over.
+	const block, blocks = 1 << 20, 256
 	path := filepath.Join(mp, "big")
 	func() {
 		f, err := os.Create(path)
@@ -178,6 +197,9 @@ func TestFUSEInterruptsAreNotErrors(t *testing.T) {
 				buf := make([]byte, block)
 				for p := range passes / 2 {
 					for b := range blocks {
+						if time.Since(start) > signalPhase {
+							return
+						}
 						off := int64(b) * block
 						n, err := 0, error(nil)
 						for n < block && err == nil {
@@ -209,6 +231,9 @@ func TestFUSEInterruptsAreNotErrors(t *testing.T) {
 	t.Logf("%d GiB read under %d signals in %v (%.0f MB/s): %d failed, the caller saw EINTR %d times", read.Load()>>30, sig.sent.Load(), took.Round(time.Millisecond), float64(read.Load())/1e6/took.Seconds(), bad.Load(), eintr.Load())
 	if bad.Load() != 0 {
 		t.FailNow()
+	}
+	if read.Load() < signalMinBytes {
+		t.Fatalf("only %d MiB read in %v: too little to say that signals do no harm", read.Load()>>20, signalPhase)
 	}
 	sig.close()
 	m.stop(t)

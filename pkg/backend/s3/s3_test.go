@@ -3,6 +3,8 @@ package s3
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -116,5 +118,24 @@ func TestURLStringNamesNoQuery(t *testing.T) {
 	}
 	if got := be.String(); got != "s3://bucket/vol/one" {
 		t.Fatalf("String() = %q, want s3://bucket/vol/one", got)
+	}
+}
+
+// TestAbsentKeyOnAConditionalWriteIsAConflict: some stores answer a conditional write
+// to an absent key with 404 NoSuchKey instead of 412. It is a lost precondition all
+// the same, and nothing was written.
+func TestAbsentKeyOnAConditionalWriteIsAConflict(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?><Error><Code>NoSuchKey</Code><Message>no such key</Message><Resource>/x</Resource></Error>`))
+	}))
+	defer srv.Close()
+	be, err := New(Config{Endpoint: strings.TrimPrefix(srv.URL, "http://"), Insecure: true, Region: "us-east-1", Bucket: "disk", AccessKey: "k", SecretKey: "s"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := be.PutIfVersion(context.Background(), "head", []byte("x"), "nothing"); !errors.Is(err, backend.ErrConflict) {
+		t.Fatalf("PutIfVersion answered NoSuchKey = %v, want ErrConflict", err)
 	}
 }

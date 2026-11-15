@@ -52,11 +52,12 @@ import (
 )
 
 var (
-	// ErrStaleRound is returned when a Put's round is below the round already
-	// recorded for the object: the deposed or partitioned writer rejection. The
-	// object is left byte-for-byte untouched. Once a successor advances the
-	// recorded round, the predecessor can never write again.
-	ErrStaleRound = errors.New("fence: write round is below the recorded round (writer fenced)")
+	// ErrStaleRound is returned when the round does not hold the object: a Put at a
+	// round below the one already recorded, or a Claim at a round that is not above
+	// it. It is the deposed or partitioned writer rejection. The object is left
+	// byte-for-byte untouched. Once a successor advances the recorded round, the
+	// predecessor can never write again.
+	ErrStaleRound = errors.New("fence: write round is behind the recorded round (writer fenced)")
 
 	// errCorrupt is returned when a stored object does not decode as a record this
 	// package wrote: fail closed rather than invent a round from arbitrary bytes.
@@ -215,6 +216,25 @@ func (s *Store) Put(ctx context.Context, key string, payload []byte, round uint6
 // more than once across retries, so it must be idempotent. An absent key is
 // recorded round 0 with a nil payload.
 func (s *Store) Claim(ctx context.Context, key string, round uint64, hydrate func(payload []byte, recorded uint64) error) error {
+	return s.Rewrite(ctx, key, round, func(payload []byte, recorded uint64) ([]byte, error) {
+		if hydrate != nil {
+			if err := hydrate(payload, recorded); err != nil {
+				return nil, err
+			}
+		}
+		return payload, nil
+	})
+}
+
+// Rewrite is Claim that may change the payload: carry receives the payload read and
+// the round recorded with it and returns the payload to record in its place. A claim
+// carries it unchanged; sealing a Head for another place changes it. A retry that
+// finds exactly the bytes of the attempt before it knows that attempt landed, so
+// carry may return different bytes each time it runs (fresh randomness in a sealed
+// payload) and the lost-reply case is still recognised within one call. A caller
+// that retries after an error that is not a lost race starts over, and a record it
+// wrote earlier under its token is not its own any more: it must use a higher round.
+func (s *Store) Rewrite(ctx context.Context, key string, round uint64, carry func(payload []byte, recorded uint64) ([]byte, error)) error {
 	if s == nil || s.be == nil {
 		return fmt.Errorf("fence: nil store")
 	}
@@ -238,9 +258,9 @@ func (s *Store) Claim(ctx context.Context, key string, round uint64, hydrate fun
 		if round < recorded {
 			return fmt.Errorf("%w: key=%s round=%d recorded=%d", ErrStaleRound, key, round, recorded)
 		}
-		if hydrate != nil {
-			if err := hydrate(payload, recorded); err != nil {
-				return fmt.Errorf("fence: claim hydrate %s: %w", key, err)
+		if carry != nil {
+			if payload, err = carry(payload, recorded); err != nil {
+				return fmt.Errorf("fence: claim %s: %w", key, err)
 			}
 		}
 		last = s.encode(round, payload)

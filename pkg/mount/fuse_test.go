@@ -25,8 +25,10 @@ import (
 	"github.com/luxfi/age"
 
 	"github.com/hanzoai/vfs"
+	"github.com/hanzoai/vfs/internal/storetest"
 	"github.com/hanzoai/vfs/pkg/backend"
 	_ "github.com/hanzoai/vfs/pkg/backend/file"
+	_ "github.com/hanzoai/vfs/pkg/backend/s3"
 	"github.com/hanzoai/vfs/pkg/mount"
 )
 
@@ -66,8 +68,8 @@ func unmount(mountpoint string) {
 }
 
 // The server runs in a child process: the test binary run again with the
-// arguments "mountchild <store> <mountpoint> <round>" and the key on standard
-// input. A process that mounts a Volume must not use files on its own mount: Go
+// arguments "mountchild <backend URL> <mountpoint> <round>" and the key on standard
+// input. The store is wrapped so that a call on a nil context panics, as the client of a real store does. A process that mounts a Volume must not use files on its own mount: Go
 // registers an open file with its event poller, the kernel asks the file system
 // for readiness, and the server, which needs that same poller to read its next
 // request, never answers. That deadlock is a property of one process playing both
@@ -77,7 +79,7 @@ func TestMountChild(t *testing.T) {
 	if flag.Arg(0) != "mountchild" {
 		t.Skip("runs only as the server process of the mount tests")
 	}
-	store, mp := flag.Arg(1), flag.Arg(2)
+	url, mp := flag.Arg(1), flag.Arg(2)
 	round, _ := strconv.ParseUint(flag.Arg(3), 10, 64)
 	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
 	if err != nil {
@@ -87,10 +89,11 @@ func TestMountChild(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	be, err := backend.Open(context.Background(), "file://"+store)
+	opened, err := backend.Open(context.Background(), url)
 	if err != nil {
 		t.Fatal(err)
 	}
+	be := storetest.Strict{Backend: opened}
 	cfg := vfs.Config{Backend: be, Cipher: vfs.Hybrid(key), Round: round}
 	if round == 1 {
 		if err := vfs.Create(context.Background(), cfg); err != nil {
@@ -135,7 +138,15 @@ func (m *mounted) stop(t *testing.T) {
 // round 1) at round and mounts it at mp. The caller stops it.
 func mountAt(t *testing.T, storeDir, mp string, key *age.HybridIdentity, round uint64) *mounted {
 	t.Helper()
-	cmd := exec.Command(os.Args[0], "-test.run=^TestMountChild$", "-test.count=1", "mountchild", storeDir, mp, strconv.FormatUint(round, 10))
+	return mountURL(t, "file://"+storeDir, nil, mp, key, round)
+}
+
+// mountURL is mountAt for any backend URL; env is added to the server's environment
+// (the credentials an object store's URL does not carry).
+func mountURL(t *testing.T, url string, env []string, mp string, key *age.HybridIdentity, round uint64) *mounted {
+	t.Helper()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestMountChild$", "-test.count=1", "mountchild", url, mp, strconv.FormatUint(round, 10))
+	cmd.Env = append(os.Environ(), env...)
 	cmd.Stdin = strings.NewReader(key.String() + "\n")
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {

@@ -41,6 +41,24 @@ func Past(max int64) int64 {
 	return max + 1
 }
 
+// redact removes what a URL carries before the last "@" of its authority, which
+// is where a credential would be, so that a URL can be named in an error.
+func redact(raw string) string {
+	rest := raw
+	head := ""
+	if i := strings.Index(raw, "://"); i >= 0 {
+		head, rest = raw[:i+3], raw[i+3:]
+	}
+	end := strings.IndexAny(rest, "/?#")
+	if end < 0 {
+		end = len(rest)
+	}
+	if at := strings.LastIndex(rest[:end], "@"); at >= 0 {
+		rest = "***@" + rest[at+1:]
+	}
+	return head + rest
+}
+
 // ValidPrefix reports whether p can name a Volume's place in a bucket: slash
 // separated segments, none empty, none "." or "..", no NUL or other control
 // character, short enough to leave room for a key. A prefix is joined to keys by
@@ -158,10 +176,11 @@ func Register(scheme string, opener Opener) {
 func Open(ctx context.Context, raw string) (Backend, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
-		return nil, fmt.Errorf("backend.Open: parse %q: %w", raw, err)
+		// The parser's own message repeats the URL, userinfo included.
+		return nil, fmt.Errorf("backend.Open: %q is not a URL", redact(raw))
 	}
 	if u.Scheme == "" {
-		return nil, fmt.Errorf("backend.Open: missing scheme in %q", raw)
+		return nil, fmt.Errorf("backend.Open: missing scheme in %q", redact(raw))
 	}
 	opener, ok := openers[u.Scheme]
 	if !ok {

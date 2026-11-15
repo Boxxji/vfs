@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"sync"
 	"syscall"
 
 	"github.com/hanzoai/vfs"
@@ -98,15 +99,90 @@ func own[T any](req, base context.Context, work func(context.Context) (T, error)
 	}
 }
 
-// commit is Flush for a request that waits on it. A commit settles every open file
-// and replaces the Head, and every other caller queues behind it, so it is shared
-// work: it runs on a context nothing cancels, never half-cancelled and never left
-// with the Head's outcome unknown because one caller was interrupted.
-func commit(req context.Context, vol *vfs.Volume) error {
-	_, err := own(req, context.Background(), func(c context.Context) (struct{}, error) {
-		return struct{}{}, vol.Flush(c)
-	})
-	return err
+// session is what every node and handle of one mount shares: the Volume, the mount's
+// own context, and the committer. It is built only by newSession, which refuses a
+// nil context: the work of a read runs on base, and a store client panics on a nil
+// parent the first time it is used.
+type session struct {
+	vol   *vfs.Volume
+	base  context.Context
+	group *committer
+}
+
+func newSession(base context.Context, vol *vfs.Volume) *session {
+	if base == nil || vol == nil {
+		panic("mount: a session needs a context and a Volume")
+	}
+	return &session{vol: vol, base: base, group: newCommitter(vol)}
+}
+
+// committer runs the commits of a mount. A commit settles every open file and
+// replaces the Head, and every other caller queues behind it, so it is shared work: it
+// runs on a context nothing cancels, in a goroutine of its own, never half-cancelled
+// and never left with the Head's outcome unknown because one caller was interrupted.
+// A caller waits for it as long as its request lives.
+//
+// Commits do not pile up behind a stalled store: at most two exist, the one running
+// and one waiting to start. A caller that arrives while one is running joins the one
+// waiting, which starts after the caller's writes were made and so covers them; a
+// caller that arrives when none is running starts one. Five thousand interrupted
+// fsyncs retried against a stalled store therefore park two goroutines, not five
+// thousand.
+type committer struct {
+	vol       *vfs.Volume
+	mu        sync.Mutex
+	run, next *flight
+}
+
+// flight is one commit and the callers waiting on it.
+type flight struct {
+	done chan struct{}
+	err  error
+}
+
+func newCommitter(vol *vfs.Volume) *committer { return &committer{vol: vol} }
+
+// commit makes everything written before the call durable, or ends with the
+// request: with its error if the request ended first (EINTR), the commit going on
+// by itself.
+func (c *committer) commit(req context.Context) error {
+	if err := req.Err(); err != nil {
+		return err
+	}
+	f := c.join()
+	select {
+	case <-f.done:
+		return f.err
+	case <-req.Done():
+		return req.Err()
+	}
+}
+
+// join returns a flight that starts after now.
+func (c *committer) join() *flight {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.run == nil {
+		c.run = &flight{done: make(chan struct{})}
+		go c.fly(c.run)
+		return c.run
+	}
+	if c.next == nil {
+		c.next = &flight{done: make(chan struct{})}
+	}
+	return c.next
+}
+
+// fly runs f, then starts the flight that was waiting, if any.
+func (c *committer) fly(f *flight) {
+	f.err = c.vol.Flush(context.Background())
+	close(f.done)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.run, c.next = c.next, nil
+	if c.run != nil {
+		go c.fly(c.run)
+	}
 }
 
 // finish commits what the mount wrote once the kernel has released it. A Volume

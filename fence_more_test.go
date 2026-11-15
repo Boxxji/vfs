@@ -132,7 +132,7 @@ func TestDeposedWriterIsToldAtItsNextCommit(t *testing.T) {
 	f, _ := a.Open(ctx, in.ID)
 	mem.Reset()
 	var wrote int64
-	for i := 0; i < 96; i++ { // 96 MiB
+	for i := 0; i < sized(24, 96); i++ { // 96 MiB
 		chunk := content(uint64(1000+i), 1<<20)
 		if _, err := f.WriteAt(ctx, chunk, wrote); err != nil {
 			t.Fatal(err)

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -79,16 +80,24 @@ func check(c Cipher) error {
 
 // seal frames a sealed object as [len(keyID) byte][keyID][sealed], which makes
 // every object self-describing: no table anywhere records which key sealed what.
-// What is sealed is aad followed by plain: the aad names what the object is (its
-// Volume, its kind, and for a Head its location), and unseal refuses an object
-// whose aad is not the one the reader expects, so an object copied
-// from another Volume or place fails closed even under a Cipher both share.
+// What is sealed is aad followed by plain: the aad (bindLen bytes, from bind) names
+// what the object is (its kind and what names it), and unseal refuses an object
+// whose aad is not exactly the one the reader expects, so an object copied from
+// another Volume or place fails closed even under a Cipher both share. A Cipher
+// whose output contains the aad is not sealing, and the Seal fails: the check made
+// when a Volume is configured cannot see a Cipher that stops sealing later.
 func seal(c Cipher, aad, plain []byte) ([]byte, error) {
+	if len(aad) != bindLen {
+		return nil, fmt.Errorf("vfs: seal: context of %d bytes, want %d", len(aad), bindLen)
+	}
 	buf := make([]byte, 0, len(aad)+len(plain))
 	buf = append(append(buf, aad...), plain...)
 	sealed, id, err := c.Seal(buf)
 	if err != nil {
 		return nil, fmt.Errorf("vfs: seal: %w", err)
+	}
+	if bytes.Contains(sealed, aad) {
+		return nil, fmt.Errorf("%w: its output contains its input", ErrBadCipher)
 	}
 	if len(id) == 0 || len(id) > 255 {
 		return nil, fmt.Errorf("vfs: cipher returned a key id of %d bytes, want 1 to 255", len(id))
@@ -99,8 +108,14 @@ func seal(c Cipher, aad, plain []byte) ([]byte, error) {
 	return append(out, sealed...), nil
 }
 
+// errContext is returned by unseal for an object sealed to another context.
+var errContext = fmt.Errorf("%w: sealed for another volume, kind or place", ErrCorrupt)
+
 // unseal reverses seal for the context the reader expects.
 func unseal(c Cipher, aad, frame []byte) ([]byte, error) {
+	if len(aad) != bindLen {
+		return nil, fmt.Errorf("vfs: unseal: context of %d bytes, want %d", len(aad), bindLen)
+	}
 	if len(frame) < 1 || len(frame) < 1+int(frame[0]) {
 		return nil, fmt.Errorf("%w: truncated frame", ErrCorrupt)
 	}
@@ -109,19 +124,42 @@ func unseal(c Cipher, aad, frame []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !bytes.HasPrefix(plain, aad) {
-		return nil, fmt.Errorf("%w: sealed for another volume, kind or place", ErrCorrupt)
+	if len(plain) < bindLen || subtle.ConstantTimeCompare(plain[:bindLen], aad) != 1 {
+		return nil, errContext
 	}
-	return plain[len(aad):], nil
+	return plain[bindLen:], nil
 }
 
 // ageCipher is the default Cipher: every object is an age file sealed to a
 // hybrid post-quantum recipient (X25519 with ML-KEM-768), so what is stored today
 // stays confidential against a future quantum adversary who recorded it.
+//
+// Anyone who holds a recipient, which is public, can write an age file the identity
+// opens. So the plaintext carries a tag keyed from the identity's secret, and Open
+// refuses an object whose tag does not verify: a party that holds only the public
+// recipient can encrypt to the Volume but cannot forge an object it accepts. The
+// tag key is derived from the secret identity string, so everything that can open
+// an object can also seal one, and nothing else can.
 type ageCipher struct {
 	current age.Recipient
 	curID   string
 	ids     map[string]age.Identity
+	tags    map[string][32]byte // per key id: the key of the tag
+}
+
+const tagLen = 32
+
+// tagKey derives the tag key of an identity from its secret.
+func tagKey(k *age.HybridIdentity) (key [32]byte) {
+	blake3.DeriveKey("hanzoai/vfs seal tag", []byte(k.String()), key[:])
+	return key
+}
+
+// tag is the keyed digest of what is sealed.
+func tag(key [32]byte, plain []byte) []byte {
+	h, _ := blake3.NewKeyed(key[:])
+	_, _ = h.Write(plain)
+	return h.Sum(nil)
 }
 
 // Hybrid returns the default Cipher. New objects are sealed to current; objects
@@ -129,9 +167,10 @@ type ageCipher struct {
 // Volume's key is per Volume by construction: nothing is shared across Volumes,
 // and dedupe never crosses one.
 func Hybrid(current *age.HybridIdentity, retired ...*age.HybridIdentity) Cipher {
-	c := &ageCipher{current: current.Recipient(), curID: ageKeyID(current), ids: map[string]age.Identity{}}
+	c := &ageCipher{current: current.Recipient(), curID: ageKeyID(current), ids: map[string]age.Identity{}, tags: map[string][32]byte{}}
 	for _, k := range append([]*age.HybridIdentity{current}, retired...) {
 		c.ids[ageKeyID(k)] = k
+		c.tags[ageKeyID(k)] = tagKey(k)
 	}
 	return c
 }
@@ -150,6 +189,9 @@ func (c *ageCipher) Seal(plain []byte) ([]byte, string, error) {
 		return nil, "", err
 	}
 	if _, err := w.Write(plain); err != nil {
+		return nil, "", err
+	}
+	if _, err := w.Write(tag(c.tags[c.curID], plain)); err != nil {
 		return nil, "", err
 	}
 	if err := w.Close(); err != nil {
@@ -171,5 +213,12 @@ func (c *ageCipher) Open(sealed []byte, keyID string) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrCorrupt, err)
 	}
-	return plain, nil
+	if len(plain) < tagLen {
+		return nil, fmt.Errorf("%w: no tag", ErrCorrupt)
+	}
+	body, got := plain[:len(plain)-tagLen], plain[len(plain)-tagLen:]
+	if subtle.ConstantTimeCompare(got, tag(c.tags[keyID], body)) != 1 {
+		return nil, fmt.Errorf("%w: the tag does not verify", ErrCorrupt)
+	}
+	return body, nil
 }
