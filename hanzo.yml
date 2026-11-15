@@ -1,8 +1,9 @@
 # Go virtual filesystem with SQLite replication. Library + cmd/.
 #
-# The gates below run as parallel jobs, one per entry (.github/workflows/cicd.yml
-# names each by `gates:`; the last takes everything the others do not, so an entry
-# added here is gated by default). Each is under five minutes.
+# The gates below run as parallel jobs, one per entry: .github/workflows/cicd.yml
+# has a matrix that names each by `gates:`, and its last entry takes everything the
+# others do not, so an entry added here is gated by default. Each is under five
+# minutes.
 #
 #   check            build, vet, gofmt, and the small packages under the race detector
 #   race-a/b/c       the engine's unit tests under the race detector (-short), shared
