@@ -19,7 +19,11 @@ number, and nothing here describes any other.
 * A Volume lives in one place: a prefix of a bucket of an object store, or a
   directory. The place has a canonical location string, the same for every process that
   opens it (`s3://<bucket>/<prefix>` for an object store, `file://<absolute directory>`
-  for a directory). A reader and a writer MUST use the same string.
+  for a directory). A reader and a writer MUST use the same string. The string is
+  canonical: the prefix has no leading or trailing `/`; the directory is absolute,
+  cleaned (no `.`, `..`, doubled or trailing `/`) and has its symbolic links resolved,
+  so every spelling of one place gives one string. It never contains a credential, an
+  endpoint or a query.
 
 ## 2. What the store must provide
 
@@ -77,35 +81,64 @@ provides:
   under the key `keyID` names, or was altered, or if the Cipher does not hold that
   key (a distinct error, "unknown key").
 
+Authenticated means authenticated against the holder of the key material that opens:
+`Open` MUST refuse an object that a party without that material could have made. A
+public-key construction does not give that by itself, since whoever holds the public
+recipient can encrypt to the Volume; the Cipher MUST add something only the holders of
+the secret can produce. A Cipher that does not is a Cipher under which anyone who
+learns the recipient can forge a Head or a shard.
+
 A Cipher MAY hold several keys, sealing under the current one and opening any it
 holds; that is key rotation, and needs no re-encryption. A Cipher MUST be safe for
 concurrent use. When a Volume is configured it MUST check its Cipher: it seals a
 random 64-byte probe and refuses the Cipher unless the sealed bytes contain neither
 the probe nor its first 16 bytes, `Open` returns the probe, and `Open` fails when one
 bit in the middle of the sealed bytes is flipped. This refuses a Cipher wired to
-nothing; it does not prove a Cipher strong.
+nothing; it does not prove a Cipher strong. Because a Cipher can stop sealing after it
+was checked (a fallback to the identity when its key service is gone), the Volume also
+checks every `Seal`: the sealed bytes MUST NOT contain the context (4.2), and a Seal
+whose output does is an error, not a write.
 
 The reference implementation's default Cipher is a public-key hybrid of X25519 and
 ML-KEM-768, producing one self-contained encrypted file per sealed object; its key id
-is the first 8 bytes of the hash of the public recipient, in hex. (informative)
+is the first 8 bytes of the hash of the public recipient, in hex. Its integrity rests
+on the secrecy of the identity, not of the recipient: the plaintext carries a final
+32-byte tag, the BLAKE3 keyed hash of everything before it under a key derived from
+the secret identity (`DeriveKey("hanzoai/vfs seal tag", identity string)`), and `Open`
+refuses an object whose tag does not verify. A party that holds only the public
+recipient can encrypt to the Volume but cannot make an object the Volume accepts.
+Everything that can open an object can also seal one. (informative)
 
 ### 4.2 The frame and its context
 
 A sealed object is `[len(keyID): 1 byte][keyID][sealed]`, where `sealed` is
-`Seal(aad || plaintext)`. The `aad` names what the object is and is not stored: a
-reader supplies the one it expects, and after `Open` MUST verify that the plaintext
-begins with it, and refuse the object otherwise. So an object of another Volume, of
-another kind or in another place fails closed even under a Cipher both Volumes share.
+`Seal(ctx || plaintext)`. The context `ctx` names what the object is and is not
+stored. It is always exactly 32 bytes: the BLAKE3 digest of
 
-| Object | `aad` |
-|---|---|
-| Head | the ASCII bytes `vfs head ` followed by the canonical location string of the place |
-| shard | the ASCII bytes `vfs shard ` followed by the 16-byte Volume id |
-| chunk | the ASCII bytes `vfs chunk ` followed by the 16-byte Volume id and the 32-byte chunk id |
+    "hanzoai/vfs seal context" || frame(kind) || frame(field 1) || frame(field 2) ...
+
+where `frame(x)` is the length of `x` as an unsigned varint followed by `x`, and the
+kind and fields are:
+
+| Object | kind | fields |
+|---|---|---|
+| Head | `head` | the canonical location string of the place |
+| shard | `shard` | the 16-byte Volume id |
+| chunk | `chunk` | the 16-byte Volume id, the 32-byte chunk id |
+
+A reader supplies the context it expects, and after `Open` MUST check that the first
+32 bytes of the plaintext are equal to it, byte for byte, and refuse the object
+otherwise; the plaintext proper is what follows. Because the context has a fixed
+length and its preimage is length-framed, no context is a prefix of another and two
+different (kind, fields) never share one, so an object of another Volume, of another
+kind or of another place fails closed even under a Cipher both Volumes share. A
+variable-length context compared as a prefix would not: a Head sealed for
+`.../vol10` would open at `.../vol1` and at the bucket root.
 
 A Head is bound to its place: a Volume copied to another place does not open there
 until its Head is sealed again for that place. Shards and chunks are bound to the
-Volume, so they move with it.
+Volume, so they move with it, and moving a Volume is copying its objects and then
+resealing the Head (5.4).
 
 ## 5. The Head, the fence and the commit
 
@@ -122,8 +155,9 @@ bytes), and nothing after. It is sealed (4.2) and placed in a fence record.
 * `Root` is the ref (section 6) of the root shard, or 32 zero bytes for the empty tree.
 * `Next` is the next inode number to assign.
 * `ID` names the Volume. A new Volume draws it at random.
-* `Seed` draws the Volume's chunking table (section 7.2). A new Volume draws it at
-  random. It is as secret as the Volume.
+* `Seed` draws the Volume's chunking table (section 7.2) and keys the boundaries of
+  the metadata tree (section 6.3). A new Volume draws it at random. It is as secret as
+  the Volume: it is what a party who chooses file names does not know.
 
 A reader MUST bound its read of `head` (the reference implementation accepts at most
 64 KiB).
@@ -157,7 +191,12 @@ write is what enforces it:
 
 The Volume is attached at a Round `r` that MUST be strictly greater than the round
 recorded, and MUST NOT be 0 or 2^64-1 (no Round could follow the latter). A Volume
-opened without a Round is read-only and claims nothing. After a successor has claimed,
+opened without a Round is read-only and claims nothing. After any error from an attach
+other than a refusal for a Round that is too low, the claim may or may not have
+landed (a reply can be lost), and a caller that tries again MUST use a higher Round: a
+claim that landed with its reply lost is recognised as the claimant's own only by a
+retry inside the same call, which finds its own bytes, and a later call at the same
+Round is told "stale round". After a successor has claimed,
 no commit by a lower Round can land: its conditional write finds a different version, or
 its read finds a higher round.
 
@@ -189,6 +228,17 @@ the writer was fenced and can never commit again; if the store's Head then holds
 exactly the writer's root and Volume id (an earlier attempt landed and a successor
 carried it forward), the commit counts as landed.
 
+### 5.4 Moving a Volume
+
+Only the Head is bound to the place (4.2). To move a Volume to another place, copy
+every object under its prefix to the new place and then reseal the Head there: read
+`head` through the fence, open its sealed payload under the context of the old place's
+canonical location string, check that it decodes as a Head, seal it again under the
+context of the new place, and write it with the Claim procedure (5.2) at a Round
+strictly greater than the one recorded (neither 0 nor 2^64-1). The reseal fences the
+copy only: a writer still attached at the old place is not told, so it must be
+stopped first. A failed reseal is retried at a higher Round.
+
 ## 6. The metadata tree
 
 All metadata is records in one ordered tree of immutable shards: a Merkle search tree
@@ -210,13 +260,40 @@ root directory is inode 1. Inode numbers are assigned in increasing order from
 `Head.Next` and are never reused within a Volume. A name is 1 to 255 bytes, contains
 no `/` and no NUL, and is not `.` or `..`.
 
-An inode's fields: tag 1 mode (uvarint, a 32-bit value: the low 9 bits are the permissions `rwxrwxrwx`
-and bit 31 marks a directory; no other type bit is used yet), 2 size in bytes (uvarint), 3 mtime, 4 atime, 5 ctime (varint, nanoseconds
-since the Unix epoch). Tags 1 to 5 MUST be present. A reader MUST check the fields it
+An inode's fields: tag 1 mode (uvarint, a 32-bit value, below), 2 size in bytes
+(uvarint), 3 mtime, 4 atime, 5 ctime (varint, nanoseconds since the Unix epoch). Tags 1 to 5 MUST be present. A reader MUST check the fields it
 knows, MUST reject tags that are not strictly ascending, MUST keep the bytes of fields
 it does not know and write them back unchanged when it rewrites the inode, and MUST
 NOT fail on them. A new attribute is a new tag. A new kind of record is a new first
 byte of the key; a reader MUST ignore records of a table it does not know.
+
+The mode is a 32-bit value whose bits are fixed here, so that a later record never has
+to reinterpret one:
+
+| Bits | Meaning |
+|---|---|
+| 0 to 8 | permissions `rwxrwxrwx` (octal 0777) |
+| 20 | sticky |
+| 22, 23 | setgid, setuid |
+| 31 | directory |
+| 27 | symbolic link |
+| 26, 25, 24, 21 | device, named pipe, socket, character device |
+| 19 | irregular file |
+| 28, 29, 30 | reserved |
+
+A regular file has none of the type bits (19, 21, 24 to 27, 31). The type bits of the
+mode are the ones listed (19, 21, 24, 25, 26, 27, 31), and a directory entry (6.1)
+records those only. A writer MUST NOT set a bit this table does not list; a reader
+MUST keep bits it does not understand when it rewrites an inode and MUST NOT act on
+them. The reference implementation sets bit 31 and the permissions today and no other.
+
+Fields are optional by default: a reader that does not know one keeps it and ignores
+its meaning. A field that some writer must maintain for the Volume to stay consistent
+is critical: a link count that every unlink must adjust is one, an owner is not. A
+critical field MUST be announced by a new field in the Head, after `Seed`. The Head is
+strict (a reader rejects bytes after the last field it knows), so a reader that does not
+know the announcement refuses the Volume, instead of rewriting inodes behind the
+field's back.
 
 ### 6.2 Shards and nodes
 
@@ -231,18 +308,26 @@ read (the reference implementation accepts at most 1 MiB, since a node ends at
 
 ### 6.3 Where a node ends
 
-A tree is canonical: its shape depends on its records alone, so the tree built
+A tree is canonical: its shape depends on its records and the Volume's seed alone, so the tree built
 incrementally by a sequence of changes is identical, shard for shard, to the tree
 built from scratch from the same records. A writer MUST produce the canonical shape.
 Entries of one level are taken in key order and cut into nodes: an entry ends its node
 if either
 
 * `size = len(key) + len(value) + 4` and `u32le(H[0:4]) * 65536 < size * 2^32`, where
-  `H = BLAKE3(level_byte || key)`, `level_byte` is the level as one byte, and
-  `u32le(H[0:4])` is the first four bytes of `H` as a little-endian unsigned integer
-  (65536 is the average node size, 64 KiB); or
+  `H` is the BLAKE3 keyed hash, under the key `K` below, of `level_byte || key`,
+  `level_byte` is the level as one byte, and `u32le(H[0:4])` is the first four bytes of
+  `H` as a little-endian unsigned integer (65536 is the average node size, 64 KiB); or
 * the node's accumulated size (the sum of `size` over its entries) has reached
   512 KiB.
+
+The key is `K = DeriveKey("hanzoai/vfs tree boundaries", Head.Seed)` (32 bytes). It is
+secret to the Volume, and that is its purpose: with an unkeyed hash a party who chooses
+file names (an archive being unpacked) can choose names that each end their own node,
+and 2,000 such names cost 2,007 shards instead of 4. With the key the boundaries fall
+where they fall, and the tree is a pure function of the records and the seed: two
+writers that hold the Head build the same tree, and a writer that does not hold it
+cannot predict where a node will end.
 
 The last node of a level ends there whatever the entries. If a level yields one node,
 that node is the root; otherwise its nodes become the entries of the next level up
@@ -342,6 +427,8 @@ a fetch. (informative; the reasons are in the implementation's notes.)
 | round | 1 to 2^64-2 for a writer |
 | fence retries | at most 8 compare-and-set attempts per Put or Claim |
 | key id | 1 to 255 bytes |
+| sealing context | exactly 32 bytes |
+| default Cipher tag | 32 bytes at the end of the plaintext |
 
 ## 10. Conformance
 
@@ -351,9 +438,12 @@ reference implementation (all in the repository root unless a package is named):
 | Property | Tests |
 |---|---|
 | objects are written once; crash at any point leaves the last commit | `TestSigkill` (six kill points), `TestFailureAtEveryWrite`, `TestLostAcknowledgementOfHead`, `TestKillOverRealServer` |
-| fence: one winner, older Round refused, takeover loses nothing, lost acknowledgements | `pkg/fence` tests, `TestFenceRefusesOlderRound`, `TestAttachNeedsAHigherRound`, `TestTakeoverLosesNoAcknowledgedCommit`, `TestRacingClaims`, `TestSameRoundRace`, `TestAttachLostAckIsNotStale`, `TestRoundMaxIsRefused`, `TestHeadSeqNeverRepeats` |
+| fence: one winner, older Round refused, takeover loses nothing, lost acknowledgements | `pkg/fence` tests, `TestFenceRefusesOlderRound`, `TestAttachNeedsAHigherRound`, `TestTakeoverLosesNoAcknowledgedCommit`, `TestRacingClaims`, `TestSameRoundRace`, `TestAttachLostAckIsNotStale`, `TestAttachAfterALostClaimNeedsAHigherRound`, `TestRoundMaxIsRefused`, `TestHeadSeqNeverRepeats` |
 | store contract | `internal/storetest` conformance suite, run on every backend; `TestRealServerCAS`, `TestRealServerRaceStress` |
-| sealing context and the Cipher check | `TestSealedToItsContext`, `TestIdentityCipherIsRefused`, `TestWrongKeyFailsClosed`, `TestTamperedObjectsAreRefused`, `TestSwappedChunkIsRefused`, `TestChunkHashIsChecked` |
+| sealing context, exact and injective | `TestSealedToItsContext`, `TestHeadContextIsExact`, `TestContextsDoNotCollide`, `TestSwappedHeadIsRefused`, `TestChunkHashIsChecked` |
+| the Cipher: checked at configuration and at every Seal; unforgeable with the recipient alone | `TestIdentityCipherIsRefused`, `TestCipherThatStopsSealingIsCaughtAtEverySeal`, `TestRecipientAloneCannotForge`, `TestWrongKeyFailsClosed`, `TestTamperedObjectsAreRefused`, `TestSwappedChunkIsRefused` |
+| places and moving a Volume | `TestPlaceSpellings`, `TestResealMovesAVolume` |
+| keyed tree boundaries | `TestGroundNamesDoNotBloatTheTree`, `TestBoundariesDependOnTheSeed` |
 | rotation | `TestRotation` |
 | records and the tagged inode | `TestInodeRecordIsExtensible`, `TestHeadRejectsGarbage` |
 | canonical tree | `TestTreeMatchesModel`, `TestTreeForcedCuts` |
@@ -361,12 +451,11 @@ reference implementation (all in the repository root unless a package is named):
 | holes and truncation, byte for byte against a plain model | `TestSparseExact`, `TestSparseRandom`, `TestSparsePetabyte`, `TestModelFuzz` |
 | bounded reads | `TestHeadBound`, `TestShardBound`, `TestBackendBodyIsBounded`, `TestReadIsBounded` |
 | prefixes | `TestValidPrefix`, `TestPrefixConfinement` |
-| durability and interrupts on a mount | `TestFUSEFsyncSurvivesKill`, `TestFUSEInterruptsAreNotErrors`, `TestCommitSurvivesItsCaller` (`pkg/mount`) |
+| durability and interrupts on a mount | `TestFUSEFsyncSurvivesKill`, `TestFUSEInterruptsAreNotErrors`, `TestCommitSurvivesItsCaller`, `TestInterruptedFsyncRetriesDoNotPileUp`, `TestFUSEReadsExistingFilesOverS3` (`pkg/mount`) |
 
 ## 11. Not specified
 
 Rename, links, symbolic links, owner and mode changes, extended attributes, locks and
 file-system statistics have no records yet; a mount answers them "not supported". There
-is no garbage collection of unreferenced objects, no snapshot or clone, and no way to
-seal a Head for a new place. Deadlines, retries and back-off are the caller's. Sealed
+is no garbage collection of unreferenced objects and no snapshot or clone. Deadlines, retries and back-off are the caller's. Sealed
 sizes depend on the Cipher.

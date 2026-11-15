@@ -1,84 +1,92 @@
 # Go virtual filesystem with SQLite replication. Library + cmd/.
 #
-# Seven steps, run in parallel, each under five minutes:
-#   unit        gofmt, vet, and the unit suite under the race detector (-short)
-#   model       the tests that run random operations against a plain model, under the
-#               race detector (-short); the complement of unit's skip list
-#   realserver  the engine against a real Hanzo S3 server: every test that needs one
-#   kill        a writer killed at random moments over the real server
-#   mount       the FUSE front on a kernel mount, served from a child process
-#   scale       the measurements: 100,000 files, a million inodes, sync cost, the
-#               object budget, a checkout, a petabyte, amplification; without -race,
-#               which only slows the hashing they measure (-short skips them)
-#   fuzz        the model run over many more seeds, without -race
+# The gates below run as parallel jobs, one per entry (.github/workflows/cicd.yml
+# names each by `gates:`; the last takes everything the others do not, so an entry
+# added here is gated by default). Each is under five minutes.
 #
-# realserver, kill and mount fail if a test they exist for did not run: a skip is a
-# failure there, never a pass. The unit step runs without the real server and without
-# a mount, and its skips are expected.
+#   check            build, vet, gofmt, and the small packages under the race detector
+#   race-a/b/c       the engine's unit tests under the race detector (-short), shared
+#                    out by the first letter of the test's name
+#   model            the tests that run random operations against a plain model, in
+#                    -short size and without the race detector, which multiplies the
+#                    hashing and sealing they do tenfold and finds nothing in code with
+#                    no goroutines
+#   realserver       the engine against a real Hanzo S3 server: every test that needs one
+#   realserver-kill  a writer killed at random moments over the real server, and a
+#                    mount over it
+#   mount            the FUSE front on a kernel mount
+#   mount-signals    signals sent at callers waiting on the mount
+#   mount-checkout   a 5,000-file checkout through the mount
+#   scale-a/b        the measurements: 100,000 files, a million inodes, sync cost, the
+#                    object budget, a petabyte, amplification; without the race detector,
+#                    which only slows the hashing they measure (-short skips them)
+#   fuzz             the model run over many more seeds
 #
-# The real server is built from a pinned commit of hanzoai/s3, not consumed as a
-# release: the published releases are an older line without the own-storage server
-# whose conditional writes the Head stands on, and `go install pkg@commit` is
-# refused because that module carries a replace directive. A pinned commit is
-# immutable, so the build is reproducible; it takes about a minute on four cores.
+# realserver, realserver-kill and the mount gates fail if a test they exist for did not
+# pass: a skip is a failure there, never a pass. The real server is built from a pinned
+# commit (tools/ci/s3server.sh). The mount gates run in a user namespace with a stand-in
+# for the setuid helper (tools/ci/mount.sh), since the runner ignores setuid bits.
 # Tests find the server as `s3` on PATH; there is no environment switch.
 test:
-  - name: unit
+  - name: check
     run: |
       set -euo pipefail
       go build ./...
       go vet ./...
       go vet -tags fuse ./pkg/mount
+      GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go vet -tags fuse ./pkg/mount
       test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
-      go test -race -short -skip '^Test(Sparse|Model|TreeForced)' ./...
+      go test -race -short -count=1 ./cmd/... ./pkg/... ./replica/...
+  - name: race-a
+    run: go test -race -short -count=1 -run '^Test[A-D]' -skip '^Test(Sparse|Model|TreeForced)' .
+  - name: race-b
+    run: go test -race -short -count=1 -run '^Test[E-R]' -skip '^Test(Sparse|Model|TreeForced)' .
+  - name: race-c
+    run: go test -race -short -count=1 -run '^Test[S-Z]' -skip '^Test(Sparse|Model|TreeForced)' .
   - name: model
-    run: |
-      set -euo pipefail
-      go test -race -short -count=1 -run '^Test(Sparse|Model|TreeForced)' .
+    run: go test -short -count=1 -run '^Test(Sparse|Model|TreeForced)' .
   - name: realserver
     run: |
       set -euo pipefail
-      S3_COMMIT=cbf3d650091a24f915aece9901e77bfef785721c
-      ROOT=$PWD
-      SRC=$(mktemp -d)
-      mkdir -p bin
-      git clone --quiet --filter=blob:none https://github.com/hanzoai/s3 "$SRC"
-      git -C "$SRC" checkout --quiet "$S3_COMMIT"
-      (cd "$SRC" && CGO_ENABLED=0 go build -trimpath -o "$ROOT/bin/s3" ./s3)
-      export PATH="$ROOT/bin:$PATH"
-      go test -count=1 -v -timeout 15m \
-        -run '^(TestRealServerConforms|TestRealServerRaceStress|TestRealServerCAS|TestRealServerMultipartIsConditional|TestPrefixConfinement|TestCommitRateOnRealServer|TestGetPairsBodyWithVersion|TestSameRoundRace|TestFenceRefusesOlderRound|TestAttachNeedsAHigherRound|TestTakeoverLosesNoAcknowledgedCommit|TestRacingClaims|TestVolumeOnEveryStore)$' \
-        . ./pkg/backend/s3 | tee realserver.log
+      bin=$(mktemp -d)
+      tools/ci/s3server.sh "$bin"
+      export PATH="$bin:$PATH"
+      log="$bin/realserver.log"
+      go test -count=1 -v -timeout 4m \
+        -run '^(TestRealServerConforms|TestRealServerRaceStress|TestRealServerCAS|TestRealServerMultipartIsConditional|TestPrefixConfinement|TestCommitRateOnRealServer|TestGetPairsBodyWithVersion|TestCancelledS3RequestsAreNotFaults|TestConditionalWriteAtTheSingleRequestBound|TestSameRoundRace|TestFenceRefusesOlderRound|TestAttachNeedsAHigherRound|TestTakeoverLosesNoAcknowledgedCommit|TestRacingClaims|TestVolumeOnEveryStore)$' \
+        . ./pkg/backend/s3 | tee "$log"
       for t in TestRealServerConforms TestRealServerRaceStress TestRealServerCAS TestRealServerMultipartIsConditional \
                TestPrefixConfinement TestCommitRateOnRealServer TestGetPairsBodyWithVersion \
+               TestCancelledS3RequestsAreNotFaults TestConditionalWriteAtTheSingleRequestBound \
                TestSameRoundRace/hanzo-s3 TestFenceRefusesOlderRound/hanzo-s3 TestAttachNeedsAHigherRound/hanzo-s3 \
                TestTakeoverLosesNoAcknowledgedCommit/hanzo-s3 TestRacingClaims/hanzo-s3 TestVolumeOnEveryStore/hanzo-s3; do
-        grep -q -- "--- PASS: $t " realserver.log || { echo "did not pass against the real server: $t"; exit 1; }
+        grep -q -- "--- PASS: $t " "$log" || { echo "did not pass against the real server: $t"; exit 1; }
       done
-  - name: kill
+  - name: realserver-kill
     run: |
       set -euo pipefail
-      S3_COMMIT=cbf3d650091a24f915aece9901e77bfef785721c
-      ROOT=$PWD
-      SRC=$(mktemp -d)
-      mkdir -p bin
-      git clone --quiet --filter=blob:none https://github.com/hanzoai/s3 "$SRC"
-      git -C "$SRC" checkout --quiet "$S3_COMMIT"
-      (cd "$SRC" && CGO_ENABLED=0 go build -trimpath -o "$ROOT/bin/s3" ./s3)
-      export PATH="$ROOT/bin:$PATH"
-      go test -count=1 -v -timeout 15m -run '^TestKillOverRealServer$' . | tee kill.log
-      grep -q -- '--- PASS: TestKillOverRealServer ' kill.log || { echo "TestKillOverRealServer did not pass"; exit 1; }
+      bin=$(mktemp -d)
+      tools/ci/s3server.sh "$bin"
+      export PATH="$bin:$PATH"
+      log="$bin/kill.log"
+      go test -count=1 -v -timeout 3m -run '^TestKillOverRealServer$' . | tee "$log"
+      grep -q -- '--- PASS: TestKillOverRealServer ' "$log" || { echo "TestKillOverRealServer did not pass"; exit 1; }
+      tools/ci/mount.sh run '^TestFUSEReadsExistingFilesOverS3$' TestFUSEReadsExistingFilesOverS3
   - name: mount
     run: |
-      set -euo pipefail
-      go test -tags fuse -count=1 -v -timeout 10m ./pkg/mount | tee mount.log
-      if grep -E -- '^\s*--- SKIP' mount.log | grep -v TestMountChild; then echo "a mount test skipped"; exit 1; fi
-      grep -q -- '--- PASS: TestFUSEPetabyteTruncate ' mount.log || { echo "TestFUSEPetabyteTruncate did not pass"; exit 1; }
-  - name: scale
-    run: |
-      set -euo pipefail
-      go test -count=1 -timeout 15m -run '^(TestHundredThousandFiles|TestMillionInodes|TestSyncCostDoesNotGrowWithTheTree|TestObjectBudget150GiB|TestCheckoutCost|TestCommitPerClose|TestChunkedFilesCommitCost|TestObjectsPerThousandSmallFiles|TestAppendWithFsyncAmplification|TestColdReadAmplification|TestSmallWritesAmplifyMemory|TestSparsePetabyte|TestMillionEntryDirectory|TestSequentialWriteMemory|TestFlushLatency|TestSustainedWriteWithFsync)$' .
+      tools/ci/mount.sh skip '^(TestFUSECheckout|TestFUSEInterruptsAreNotErrors|TestFUSEReadsExistingFilesOverS3)$' \
+        TestFUSEPOSIX TestFUSESemantics TestFUSEUnsupportedIsHonest TestFUSEHostileNames TestFUSEConcurrentSameFile \
+        TestFUSECommitPerClose TestFUSEKillDuringWrite TestFUSEUnlinkVersusRmdir TestFUSEPetabyteTruncate \
+        TestFUSEFileTooBig TestFUSEFsyncSurvivesKill TestFUSESQLite \
+        TestInterruptIsEINTR TestCommitSurvivesItsCaller TestCloseWaitsForItsCommit TestReadWaitsForItsData \
+        TestInterruptedFsyncRetriesDoNotPileUp TestSessionRefusesANilContext TestLookedUpFileReadsOnTheMountContext
+  - name: mount-signals
+    run: tools/ci/mount.sh run '^TestFUSEInterruptsAreNotErrors$' TestFUSEInterruptsAreNotErrors
+  - name: mount-checkout
+    run: tools/ci/mount.sh run '^TestFUSECheckout$' TestFUSECheckout
+  - name: scale-a
+    run: go test -count=1 -timeout 4m -run '^(TestHundredThousandFiles|TestMillionInodes|TestSyncCostDoesNotGrowWithTheTree|TestObjectBudget150GiB|TestMillionEntryDirectory|TestSequentialWriteMemory|TestSparsePetabyte)$' .
+  - name: scale-b
+    run: go test -count=1 -timeout 4m -run '^(TestCheckoutCost|TestCommitPerClose|TestChunkedFilesCommitCost|TestObjectsPerThousandSmallFiles|TestAppendWithFsyncAmplification|TestColdReadAmplification|TestSmallWritesAmplifyMemory|TestFlushLatency|TestSustainedWriteWithFsync|TestTinyExtentsCost|TestPetabyteScattered)$' .
   - name: fuzz
-    run: |
-      set -euo pipefail
-      go test -count=1 -timeout 15m -run '^TestModelFuzzMany$' .
+    run: go test -count=1 -timeout 4m -run '^TestModelFuzzMany$' .

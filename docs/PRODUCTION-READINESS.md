@@ -69,7 +69,7 @@ the last committed tree, whole, and a retry commits the next.
 | after the first shard upload | `TestSigkill/sharded` |
 | before the Head write | `TestSigkill/head` |
 | after the Head write | `TestSigkill/landed` |
-| each of the 9 store writes of a commit failing in turn | `TestFailureAtEveryWrite` |
+| every write of a commit failing in turn, by kind: the pack, each shard, the Head | `TestFailureAtEveryWrite` |
 | Head landed, reply lost, then retry | `TestLostAcknowledgementOfHead`, `TestLostAckNoLostUpdateNoDuplicate` |
 | Head landed, reply lost, then takeover | `TestLostAckThenTakeoverIsNotReportedLost` |
 | takeover during a stream of commits | `TestTakeoverLosesNoAcknowledgedCommit` |
@@ -87,7 +87,13 @@ the last committed tree, whole, and a retry commits the next.
 | Conditional writes are never silently unconditional | pass | `TestRealServerMultipartIsConditional`, `TestLargeConditional`: above 64 MiB (a multipart upload) a conditional write is refused with `ErrTooLarge` |
 | A read returns at most what its kind of object may weigh | pass | `TestHeadBound`, `TestShardBound`, `TestBackendBodyIsBounded`, `TestReadIsBounded`: a hostile store cannot make a read allocate its way out |
 | Backend outage surfaces, loses nothing | pass | `TestFailureAtEveryWrite`: an error from the store is an error from `Flush`, the changes stay in memory, the store is untouched |
-| Wrong key fails closed; tampered, swapped or foreign objects are refused | pass | `TestWrongKeyFailsClosed`, `TestTamperedObjectsAreRefused`, `TestSwappedChunkIsRefused`, `TestTreeDetectsSwappedShard`, `TestChunkHashIsChecked`, `TestSealedToItsContext` (a shard, chunk or Head of another Volume or place does not open under a Cipher both share) |
+| Wrong key fails closed; tampered, swapped or foreign objects are refused | pass | `TestWrongKeyFailsClosed`, `TestTamperedObjectsAreRefused`, `TestSwappedChunkIsRefused`, `TestTreeDetectsSwappedShard`, `TestChunkHashIsChecked`, `TestSealedToItsContext`, `TestHeadContextIsExact`, `TestSwappedHeadIsRefused` (a shard, chunk or Head of another Volume or place does not open under a Cipher both share; the context is a fixed-length digest compared for equality, so a Head sealed for `.../vol10` does not open at `.../vol1`) |
+| A Cipher that stops sealing is caught at the first Seal | pass | `TestCipherThatStopsSealingIsCaughtAtEverySeal` |
+| The recipient alone cannot forge an object | pass | `TestRecipientAloneCannotForge`: every sealed object carries a tag keyed from the secret identity, so integrity rests on the identity, not on the (public) recipient |
+| A guest who picks file names cannot multiply the metadata | pass | `TestGroundNamesDoNotBloatTheTree`: names ground against another key write as many shards as ordinary ones (6 and 6; 2,007 and 4 before the boundaries were keyed from the Volume's seed) |
+| Every spelling of one place is one place; a moved Volume is resealed | pass | `TestPlaceSpellings`, `TestResealMovesAVolume` |
+| Interrupted fsync retries do not pile up | pass | `TestInterruptedFsyncRetriesDoNotPileUp`: 5,000 retries against a stalled store leave at most two commits, one running and one waiting |
+| A mount hands the store a context on every path | pass | `TestLookedUpFileReadsOnTheMountContext` (over a store that panics on a nil context), `TestSessionRefusesANilContext`, `TestFUSEReadsExistingFilesOverS3` (a mount over the real server) |
 | A Cipher that hides nothing is refused at configuration | pass | `TestIdentityCipherIsRefused` |
 | Key rotation | pass | `TestRotation`: a Cipher with the new key and the old one reads everything and seals under the new; once the old is dropped, what only it sealed no longer opens |
 | No key, plaintext or name on disk; the Cipher is the only door | pass | `TestNothingKeyShapedOnDisk`, `TestCipherIsTheOnlyDoor`, `TestEveryObjectIsHybridPQ`, `TestCLIRoundTrip` (the key comes from standard input; an environment variable is ignored) |
@@ -105,8 +111,19 @@ the last committed tree, whole, and a retry commits the next.
 Mount tests run only with `-tags fuse`, from a child process that serves the mount
 while the test acts as its client; a process that mounts a Volume and also opens a
 file on that mount deadlocks. The real-server tests need an `s3` binary on `PATH`.
-CI (`hanzo.yml`) builds that server from a pinned commit of `hanzoai/s3` and fails
-the step if any of those tests did not pass: a skip is a failure there.
+
+CI (`hanzo.yml`, `.github/workflows/cicd.yml`) runs thirteen gates as parallel jobs,
+each under five minutes: `check`; the engine's unit tests under the race detector
+shared three ways (`race-a`, `race-b`, `race-c`); `model`, the random tests against a
+plain model, without the race detector (they have no goroutines, and the detector
+multiplies their hashing tenfold); `realserver` and `realserver-kill`, which build the
+server from a pinned commit of `hanzoai/s3` and fail if a test they exist for did not
+pass; `mount`, `mount-signals` and `mount-checkout`; the measurements `scale-a` and
+`scale-b`; and `fuzz`. A skip is a failure in every gate that needs a server or a
+mount. The runner is a sandbox whose kernel ignores the setuid bit and gives its user
+no capability, so the mount gates cannot use `fusermount3`; they run inside a user
+namespace (`unshare -Urm`), where the user holds every capability and may mount a
+file system, with `tools/fusemount` on `PATH` as `fusermount3`.
 
 ## Measurements
 
@@ -206,6 +223,9 @@ tests that use a cheap stand-in cipher (the tree and chunk-list tests) count nod
 and chunks, which do not depend on the Cipher, and none of them contributes a number
 to this document.
 
+Moving a Volume is a copy of its objects and `vfs.Reseal` of its Head: only the Head
+is bound to the place (`TestResealMovesAVolume`).
+
 ## Upload defaults
 
 A pack is cut at 16 MiB (`packTarget`, the top of the 4 to 16 MiB range that suits an object store) and
@@ -260,10 +280,14 @@ Plain statements of fact; each is its own change.
   cannot be told from the current one without a pin; a caller that must notice keeps
   the `Seq` of the last Head it saw. `Seq` counts commit attempts and never repeats,
   but it can skip.
-* Re-sealing a Volume's Head for a new place: a Volume copied to another prefix or
-  bucket does not open until its Head is sealed again.
 * `vfs serve` and the agent.
 * Compression.
+* A tiny extent costs a whole sealed chunk (a few hundred bytes of header and tag on
+  top of its bytes): 100,000 scattered 17-byte writes into a sparse file are 100,000
+  chunks, about 171 MiB of packs for about 2 MiB of data, and a first Flush of 12.7 s
+  (`TestTinyExtentsCost`). The cost follows the number of extents, not the size of the
+  file. Packing tiny extents inline is not built.
+* `statfs` answers zeros.
 
 ## Running the tests
 

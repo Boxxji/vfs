@@ -65,17 +65,23 @@ order. A reader checks the tags it knows, carries the ones it does not, and writ
 them back on rewrite, so owner, link count, device, symlink target and the like are
 new tags. New record kinds take the next `[table]` byte.
 
-Node boundaries are decided by the entries (a hash of the key under a threshold
-proportional to the entry's size), average 64 KiB, so the tree's shape is a pure
-function of its records. A change rewrites the changed leaves and their ancestors
+Node boundaries are decided by the entries (a keyed hash of the key under a
+threshold proportional to the entry's size, the key derived from the Volume's seed),
+average 64 KiB, so the tree's shape is a pure function of its records and the seed.
+The key is what stops a guest who picks file names from picking names that each end
+their own node (2,000 such names cost 2,007 shards instead of 4). A change rewrites the changed leaves and their ancestors
 and nothing else; the new root equals the root built from scratch
 (`TestTreeMatchesModel`, `TestTreeForcedCuts`).
 
-**Sealing context.** Every object is sealed together with what it is: a Head to
-the Volume's place (`Backend.String()`), a shard to its Volume id, a chunk to its
-Volume id and its own id. An object from another Volume or place does not open even
-under a Cipher both share. A Volume copied to another place does not open there
-until its Head is re-sealed (not built yet).
+**Sealing context.** Every object is sealed together with what it is: a 32-byte
+digest of its kind and of the length-framed fields that name it (a Head: its place,
+`Backend.String()`; a shard: its Volume id; a chunk: its Volume id and its own id).
+The reader compares it for equality, so no context is a prefix of another. An object
+from another Volume or place does not open even under a Cipher both share, and every
+Seal checks that the Cipher did not return its input. Only the Head is bound to the
+place: a Volume copied to another place does not open there until `vfs.Reseal`
+rewrites its Head for it. The place string is canonical: absolute and symlink-free
+for a directory, `s3://bucket/prefix` without slashes at the ends for a bucket.
 
 ## Commit, Flush, Fsync
 
@@ -202,15 +208,20 @@ and hides that from the caller: retries and deadlines are not built yet.
 ```
 go test ./...                                    # fast + scale tests
 go test -short -race ./...                       # the unit step of CI
-go test -tags fuse ./pkg/mount                   # needs /dev/fuse + fusermount
-PATH=$DIR:$PATH go test ./...                    # $DIR holds an `s3` built from github.com/hanzoai/s3
+go test -tags fuse ./pkg/mount                   # needs /dev/fuse + fusermount3
+tools/ci/mount.sh run '^TestFUSEPOSIX$'          # the same with no helper and no privilege, in a user namespace
+PATH=$DIR:$PATH go test ./...                    # $DIR holds an `s3` built from github.com/hanzoai/s3 (tools/ci/s3server.sh DIR)
 go run ./tools/mutate                            # every mutation must be killed by a test
 ```
 
 The real-server tests start `s3 server` (own-storage mode) in a temp dir with a
 throwaway key pair, race 16 and 128 writers on one version, run whole Volumes on it,
-and kill a writer at random moments. CI builds that server from a pinned commit of
-`hanzoai/s3` and fails if any of them skips (`hanzo.yml`). Crash tests kill a
+and kill a writer at random moments. CI (`hanzo.yml`, `.github/workflows/cicd.yml`)
+runs thirteen gates as parallel jobs, each under five minutes: the real-server gates
+build that server from a pinned commit of `hanzoai/s3` and fail if a test did not
+pass; the mount gates run on a kernel mount inside a user namespace (the runner is a
+sandbox with no setuid helper and no privilege; `tools/fusemount` does what
+fusermount3 does there) and fail on a skip. Crash tests kill a
 re-executed test binary with SIGKILL at every point of a commit (the key arrives on
 its stdin). A mount test serves the Volume from a child process, always: a process
 that mounts a Volume and also opens a file on that mount deadlocks. Go registers the

@@ -50,6 +50,8 @@ v.Flush(ctx)                                                // durable: head adv
 `Flush` returns only after the Head naming everything written has advanced in the
 store. `Fsync` is `Flush`.
 
+Moving a Volume to another bucket or directory is a copy of its objects and `vfs.Reseal` of its Head.
+
 See [`docs/SPECIFICATION.md`](./docs/SPECIFICATION.md) for the on-disk layout and protocols as a third party could implement them, [`LLM.md`](./LLM.md) for the commit and fence protocols, and what
 is not built yet, and [`docs/PRODUCTION-READINESS.md`](./docs/PRODUCTION-READINESS.md)
 for the measurements.
