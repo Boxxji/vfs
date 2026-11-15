@@ -35,7 +35,6 @@ func TestWorkflowsNeedTheirInputs(t *testing.T) {
 	for name, p := range map[string]Params{
 		"checkout": {Project: "/p", State: "/s", From: "a"},
 		"npm":      {Project: "/p", State: "/s"},
-		"pnpm":     {Project: "/p", State: "/s"},
 		"uvsync":   {Project: "/p", State: "/s"},
 	} {
 		if _, err := workflows[name](p); err == nil {

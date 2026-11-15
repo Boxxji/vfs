@@ -110,9 +110,11 @@ func report(w io.Writer, dir string) error {
 	fmt.Fprint(w, "### Order: first K distinct 1 MiB extents of run 1 against run 2 (reach % / same-prefix %)\n\n")
 	tabulate(w, []string{"workflow", "project", "K=10", "K=100", "K=1000", "K=10000", "run 2 transitions also in run 1 %", "transitions (n)"}, orders)
 
+	sims := simulations(d, wfs)
+	summaryTable(w, d, wfs, sims)
 	reuseTables(w, d, wfs)
 	readTable(w, d, wfs)
-	simTables(w, d, wfs)
+	simTables(w, d, wfs, sims)
 	setTable(w, d, wfs)
 	waitTable(w, d, wfs)
 	return nil
@@ -245,4 +247,35 @@ func waitTable(w io.Writer, d *Dataset, wfs []string) {
 		}
 	}
 	tabulate(w, []string{"workflow", "project", "read calls (n)", "traced s", "cold s", "warm s", "cold - warm s", "% of cold wall", "strace read wait s (thread-seconds)", "strace any thread reading s", "strace open/stat/list wait s"}, rows)
+}
+
+// summaryTable puts the headline of each workflow in one row.
+func summaryTable(w io.Writer, d *Dataset, wfs []string, sims map[string]map[string]*Outcome) {
+	fmt.Fprintf(w, "### Summary (run 2 against run 1; 5 ms per cold 1 MiB extent; stall is the busiest thread's wait, then the sum over threads)\n\n")
+	var rows [][]string
+	for _, wf := range wfs {
+		labels, by := projects(d.Runs[wf])
+		var set, pages, shared, plain, warm int64
+		for _, l := range labels {
+			if len(by[l]) < 2 {
+				continue
+			}
+			p := predict(by[l][0], by[l][1], true)
+			pages += p.PagesB
+			shared += p.PagesShared
+			set += workingset(by[l][1]).Mapped
+			plain += by[l][1].M.Plain
+			warm += by[l][1].M.Warm
+		}
+		none, lru, trace, node := sims[wf]["no cache"], sims[wf]["LRU 4 GiB"], sims[wf]["LRU 4 GiB + trace prefetch"], sims[wf]["same node, LRU 512 MiB"]
+		if none == nil || none.res[1].Lookups == 0 {
+			continue
+		}
+		st := func(o *Outcome) string { return secs(o.res[1].StallMax) + " / " + secs(o.res[1].Stall) }
+		rows = append(rows, []string{wf, mib(set), pct(shared, pages), pct(lru.res[1].Hit, lru.res[1].Lookups),
+			pct(trace.res[1].Hit, trace.res[1].Lookups), pct(node.res[1].Hit, node.res[1].Lookups),
+			st(none), st(trace), pct(plain-warm, plain)})
+	}
+	tabulate(w, []string{"workflow", "working set MiB", "run 2 pages already read by run 1 %", "cold node LRU hit %", "trace prefetch hit %", "same node 512 MiB hit %",
+		"stall s, no cache", "stall s, trace prefetch", "disk share of cold wall %"}, rows)
 }

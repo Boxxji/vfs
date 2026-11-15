@@ -81,7 +81,7 @@ func extents(c cover, r *Run, sh uint, keep func(file int32) bool) []ext {
 
 // evaluate runs the named policies (all when none are named) for run 2
 // of each project of a workflow.
-func evaluate(d *Dataset, wf string, pc int64, sh uint, conc int, only ...string) map[string]*Outcome {
+func evaluate(d *Dataset, wf string, pc int64, sh uint, conc int, hold int64, only ...string) map[string]*Outcome {
 	labels, by := projects(d.Runs[wf])
 	out := map[string]*Outcome{}
 	var run []policy
@@ -114,7 +114,7 @@ func evaluate(d *Dataset, wf string, pc int64, sh uint, conc int, only ...string
 		for _, p := range run {
 			var rs [len(fetches)]Result
 			for k, c := range fetches {
-				cfg := Config{Cache: p.cache, Fetch: c, Conc: conc, Ahead: p.ahead, Shift: sh}
+				cfg := Config{Cache: p.cache, Fetch: c, Conc: conc, Ahead: p.ahead, Shift: sh, Hold: hold}
 				switch p.trace {
 				case "same":
 					cfg.Order = same
@@ -136,12 +136,21 @@ func evaluate(d *Dataset, wf string, pc int64, sh uint, conc int, only ...string
 	return out
 }
 
-func simTables(w io.Writer, d *Dataset, wfs []string) {
+// simulate runs every policy once per workflow.
+func simulations(d *Dataset, wfs []string) map[string]map[string]*Outcome {
+	out := map[string]map[string]*Outcome{}
+	for _, wf := range wfs {
+		out[wf] = evaluate(d, wf, pagecache, shift, conc, unread)
+	}
+	return out
+}
+
+func simTables(w io.Writer, d *Dataset, wfs []string, sims map[string]map[string]*Outcome) {
 	fmt.Fprintf(w, "### Cache policies on run 2 (cold node unless stated; 1 MiB extents, %d MiB guest page cache, %d prefetches in flight)\n\n", pagecache>>20, conc)
 	fmt.Fprintf(w, "hit, late and miss are shares of extent lookups at a 5 ms fetch; amplification is bytes fetched over the bytes the run needed by 4 KiB page; stall is the time reads waited, summed over threads / the busiest thread, for a 1, 5 and 20 ms fetch.\n\n")
 	var rows [][]string
 	for _, wf := range wfs {
-		out := evaluate(d, wf, pagecache, shift, conc)
+		out := sims[wf]
 		for _, p := range policies {
 			o := out[p.name]
 			r := o.res[1]
@@ -165,12 +174,14 @@ func simTables(w io.Writer, d *Dataset, wfs []string) {
 			pc   int64
 			sh   uint
 			conc int
-		}{{pagecache, 18, conc}, {pagecache, 20, conc}, {pagecache, 22, conc}, {0, 20, conc}, {4 << 30, 20, conc}, {pagecache, 20, 16}, {pagecache, 20, 256}} {
-			o := evaluate(d, wf, v.pc, v.sh, v.conc, "LRU 4 GiB + trace prefetch")["LRU 4 GiB + trace prefetch"]
+			hold int64
+		}{{pagecache, 18, conc, unread}, {pagecache, 20, conc, unread}, {pagecache, 22, conc, unread}, {0, 20, conc, unread}, {4 << 30, 20, conc, unread},
+			{pagecache, 20, 16, unread}, {pagecache, 20, 256, unread}, {pagecache, 20, conc, 64 << 20}, {pagecache, 20, conc, 1 << 30}} {
+			o := evaluate(d, wf, v.pc, v.sh, v.conc, v.hold, "LRU 4 GiB + trace prefetch")["LRU 4 GiB + trace prefetch"]
 			r := o.res[1]
-			rows = append(rows, []string{wf, fmt.Sprintf("%d KiB", 1<<v.sh>>10), fmt.Sprintf("%d MiB", v.pc>>20), fmt.Sprint(v.conc), fmt.Sprint(r.Reqs),
+			rows = append(rows, []string{wf, fmt.Sprintf("%d KiB", 1<<v.sh>>10), fmt.Sprintf("%d MiB", v.pc>>20), fmt.Sprint(v.conc), fmt.Sprintf("%d MiB", v.hold>>20), fmt.Sprint(r.Reqs),
 				pct(r.Hit, r.Lookups), pct(r.Late, r.Lookups), pct(r.Miss, r.Lookups), mib(r.Fetched), fmt.Sprintf("%.2f", float64(r.Fetched)/float64(max(o.useful, 1))), secs(r.Stall)})
 		}
 	}
-	tabulate(w, []string{"workflow", "extent", "page cache", "prefetches in flight", "reads to engine (n)", "hit %", "late %", "miss %", "fetched MiB", "amplification", "stall s"}, rows)
+	tabulate(w, []string{"workflow", "extent", "page cache", "prefetches in flight", "unread bytes held", "reads to engine (n)", "hit %", "late %", "miss %", "fetched MiB", "amplification", "stall s"}, rows)
 }

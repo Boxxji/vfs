@@ -54,33 +54,41 @@ func TestLRUEvictionCallbackAndSizes(t *testing.T) {
 
 func TestPrefetchArrivesLate(t *testing.T) {
 	order := []ext{{1, 100}, {2, 100}}
-	r := simulate([]Req{rq(5, 1), rq(100, 2)}, big, Config{Cache: 1 << 30, Fetch: 10, Conc: 1, Order: order})
+	r := simulate([]Req{rq(5, 1), rq(100, 2)}, big, Config{Cache: 1 << 30, Fetch: 10, Conc: 1, Order: order, Hold: unread})
 	if r.Late != 1 || r.Hit != 1 || r.Miss != 0 || r.Stall != 5 {
 		t.Errorf("%+v", r)
 	}
 }
 
-func TestTraceWindowResynchronises(t *testing.T) {
+func TestPrefetchServesTheSameSetInAnotherOrder(t *testing.T) {
 	var order []ext
-	for i := 0; i < 3000; i++ {
-		order = append(order, ext{uint64(i + 1), 1})
+	var reqs []Req
+	for i := 1; i <= 100; i++ {
+		order = append(order, ext{uint64(i), 100})
 	}
-	// The run jumps to entry 2500, far beyond the window: the entries it
-	// skipped are never fetched, the ones after it are.
-	reqs := []Req{{T: 0, Ext: []ext{{2501, 1}}}, {T: 1000, Ext: []ext{{2502, 1}}}}
-	r := simulate(reqs, big, Config{Cache: 1 << 30, Fetch: 1, Conc: 4, Order: order})
-	if r.Miss != 1 || r.Hit != 1 {
+	for i := 100; i >= 1; i-- { // reverse order, long after everything arrived
+		reqs = append(reqs, Req{T: int64(1e9 + (100-i)*1000), Ext: []ext{{uint64(i), 100}}})
+	}
+	r := simulate(reqs, big, Config{Cache: 1 << 30, Fetch: 1000, Conc: 8, Order: order, Hold: unread})
+	if r.Hit != 100 || r.Miss != 0 || r.Late != 0 {
 		t.Errorf("%+v", r)
 	}
-	if want := int64(4 + 1 + 499); r.Fetched != want {
-		// 4 issued before the first read, the missed entry, and entries 2501 to 2999
-		t.Errorf("fetched %d, want %d", r.Fetched, want)
+}
+
+func TestDivergedRunWastesAtMostTheBudget(t *testing.T) {
+	var order []ext
+	for i := 1; i <= 1000; i++ {
+		order = append(order, ext{uint64(i), 1 << 20})
+	}
+	r := simulate([]Req{{T: 1e9, Ext: []ext{{99999, 1}}}}, big, Config{Cache: 8 << 30, Fetch: 1, Conc: 64, Order: order, Hold: 64 << 20})
+	if r.Fetched != 64<<20+1 || r.Wasted != 64<<20 {
+		t.Errorf("fetched %d wasted %d, want a 64 MiB budget", r.Fetched, r.Wasted)
 	}
 }
 
 func TestUnreadPrefetchIsWaste(t *testing.T) {
 	order := []ext{{1, 100}, {2, 100}, {3, 100}}
-	r := simulate([]Req{rq(1000, 1)}, big, Config{Cache: 1 << 30, Fetch: 1, Conc: 4, Order: order})
+	r := simulate([]Req{rq(1000, 1)}, big, Config{Cache: 1 << 30, Fetch: 1, Conc: 4, Order: order, Hold: unread})
 	if r.Wasted != 200 || r.Fetched != 300 || r.Hit != 1 {
 		t.Errorf("%+v", r)
 	}
@@ -88,7 +96,7 @@ func TestUnreadPrefetchIsWaste(t *testing.T) {
 
 func TestEvictedPrefetchIsWaste(t *testing.T) {
 	order := []ext{{1, 100}, {2, 100}, {3, 100}}
-	r := simulate([]Req{rq(1000, 3)}, big, Config{Cache: 150, Fetch: 1, Conc: 4, Order: order})
+	r := simulate([]Req{rq(1000, 3)}, big, Config{Cache: 150, Fetch: 1, Conc: 4, Order: order, Hold: unread})
 	// 1 and 2 were evicted unread by their successors; 3 was read.
 	if r.Wasted != 200 {
 		t.Errorf("%+v", r)
@@ -205,7 +213,7 @@ func TestEntriesThatFillTheCacheExactlyStay(t *testing.T) {
 func TestPrefetchHoldsABoundedAmountUnread(t *testing.T) {
 	const big = 200 << 20
 	order := []ext{{1, big}, {2, big}, {3, big}, {4, big}, {5, big}}
-	r := simulate([]Req{{T: 1e9, Ext: []ext{{1, big}}}}, func(int32) int64 { return 0 }, Config{Cache: 8 << 30, Fetch: 1, Conc: 8, Order: order})
+	r := simulate([]Req{{T: 1e9, Ext: []ext{{1, big}}}}, func(int32) int64 { return 0 }, Config{Cache: 8 << 30, Fetch: 1, Conc: 8, Order: order, Hold: unread})
 	// two entries make 400 MiB unread, over the 256 MiB budget; reading
 	// one frees room for one more
 	if r.Fetched != 3*big {
@@ -213,24 +221,25 @@ func TestPrefetchHoldsABoundedAmountUnread(t *testing.T) {
 	}
 }
 
-func TestPrefetchLooksOnlyAWindowAhead(t *testing.T) {
-	var order []ext
-	for i := 0; i < 3000; i++ {
-		order = append(order, ext{uint64(i + 1), 1})
-	}
-	r := simulate([]Req{{T: 1e9, Ext: []ext{{99999, 1}}}}, big, Config{Cache: 1 << 30, Fetch: 1, Conc: 64, Order: order})
-	if r.Fetched != traceWin+1 {
-		t.Errorf("fetched %d, want the window of %d and the one miss", r.Fetched, traceWin)
-	}
-}
-
 func TestReadEntriesAreNotFetchedAgain(t *testing.T) {
 	order := []ext{{1, 100}, {2, 100}, {3, 100}}
 	reqs := []Req{{T: 0, Ext: []ext{{2, 100}}}, {T: 10, Ext: []ext{{9, 100}}}, {T: 2000, Ext: []ext{{1, 100}}}}
-	r := simulate(reqs, big, Config{Cache: 100, Fetch: 1000, Conc: 1, Order: order})
+	r := simulate(reqs, big, Config{Cache: 100, Fetch: 1000, Conc: 1, Order: order, Hold: unread})
 	// 1 at the start, miss 2, miss 9, 3 once the slot frees, then 1 again
 	// as a miss: entry 2 was read already and is not prefetched after eviction
 	if r.Fetched != 500 {
 		t.Errorf("fetched %d", r.Fetched)
+	}
+}
+
+func TestPrefetchUsesTheSlotThatFreesFirst(t *testing.T) {
+	s := newsim(Config{Cache: 1 << 20, Fetch: 10, Conc: 2}, big)
+	s.slots = []int64{50, 0}
+	s.issue(ext{1, 1}, 0)
+	if n := s.cache.m[1]; n == nil || n.ready != 10 {
+		t.Errorf("%+v", n)
+	}
+	if s.freeAt() != 10 {
+		t.Errorf("free at %d, want 10", s.freeAt())
 	}
 }

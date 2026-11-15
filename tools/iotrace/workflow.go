@@ -13,7 +13,7 @@ import (
 type Params struct {
 	Project string // the source tree
 	State   string // scratch directory for the fresh state of one run
-	Cache   string // pre-populated package cache (npm, pnpm, uv)
+	Cache   string // pre-populated package cache (npm, uv)
 	From    string // git: commit checked out before the run
 	To      string // git: commit checked out by the run
 }
@@ -44,6 +44,13 @@ var workflows = map[string]func(Params) (plan, error){
 				{"rm", "-rf", w},
 				{"git", "clone", "--quiet", "--shared", "--no-checkout", p.Project, w},
 				{"git", "-C", w, "checkout", "--quiet", p.From},
+				// A checkout leaves the index entries written in its last
+				// second "racily clean": the next command reads those files
+				// to compare them, and how many there are depends on how
+				// fast the checkout ran. Settling the workspace first makes
+				// every run start from the state a long-lived one is in.
+				{"sleep", "2"},
+				{"git", "-C", w, "update-index", "-q", "--refresh"},
 			},
 			run:   []string{"git", "checkout", "--quiet", p.To},
 			dir:   w,
@@ -66,24 +73,6 @@ var workflows = map[string]func(Params) (plan, error){
 			run:   []string{"npm", "ci", "--offline", "--ignore-scripts", "--no-audit", "--no-fund", "--cache", c},
 			dir:   w,
 			env:   []string{"npm_config_update_notifier=false"},
-			evict: []string{w, c, nodeRoot()},
-			roots: map[string]string{"workspace": w, "cache": c, "toolchain": nodeRoot()},
-		}, nil
-	},
-	"pnpm": func(p Params) (plan, error) {
-		w, c := filepath.Join(p.State, "w"), filepath.Join(p.State, "store")
-		if p.Cache == "" {
-			return plan{}, fmt.Errorf("pnpm needs -cache")
-		}
-		return plan{
-			prep: [][]string{
-				{"rm", "-rf", w, c},
-				{"mkdir", "-p", w},
-				{"sh", "-c", `tar -C "$1" --exclude=node_modules --exclude=.git -cf - . | tar -C "$2" -xf -`, "sh", p.Project, w},
-				{"cp", "-a", p.Cache, c},
-			},
-			run:   []string{"pnpm", "install", "--frozen-lockfile", "--offline", "--ignore-scripts", "--store-dir", c},
-			dir:   w,
 			evict: []string{w, c, nodeRoot()},
 			roots: map[string]string{"workspace": w, "cache": c, "toolchain": nodeRoot()},
 		}, nil

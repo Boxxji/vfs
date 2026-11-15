@@ -142,15 +142,15 @@ type Config struct {
 	Conc  int   // fetches the prefetcher keeps in flight
 	Ahead bool  // sequential read-ahead
 	Order []ext // ordered extents the previous run touched, for trace prefetch
+	Hold  int64 // trace prefetch stops while this many fetched bytes are unread
 	Warm  []ext // extents present before the run starts
 	Shift uint
 }
 
 const (
-	aheadMax   = 8         // read-ahead window ceiling, in extents
-	traceWin   = 1024      // trace prefetch looks this many entries ahead
-	traceBytes = 256 << 20 // and holds at most this much unused
-	prefetchNS = int64(0)  // prefetch may begin when the run does
+	aheadMax = 8 // read-ahead window ceiling, in extents
+	// unread is the most bytes trace prefetch holds that the run has not read.
+	unread = 256 << 20
 )
 
 // Result is what a policy did over one run.
@@ -181,11 +181,10 @@ type sim struct {
 	res    Result
 	unused int64 // bytes prefetched and not yet read
 
-	order  []ext
-	pos    map[uint64]int
-	done   []bool
-	cursor int
-	next   int
+	order []ext
+	pos   map[uint64]int
+	done  []bool // entries of order the run has read
+	next  int    // first entry of order not yet considered for fetching
 }
 
 func newsim(cfg Config, size func(int32) int64) *sim {
@@ -241,10 +240,13 @@ func (s *sim) freeAt() int64 {
 	return m
 }
 
-// pump issues trace prefetches that fit in the window, as slots free,
-// up to time now. from is the earliest time the window had room.
+// pump issues trace prefetches in the order of the previous run, as
+// slots free up to time now, until too much fetched data is unread. An
+// entry the run already read is skipped, so a run that reads the same
+// set in another order is served as well as one that keeps the order.
+// from is the earliest time the budget had room.
 func (s *sim) pump(now, from int64) {
-	for s.order != nil && s.next < len(s.order) && s.next < s.cursor+traceWin && s.unused < traceBytes {
+	for s.order != nil && s.next < len(s.order) && s.unused < s.cfg.Hold {
 		start := max(s.freeAt(), from)
 		if start > now {
 			return
@@ -255,19 +257,6 @@ func (s *sim) pump(now, from int64) {
 			s.issue(s.order[i], from)
 		}
 	}
-}
-
-// consume records that the run read entry p of the prefetch order.
-func (s *sim) consume(p int) {
-	if p >= s.cursor+traceWin {
-		s.cursor = p // the run jumped past the window: resynchronise
-		s.next = max(s.next, p)
-	}
-	s.done[p] = true
-	for s.cursor < len(s.done) && s.done[s.cursor] {
-		s.cursor++
-	}
-	s.next = max(s.next, s.cursor)
 }
 
 func (s *sim) run(reqs []Req) Result {
@@ -303,7 +292,7 @@ func (s *sim) run(reqs []Req) Result {
 			}
 			if s.pos != nil {
 				if p, ok := s.pos[e.key]; ok {
-					s.consume(p)
+					s.done[p] = true
 				}
 			}
 			if s.cfg.Ahead {

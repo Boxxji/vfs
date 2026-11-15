@@ -13,7 +13,7 @@ import (
 )
 
 // tools whose directories join the minimal PATH of every workflow.
-var tools = []string{"sh", "tar", "cp", "rm", "mkdir", "find", "sort", "head", "cat", "git", "go", "node", "npm", "pnpm",
+var tools = []string{"sh", "tar", "cp", "rm", "mkdir", "sleep", "find", "sort", "head", "cat", "git", "go", "node", "npm",
 	"cargo", "rustc", "uv", "rg", "cc", "gcc", "ld", "as", "ar"}
 
 // run executes one workflow for the given number of runs. Before every
