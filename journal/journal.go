@@ -119,8 +119,10 @@ type Stats struct {
 
 const (
 	batchCap   = 4 << 20                 // bytes one write holds before the next record starts another
-	maxPending = 64 << 20                // bytes queued for the file before Append waits for the writer
+	maxPending = 16 << 20                // bytes queued for the file before Append waits for the writer
 	syncBytes  = 8 << 20                 // unsynced bytes that start a sync nobody asked for
+	exposed    = 16 << 20                // bytes written but not synced before the writer waits for a sync
+	hintBytes  = 1 << 20                 // bytes written to a segment before the system is asked to start writing them out
 	quantum    = int64(time.Millisecond) // acknowledgement times closer than this share a span
 	slowFrom   = 0.75                    // fill at which Append starts to slow
 	slowRate   = 64 << 20                // bytes per second Append is held to at a full journal
@@ -140,7 +142,8 @@ type slot struct {
 	end   int64  // offset past the last byte placed
 	life  uint64
 	seed  uint32
-	dirty bool // written since it was last synced
+	dirty bool  // written since it was last synced
+	hint  int64 // offset up to which writeback has been requested
 }
 
 type batch struct {
@@ -201,7 +204,8 @@ type Journal struct {
 	held   int64 // bytes in segs, published or not
 
 	dirty    []*slot
-	unsynced int64
+	unsynced int64 // bytes written since the last sync began
+	behind   int64 // bytes written and not covered by a completed sync
 	waiters  []*waiter
 	wdone    bool // the writer has exited
 

@@ -3,10 +3,10 @@ package journal_test
 import (
 	"context"
 	"errors"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/hanzoai/vfs/journal"
 	"github.com/hanzoai/vfs/journal/crash"
@@ -226,7 +226,8 @@ func TestClosedJournal(t *testing.T) {
 }
 
 // Memory is bounded: when the writer cannot keep up, Append waits for it
-// instead of queueing without limit.
+// instead of queueing without limit, and a small Append is not stuck behind
+// more than a few megabytes of someone else's bulk.
 func TestAppendWaitsForTheWriter(t *testing.T) {
 	d := crash.New()
 	hold := make(chan struct{})
@@ -247,7 +248,7 @@ func TestAppendWaitsForTheWriter(t *testing.T) {
 	finished := make(chan struct{})
 	go func() {
 		defer close(finished)
-		for i := 0; i < 100; i++ {
+		for i := 0; i < 40; i++ {
 			if _, err := j.Append(ctx, chunk); err != nil {
 				t.Error(err)
 				return
@@ -255,20 +256,15 @@ func TestAppendWaitsForTheWriter(t *testing.T) {
 			appended.Add(1)
 		}
 	}()
-	// The writer is stuck in its first write. Append must stop well short of 100 MiB.
+	// The writer is stuck in its first write. Append must stop well short of 40 MiB.
 	waitFor(t, "the first write to be held", held.Load)
-	stable := 0
-	waitFor(t, "Append to stop", func() bool {
-		n := appended.Load()
-		runtime.Gosched()
-		if n > 60 && n == appended.Load() {
-			stable++
-		} else {
-			stable = 0
-		}
-		return stable == 5000
-	})
-	if n := appended.Load(); n > 70 {
+	waitFor(t, "Append to fill the queue", func() bool { return appended.Load() > 12 })
+	select {
+	case <-finished:
+		t.Fatalf("Append queued all %d MiB behind a stuck writer", appended.Load())
+	case <-time.After(200 * time.Millisecond): // a wait for something that must not happen
+	}
+	if n := appended.Load(); n > 20 {
 		t.Fatalf("%d MiB queued behind a stuck writer", n)
 	}
 	close(hold)
@@ -324,5 +320,125 @@ func TestCancelledSyncStartsNoSync(t *testing.T) {
 	}
 	if n := syncs.Load(); n != 0 {
 		t.Fatalf("%d syncs for a call that was cancelled", n)
+	}
+}
+
+// Data written but not synced is bounded, so a bulk writer cannot make the next
+// fsync wait behind gigabytes. With a sync held in the file layer the writer
+// stops after a few megabytes instead of writing everything it was given.
+func TestWriterStopsAheadOfASlowSync(t *testing.T) {
+	d := crash.New()
+	var written atomic.Int64
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var held atomic.Bool
+	d.Intercept(func(e crash.Event) error {
+		switch e.Kind {
+		case "write":
+			written.Add(int64(e.Len))
+		case "sync":
+			if held.CompareAndSwap(false, true) {
+				close(entered)
+				<-release
+			}
+		}
+		return nil
+	})
+	j, err := journal.Open("", journal.Options{Capacity: 256 << 20, Segment: 16 << 20, Disk: d, Clock: newClock()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer j.Close()
+	chunk := make([]byte, 1<<20)
+	go func() {
+		for i := 0; i < 60; i++ {
+			if _, err := j.Append(ctx, chunk); err != nil {
+				return
+			}
+		}
+	}()
+	<-entered // enough was written that a sync began, and it will not end
+	waitFor(t, "the writer to get ahead", func() bool { return written.Load() >= 12<<20 })
+	time.Sleep(200 * time.Millisecond) // a wait for something that must not happen
+	if n := written.Load(); n > 28<<20 {
+		t.Fatalf("%d MiB written ahead of a sync that has not finished", n>>20)
+	}
+	close(release)
+}
+
+// Bulk data is handed to the system for writeback as it is written, so a
+// later Sync finds it already on its way. Small writes are not: a hint costs a
+// system call.
+func TestWritebackIsRequestedForBulkData(t *testing.T) {
+	d := crash.New()
+	var hints, hinted atomic.Int64
+	d.Intercept(func(e crash.Event) error {
+		if e.Kind == "writeback" {
+			hints.Add(1)
+			hinted.Add(int64(e.Len))
+		}
+		return nil
+	})
+	j, err := journal.Open("", journal.Options{Capacity: 64 << 20, Segment: 16 << 20, Disk: d, Clock: newClock()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer j.Close()
+	for i := 0; i < 100; i++ {
+		mustAppend(t, j, []byte("small"))
+	}
+	if got := replayed(t, j); len(got) != 100 { // everything is written
+		t.Fatalf("%d records", len(got))
+	}
+	if n := hints.Load(); n != 0 {
+		t.Fatalf("%d hints for 3 KiB of small writes", n)
+	}
+	chunk := make([]byte, 1<<20)
+	for i := 0; i < 6; i++ {
+		mustAppend(t, j, chunk)
+	}
+	if got := replayed(t, j); len(got) != 106 {
+		t.Fatalf("%d records", len(got))
+	}
+	if n := hinted.Load(); n < 5<<20 || n > 7<<20 {
+		t.Fatalf("%d bytes hinted for 6 MiB written", n)
+	}
+}
+
+// A recycled segment is hinted from its start again, not from where its
+// previous use ended.
+func TestWritebackStartsOverInARecycledSegment(t *testing.T) {
+	d := crash.New()
+	var hinted atomic.Int64
+	d.Intercept(func(e crash.Event) error {
+		if e.Kind == "writeback" {
+			hinted.Add(int64(e.Len))
+		}
+		return nil
+	})
+	j, err := journal.Open("", journal.Options{Capacity: 16 << 20, Segment: 4 << 20, Disk: d, Clock: newClock()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer j.Close()
+	chunk := make([]byte, 1<<20)
+	var last uint64
+	for i := 0; i < 9; i++ { // three segments
+		last = mustAppend(t, j, chunk)
+	}
+	mustSync(t, j, last)
+	if err := j.Publish(last); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Reclaim(); err != nil {
+		t.Fatal(err)
+	}
+	hinted.Store(0)
+	for i := 0; i < 9; i++ { // the same files again
+		last = mustAppend(t, j, chunk)
+	}
+	mustSync(t, j, last)
+	if n := hinted.Load(); n < 6<<20 {
+		t.Fatalf("%d MiB hinted while 9 MiB went into recycled segments", n>>20)
 	}
 }

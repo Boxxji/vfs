@@ -37,10 +37,36 @@ func (j *Journal) writer() {
 		j.mu.Unlock()
 
 		for _, b := range batches {
+			// Data written but not synced is what a sync has to flush and what
+			// a Sync call can end up waiting behind. Bound it, so one bulk
+			// writer cannot make the next fsync wait for gigabytes.
+			j.mu.Lock()
+			for j.behind >= exposed && j.err == nil {
+				wait := j.room
+				j.mu.Unlock()
+				<-wait
+				j.mu.Lock()
+			}
+			failed := j.err != nil
+			j.mu.Unlock()
+			if failed {
+				return
+			}
 			<-b.slot.ready
 			err := b.slot.err
 			if err == nil {
 				_, err = b.slot.file.WriteAt(b.data, b.off)
+			}
+			if err == nil {
+				// Ask for the data to start going out while more is being
+				// written. It is a hint: if it fails Sync still does the work.
+				if b.off == 0 {
+					b.slot.hint = 0
+				}
+				if end := b.off + int64(len(b.data)); end-b.slot.hint >= hintBytes {
+					b.slot.file.Writeback(b.slot.hint, end-b.slot.hint)
+					b.slot.hint = end
+				}
 			}
 			j.mu.Lock()
 			if err != nil {
@@ -54,6 +80,7 @@ func (j *Journal) writer() {
 				j.dirty = append(j.dirty, b.slot)
 			}
 			j.unsynced += int64(len(b.data))
+			j.behind += int64(len(b.data))
 			j.pending -= int64(len(b.data))
 			j.broadcast()
 			if j.wantSync() {
@@ -105,6 +132,7 @@ func (j *Journal) syncer() {
 		for _, s := range files {
 			s.dirty = false
 		}
+		round := j.unsynced
 		j.unsynced = 0
 		j.mu.Unlock()
 
@@ -122,6 +150,8 @@ func (j *Journal) syncer() {
 			return
 		}
 		j.synced = max(j.synced, target)
+		j.behind -= round
+		j.broadcast()
 		j.stats.Rounds++
 		if freed := j.releaseLocked(); freed > 0 {
 			j.stats.Groups[bucket(freed)]++

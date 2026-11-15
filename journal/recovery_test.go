@@ -540,3 +540,81 @@ func TestOpenTrimsToCapacity(t *testing.T) {
 		t.Fatalf("%d files for a capacity of 3 segments: %v", len(after), after)
 	}
 }
+
+// A record that is whole and from this segment, but not the next in sequence,
+// ends the log: here record 2 has been copied over record 4.
+func TestRecordOutOfSequenceEndsTheLog(t *testing.T) {
+	d := crash.New()
+	j := open(t, small(d, newClock(), 0))
+	const size = 100
+	for i := 1; i <= 6; i++ {
+		mustAppend(t, j, bytes.Repeat([]byte{byte('a' + i)}, size))
+	}
+	mustSync(t, j, 6)
+	j.Close()
+
+	f, err := d.Open("000000.seg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	two := make([]byte, 28+size)
+	if _, err := f.ReadAt(two, recordOffset(1, size)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt(two, recordOffset(3, size)); err != nil {
+		t.Fatal(err)
+	}
+
+	j = open(t, small(d, newClock(), 0))
+	defer j.Close()
+	if got, want := seqs(replayed(t, j)), []uint64{1, 2, 3}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("replay %v, want %v", got, want)
+	}
+}
+
+// The publisher may publish records the writer has not written yet, since it
+// reads memory, not the files. Reclaim must not free a segment whose records
+// are still queued: the late write would land in a segment that is free.
+func TestReclaimWaitsForTheWriter(t *testing.T) {
+	d := crash.New()
+	hold := make(chan struct{})
+	wiped := make(chan struct{}, 8)
+	d.Intercept(func(e crash.Event) error {
+		if e.Kind == "write" {
+			if e.Len == 20 && e.Off == 0 { // a segment being freed
+				wiped <- struct{}{}
+			} else {
+				<-hold
+			}
+		}
+		return nil
+	})
+	j := open(t, small(d, newClock(), 0))
+	defer j.Close()
+	for i := 1; i <= 4; i++ { // three fill the first segment, the fourth starts the next
+		mustAppend(t, j, bigRecord(i))
+	}
+	if err := j.Publish(4); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Reclaim(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-wiped:
+		t.Fatal("Reclaim freed a segment whose records had not been written")
+	default:
+	}
+	close(hold)
+	if got := replayed(t, j); len(got) != 0 {
+		t.Fatalf("replay %v: all published", seqs(got))
+	}
+	if err := j.Reclaim(); err != nil { // now it may
+		t.Fatal(err)
+	}
+	select {
+	case <-wiped:
+	default:
+		t.Fatal("Reclaim never freed the segment")
+	}
+}

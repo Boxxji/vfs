@@ -31,6 +31,11 @@ type Disk interface {
 type File interface {
 	ReadAt(p []byte, off int64) (int, error)
 	WriteAt(p []byte, off int64) (int, error)
+	// Writeback asks the system to start writing the range to the media now,
+	// without waiting and without any guarantee. The journal asks as it writes,
+	// so a later Sync finds most of the data already on its way and does not
+	// make the callers behind it wait for a large flush.
+	Writeback(off, n int64) error
 	// Sync makes every write that completed before Sync was called durable,
 	// without the cost of flushing file metadata that did not change (fdatasync).
 	// A write that overlaps the call may or may not be covered.
@@ -168,4 +173,6 @@ type osFile struct {
 }
 
 func (f *osFile) Sync() error { return datasync(f.File) }
-func (f *osFile) Size() int64 { return f.size }
+
+func (f *osFile) Writeback(off, n int64) error { return writeback(f.File, off, n) }
+func (f *osFile) Size() int64                  { return f.size }
