@@ -444,3 +444,29 @@ func TestWritebackStartsOverInARecycledSegment(t *testing.T) {
 		t.Fatalf("%d MiB hinted while 9 MiB went into recycled segments", n>>20)
 	}
 }
+
+// A mark is a second block to flush, which on some disks doubles the cost of a
+// lone writer's fsync, so marks are spaced out: one every few sync rounds, and
+// at Close. With a mark every fourth round, eight rounds write two.
+func TestMarksAreSpacedOutByRounds(t *testing.T) {
+	defer journal.MarkEvery(4)()
+	d := crash.New()
+	var marks atomic.Int64
+	d.Intercept(func(e crash.Event) error {
+		if e.Kind == "write" && e.Off >= headerSize && e.Off < dataStart && e.Len == markSize {
+			marks.Add(1)
+		}
+		return nil
+	})
+	j := open(t, small(d, newClock(), 0))
+	for i := 0; i < 8; i++ {
+		mustSync(t, j, mustAppend(t, j, []byte("x")))
+	}
+	if n := marks.Load(); n != 2 {
+		t.Fatalf("%d marks written in 8 sync rounds, want 2", n)
+	}
+	j.Close()
+	if n := marks.Load(); n != 3 {
+		t.Fatalf("%d marks after Close, want the final one too", n)
+	}
+}

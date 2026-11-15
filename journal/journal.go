@@ -179,8 +179,15 @@ const (
 	hintBytes  = 1 << 20          // bytes written to a segment before the system is asked to start writing them out
 	slowFrom   = 0.75             // fill at which Append starts to slow
 	slowRate   = 64 << 20         // bytes per second Append is held to at a full journal
+	markBytes  = 1 << 20          // bytes synced since the last mark that call for another
 	quantum    = time.Millisecond // acknowledgement times closer than this share a span
 )
+
+// markRounds is how many sync rounds pass between two marks. A mark is a second
+// block to flush (the one that holds the preamble), which on a disk that pays
+// for each block doubles the cost of a single writer's fsync; spaced out, it
+// costs a few percent, and the proof it gives lags by that many rounds.
+var markRounds = 16
 
 // slot is one segment file and, while it is in the log, the segment it holds.
 type slot struct {
@@ -231,6 +238,7 @@ type Journal struct {
 	limit   int // most segment files
 	bound   time.Duration
 	retry   time.Duration
+	every   int // sync rounds between marks
 	lineage lineage
 	report  Report
 
@@ -260,6 +268,8 @@ type Journal struct {
 	held   int64 // bytes in segs, published or not
 
 	dirty    []*slot
+	rounds   int   // sync rounds since the last mark
+	volume   int64 // bytes synced since the last mark
 	unsynced int64 // bytes written since the last sync began
 	behind   int64 // bytes written and not covered by a completed sync
 	waiters  []*waiter
@@ -312,6 +322,7 @@ func newJournal(opt Options) (*Journal, error) {
 		limit:   int(limit),
 		bound:   opt.Bound,
 		retry:   opt.Retry,
+		every:   markRounds,
 		lineage: lineageOf(opt.Lineage),
 		room:    make(chan struct{}),
 		done:    make(chan struct{}),

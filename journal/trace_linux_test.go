@@ -29,6 +29,7 @@ func TestMain(m *testing.M) {
 	if *child != "" {
 		os.Exit(runChild(*child))
 	}
+	journal.MarkEvery(1) // a mark every round, so that every crash state has marks in it
 	os.Exit(m.Run())
 }
 

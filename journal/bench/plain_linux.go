@@ -133,46 +133,63 @@ func plainSequential(work string) {
 }
 
 // groupSync is the loop a careful engineer writes by hand to get what the
-// journal's sync queue gives: writers append to one shared file, and one
-// fdatasync serves every writer whose write finished before it began. The first
-// writer to find no sync running becomes its leader.
+// journal's sync queue gives: writers append to one shared file, and a syncer
+// goroutine runs one fdatasync after another, each serving every writer whose
+// write finished before it began. Each waiter has its own channel, so a finished
+// sync wakes exactly the writers it covered.
 type groupSync struct {
 	f       *os.File
 	mu      sync.Mutex
-	cond    *sync.Cond
 	written uint64 // writes completed
-	synced  uint64 // writes covered by a completed fdatasync
-	syncing bool
+	waiting []waiting
+	kick    chan struct{}
 	calls   atomic.Int64
 }
 
+type waiting struct {
+	mine uint64
+	done chan struct{}
+}
+
 func newGroupSync(f *os.File) *groupSync {
-	g := &groupSync{f: f}
-	g.cond = sync.NewCond(&g.mu)
+	g := &groupSync{f: f, kick: make(chan struct{}, 1)}
+	go g.run()
 	return g
+}
+
+func (g *groupSync) run() {
+	for range g.kick {
+		g.mu.Lock()
+		batch := g.waiting
+		g.waiting = nil
+		g.mu.Unlock()
+		if len(batch) == 0 {
+			continue
+		}
+		check(fdatasync(g.f))
+		g.calls.Add(1)
+		for _, w := range batch {
+			close(w.done)
+		}
+		select { // writers that arrived during the sync are waiting for the next one
+		case g.kick <- struct{}{}:
+		default:
+		}
+	}
 }
 
 // wait returns once an fdatasync that began after this writer's write has finished.
 func (g *groupSync) wait() {
 	g.mu.Lock()
 	g.written++
-	mine := g.written
-	for g.synced < mine {
-		if g.syncing {
-			g.cond.Wait()
-			continue
-		}
-		g.syncing = true
-		target := g.written
-		g.mu.Unlock()
-		check(fdatasync(g.f))
-		g.calls.Add(1)
-		g.mu.Lock()
-		g.synced = target
-		g.syncing = false
-		g.cond.Broadcast()
-	}
+	w := waiting{g.written, make(chan struct{})}
+	g.waiting = append(g.waiting, w)
 	g.mu.Unlock()
+	select {
+	case g.kick <- struct{}{}:
+	default:
+	}
+	<-w.done
 }
 
 // groupLatency is the plain baseline that does what the journal does for the

@@ -137,3 +137,12 @@ func TestReplayDetectsRuntimeCorruption(t *testing.T) {
 		t.Fatalf("Replay over a damaged record 3 returned %v, want ErrCorrupt", err)
 	}
 }
+
+// The length of a record is 32 bits: a segment larger than 4 GiB could hold a
+// record whose length does not fit, so it is refused before anything is made.
+func TestSegmentLargerThan4GiBIsRefused(t *testing.T) {
+	if j, err := journal.Open("", journal.Options{Capacity: 20 << 30, Segment: 5 << 30, Disk: crash.New()}); err == nil {
+		j.Close()
+		t.Fatal("Open accepted a segment of 5 GiB")
+	}
+}

@@ -141,14 +141,21 @@ func (j *Journal) syncer() {
 		round := j.unsynced
 		j.unsynced = 0
 		last, through, floor := j.last, j.synced, j.published
+		j.rounds++
+		j.volume += round
+		mark := j.rounds >= j.every || j.volume >= markBytes
+		if mark {
+			j.rounds, j.volume = 0, 0
+		}
 		j.mu.Unlock()
 
 		// The mark goes in with this round's sync, and says what the rounds
 		// before it had already made durable: it can only be on the media
 		// together with, or after, everything it claims. It is written to the
-		// segment this round dirtied, so this round's fdatasync carries it.
+		// segment this round dirtied, so this round's fdatasync carries it. Not
+		// every round writes one: see markRounds.
 		var err error
-		if last != nil {
+		if last != nil && mark {
 			_, err = j.writeMark(last, through, floor)
 		}
 		for _, s := range files {
