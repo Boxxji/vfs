@@ -3,24 +3,25 @@
 # The gates below run as parallel jobs, one per entry: .github/workflows/cicd.yml
 # has a matrix that names each by `gates:`, and its last entry takes everything the
 # others do not, so an entry added here is gated by default. Each is under five
-# minutes.
+# minutes, and what makes that possible is what each job has to compile: the SQLite
+# engine is a large build and only the gates that need it (`sqlite`) build it, the
+# race detector doubles a build and runs where there are goroutines, and the server
+# the real-server tests need is built in the two gates that run them.
 #
-#   check            build, vet, gofmt, and the small packages under the race detector
-#   race-a/b/c       the engine's unit tests under the race detector (-short), shared
-#                    out by the first letter of the test's name
+#   check            build, vet and gofmt of everything but the SQLite packages
+#   unit             the engine's unit tests (-short)
+#   race             the tests with goroutines, under the race detector (-short)
 #   model            the tests that run random operations against a plain model, in
-#                    -short size and without the race detector, which multiplies the
-#                    hashing and sealing they do tenfold and finds nothing in code with
-#                    no goroutines
+#                    -short size: no goroutines, so no race detector, which would
+#                    multiply the hashing and sealing they do tenfold
+#   sqlite           the packages that run a real SQLite engine on a Volume, and on a mount
 #   realserver       the engine against a real Hanzo S3 server: every test that needs one
 #   realserver-kill  a writer killed at random moments over the real server, and a
 #                    mount over it
 #   mount            the FUSE front on a kernel mount
-#   mount-signals    signals sent at callers waiting on the mount
-#   mount-checkout   a 5,000-file checkout through the mount
+#   mount-load       a 5,000-file checkout and signals sent at callers waiting on the mount
 #   scale-a/b        the measurements: 100,000 files, a million inodes, sync cost, the
-#                    object budget, a petabyte, amplification; without the race detector,
-#                    which only slows the hashing they measure (-short skips them)
+#                    object budget, a petabyte, amplification (-short skips them)
 #   fuzz             the model run over many more seeds
 #
 # realserver, realserver-kill and the mount gates fail if a test they exist for did not
@@ -32,20 +33,29 @@ test:
   - name: check
     run: |
       set -euo pipefail
-      go build ./...
-      go vet ./...
-      go vet -tags fuse ./pkg/mount
+      pkgs=$(go list ./... | grep -v -e /replica -e /internal/sqlitecheck)
+      go build $pkgs
+      go vet $pkgs
+      go vet -tags fuse ./pkg/mount ./internal/mounttest
       GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go vet -tags fuse ./pkg/mount
       test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
-      go test -race -short -count=1 ./cmd/... ./pkg/... ./replica/...
-  - name: race-a
-    run: go test -race -short -count=1 -run '^Test[A-D]' -skip '^Test(Sparse|Model|TreeForced)' .
-  - name: race-b
-    run: go test -race -short -count=1 -run '^Test[E-R]' -skip '^Test(Sparse|Model|TreeForced)' .
-  - name: race-c
-    run: go test -race -short -count=1 -run '^Test[S-Z]' -skip '^Test(Sparse|Model|TreeForced)' .
+  - name: unit
+    run: go test -short -count=1 -skip '^Test(Sparse|Model|TreeForced)' . ./cmd/... ./pkg/...
+  - name: race
+    run: |
+      set -euo pipefail
+      go test -race -short -count=1 ./pkg/...
+      go test -race -short -count=1 -run '^Test(ConcurrentWorkers|NoGoroutineLeak|SameRoundRace|RacingClaims|TakeoverLosesNoAcknowledgedCommit|FenceRefusesOlderRound|AttachNeedsAHigherRound|AttachLostAckIsNotStale|StalledCommitHonoursItsDeadline|DeposedWriterIsToldAtItsNextCommit|LostAckNoLostUpdateNoDuplicate|LostAckThenTakeoverIsNotReportedLost|VolumeOnEveryStore)$' .
+      go test -race -tags fuse -short -count=1 -run '^Test(InterruptIsEINTR|CommitSurvivesItsCaller|CloseWaitsForItsCommit|ReadWaitsForItsData|InterruptedFsyncRetriesDoNotPileUp|SessionRefusesANilContext|LookedUpFileReadsOnTheMountContext)$' ./pkg/mount
   - name: model
     run: go test -short -count=1 -run '^Test(Sparse|Model|TreeForced)' .
+  - name: sqlite
+    run: |
+      set -euo pipefail
+      go vet ./replica ./internal/sqlitecheck
+      go vet -tags fuse ./internal/sqlitecheck
+      go test -short -count=1 ./replica ./internal/sqlitecheck
+      tools/ci/mount.sh ./internal/sqlitecheck run '^TestFUSESQLite$' TestFUSESQLite
   - name: realserver
     run: |
       set -euo pipefail
@@ -72,19 +82,17 @@ test:
       log="$bin/kill.log"
       go test -count=1 -v -timeout 3m -run '^TestKillOverRealServer$' . | tee "$log"
       grep -q -- '--- PASS: TestKillOverRealServer ' "$log" || { echo "TestKillOverRealServer did not pass"; exit 1; }
-      tools/ci/mount.sh run '^TestFUSEReadsExistingFilesOverS3$' TestFUSEReadsExistingFilesOverS3
+      tools/ci/mount.sh ./pkg/mount run '^TestFUSEReadsExistingFilesOverS3$' TestFUSEReadsExistingFilesOverS3
   - name: mount
     run: |
-      tools/ci/mount.sh skip '^(TestFUSECheckout|TestFUSEInterruptsAreNotErrors|TestFUSEReadsExistingFilesOverS3)$' \
+      tools/ci/mount.sh ./pkg/mount skip '^(TestFUSECheckout|TestFUSEInterruptsAreNotErrors|TestFUSEReadsExistingFilesOverS3)$' \
         TestFUSEPOSIX TestFUSESemantics TestFUSEUnsupportedIsHonest TestFUSEHostileNames TestFUSEConcurrentSameFile \
         TestFUSECommitPerClose TestFUSEKillDuringWrite TestFUSEUnlinkVersusRmdir TestFUSEPetabyteTruncate \
-        TestFUSEFileTooBig TestFUSEFsyncSurvivesKill TestFUSESQLite \
+        TestFUSEFileTooBig TestFUSEFsyncSurvivesKill \
         TestInterruptIsEINTR TestCommitSurvivesItsCaller TestCloseWaitsForItsCommit TestReadWaitsForItsData \
         TestInterruptedFsyncRetriesDoNotPileUp TestSessionRefusesANilContext TestLookedUpFileReadsOnTheMountContext
-  - name: mount-signals
-    run: tools/ci/mount.sh run '^TestFUSEInterruptsAreNotErrors$' TestFUSEInterruptsAreNotErrors
-  - name: mount-checkout
-    run: tools/ci/mount.sh run '^TestFUSECheckout$' TestFUSECheckout
+  - name: mount-load
+    run: tools/ci/mount.sh ./pkg/mount run '^(TestFUSECheckout|TestFUSEInterruptsAreNotErrors)$' TestFUSECheckout TestFUSEInterruptsAreNotErrors
   - name: scale-a
     run: go test -count=1 -timeout 4m -run '^(TestHundredThousandFiles|TestMillionInodes|TestSyncCostDoesNotGrowWithTheTree|TestObjectBudget150GiB|TestMillionEntryDirectory|TestSequentialWriteMemory|TestSparsePetabyte)$' .
   - name: scale-b

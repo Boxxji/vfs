@@ -94,5 +94,5 @@ func TestFUSEReadsExistingFilesOverS3(t *testing.T) {
 	if got, err := os.ReadFile(filepath.Join(mp, "fresh.bin")); err != nil || !bytes.Equal(got, fresh) {
 		t.Fatalf("a file written through the mount: %d bytes, %v", len(got), err)
 	}
-	m.stop(t)
+	m.Stop(t)
 }

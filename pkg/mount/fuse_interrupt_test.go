@@ -60,7 +60,9 @@ func (s *signaler) work(slot int, fn func()) {
 func (s *signaler) close() { s.stop.Store(true); s.wg.Wait() }
 
 // restart runs a system call again while it answers EINTR, as every C library and
-// the Go runtime do; it reports how many times the caller really saw EINTR.
+// the Go runtime do for every call but close; it counts how many times the caller
+// really saw EINTR. (A sandboxed kernel, where this runs in CI, hands a lookup the
+// server abandoned to the caller as EINTR; a Linux kernel restarts it itself.)
 func restart(eintr *atomic.Int64, call func() error) error {
 	for {
 		err := call()
@@ -117,14 +119,15 @@ func TestFUSEInterruptsAreNotErrors(t *testing.T) {
 						return
 					}
 					path := filepath.Join(mp, fmt.Sprintf("s%d-%05d", w, i))
-					fd, err := syscall.Open(path, syscall.O_CREAT|syscall.O_WRONLY, 0o644)
+					var fd int
+					err := restart(&eintr, func() (e error) { fd, e = syscall.Open(path, syscall.O_CREAT|syscall.O_WRONLY, 0o644); return })
 					if err != nil {
 						bad.Add(1)
 						t.Errorf("open: %v", err)
 						return
 					}
 					buf := rnd(uint64(w*100000+i), 4096)
-					if _, err := syscall.Write(fd, buf); err != nil {
+					if err := restart(&eintr, func() error { _, e := syscall.Write(fd, buf); return e }); err != nil {
 						bad.Add(1)
 						t.Errorf("write: %v", err)
 					}
@@ -187,7 +190,8 @@ func TestFUSEInterruptsAreNotErrors(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			sig.work(2+w, func() {
-				fd, err := syscall.Open(path, syscall.O_RDONLY, 0)
+				var fd int
+				err := restart(&eintr, func() (e error) { fd, e = syscall.Open(path, syscall.O_RDONLY, 0); return })
 				if err != nil {
 					bad.Add(1)
 					t.Errorf("open: %v", err)
@@ -236,5 +240,5 @@ func TestFUSEInterruptsAreNotErrors(t *testing.T) {
 		t.Fatalf("only %d MiB read in %v: too little to say that signals do no harm", read.Load()>>20, signalPhase)
 	}
 	sig.close()
-	m.stop(t)
+	m.Stop(t)
 }

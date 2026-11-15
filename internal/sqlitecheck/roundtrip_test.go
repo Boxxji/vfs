@@ -1,6 +1,10 @@
-package vfs_test
+// Package sqlitecheck holds the tests that run a real SQLite engine on a Volume. They
+// are a package of their own because the engine is a large compile, and nothing else
+// in the repository's tests needs it.
+package sqlitecheck
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
@@ -9,9 +13,42 @@ import (
 	"testing"
 
 	_ "github.com/hanzoai/sqlite"
+	"github.com/luxfi/age"
 
 	"github.com/hanzoai/vfs"
+	"github.com/hanzoai/vfs/internal/storetest"
+	"github.com/hanzoai/vfs/pkg/backend"
 )
+
+var ctx = context.Background()
+
+func newMem(t testing.TB) (*storetest.Mem, vfs.Cipher, *vfs.Volume) {
+	t.Helper()
+	be := storetest.NewMem()
+	k, err := age.GenerateHybridIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := vfs.Hybrid(k)
+	cfg := func(round uint64) vfs.Config { return vfs.Config{Backend: be, Cipher: c, Round: round} }
+	if err := vfs.Create(ctx, cfg(0)); err != nil {
+		t.Fatal(err)
+	}
+	v, err := vfs.Attach(ctx, cfg(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return be, c, v
+}
+
+func reopen(t testing.TB, be backend.Backend, c vfs.Cipher) *vfs.Volume {
+	t.Helper()
+	v, err := vfs.Open(ctx, vfs.Config{Backend: be, Cipher: c})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return v
+}
 
 // TestSQLiteRoundTrip writes a real SQLite database through a Volume the way
 // SQLite does, in page-sized writes at page offsets and out of order, commits,
@@ -63,10 +100,22 @@ func TestSQLiteRoundTrip(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	flush(t, v)
+	if err := v.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
 
-	got := readAll(t, reopen(t, be, c), in.ID)
-	mustEqual(t, "database bytes", got, ref)
+	ro := reopen(t, be, c)
+	got := make([]byte, len(ref))
+	rf, err := ro.Open(ctx, in.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := rf.ReadAt(ctx, got, 0); n != len(ref) || (err != nil && err.Error() != "EOF") {
+		t.Fatalf("read %d of %d bytes: %v", n, len(ref), err)
+	}
+	if string(got) != string(ref) {
+		t.Fatal("the database read back differs from the one written")
+	}
 
 	rebuilt := filepath.Join(tmp, "rebuilt.db")
 	if err := os.WriteFile(rebuilt, got, 0o644); err != nil {

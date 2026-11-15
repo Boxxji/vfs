@@ -33,8 +33,8 @@ func watchdog(t *testing.T, m *mounted, d time.Duration) (stop func()) {
 		select {
 		case <-ch:
 		case <-time.After(d):
-			_ = m.cmd.Process.Kill()
-			_ = exec.Command("fusermount3", "-u", "-z", m.dir).Run()
+			_ = m.Cmd.Process.Kill()
+			_ = exec.Command("fusermount3", "-u", "-z", m.Dir).Run()
 		}
 	}()
 	return func() { close(ch) }
@@ -170,7 +170,7 @@ func TestFUSESemantics(t *testing.T) {
 		t.Fatalf("sparse file wrong: %d bytes", len(got))
 	}
 
-	m.stop(t)
+	m.Stop(t)
 
 	// The committed store agrees.
 	ro := storeView(t, store, key)
@@ -234,7 +234,7 @@ func TestFUSEUnsupportedIsHonest(t *testing.T) {
 	if fi, _ := os.Stat(filepath.Join(mp, "dst")); fi.Mode().Perm() != 0o644 {
 		t.Errorf("mode is %v after a refused chmod", fi.Mode().Perm())
 	}
-	m.stop(t)
+	m.Stop(t)
 }
 
 // TestFUSEHostileNames: names the kernel will pass through.
@@ -282,7 +282,7 @@ func TestFUSEHostileNames(t *testing.T) {
 	// ls -a: are "." and ".." in the listing?
 	out, _ := exec.Command("ls", "-a", filepath.Join(mp, "d")).CombinedOutput()
 	t.Logf("ls -a of an empty directory: %q", strings.TrimSpace(string(out)))
-	m.stop(t)
+	m.Stop(t)
 	ro := storeView(t, store, key)
 	for i, n := range names {
 		b, err := storeBytes(t, ro, "/"+n)
@@ -334,7 +334,7 @@ func TestFUSEConcurrentSameFile(t *testing.T) {
 	if !bytes.Equal(got, want) {
 		t.Fatal("concurrent disjoint writes: content differs")
 	}
-	m.stop(t)
+	m.Stop(t)
 	ro := storeView(t, store, key)
 	if b, err := storeBytes(t, ro, "/shared"); err != nil || !bytes.Equal(b, want) {
 		t.Fatalf("committed content differs: %v", err)
@@ -377,7 +377,7 @@ func TestFUSECommitPerClose(t *testing.T) {
 	after, bytes := storeObjects(store)
 	t.Logf("%d files of 20 KiB through the mount: %v (%.0f files/s); store objects %d -> %d (%.1f per file); %.1f MiB stored for %.1f MiB of data (%.2fx)",
 		files, took.Round(time.Millisecond), files/took.Seconds(), before, after, float64(after-before)/files, float64(bytes)/(1<<20), float64(files*20<<10)/(1<<20), float64(bytes)/float64(files*20<<10))
-	m.stop(t)
+	m.Stop(t)
 }
 
 // checkoutSize is the size of file i of a source-tree-like checkout: mostly small
@@ -430,7 +430,7 @@ func TestFUSECheckout(t *testing.T) {
 			t.Fatalf("file %d read back wrong: %d bytes, %v", i, len(got), err)
 		}
 	}
-	m.stop(t)
+	m.Stop(t)
 	ro := storeView(t, store, key)
 	for i := 0; i < files; i += 331 {
 		got, err := storeBytes(t, ro, fmt.Sprintf("/d%03d/file%05d", i%(files/50), i))
@@ -459,8 +459,8 @@ func TestFUSEKillDuringWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.Write(rnd(2, 3<<20+12345)) // not closed, not synced
-	_ = m.cmd.Process.Signal(syscall.SIGKILL)
-	<-m.done
+	_ = m.Cmd.Process.Signal(syscall.SIGKILL)
+	<-m.Done
 	stopdog()
 	f.Close() // fails: transport endpoint is not connected
 	_ = exec.Command("fusermount3", "-u", "-z", mp).Run()
@@ -478,7 +478,7 @@ func TestFUSEKillDuringWrite(t *testing.T) {
 		}
 		t.Logf("partial file present with %d bytes (committed by another close)", st.Size())
 	}
-	m2.stop(t)
+	m2.Stop(t)
 }
 
 // TestFUSEUnlinkVersusRmdir: unlink(2) of a directory must fail (EISDIR or
@@ -515,7 +515,7 @@ func TestFUSEUnlinkVersusRmdir(t *testing.T) {
 	if len(names) < 2 {
 		t.Errorf("readdir of an empty directory returned %v: no '.' and '..'", names)
 	}
-	m.stop(t)
+	m.Stop(t)
 }
 
 func parseDirents(b []byte) ([]string, int) {
@@ -561,7 +561,7 @@ func TestFUSEPetabyteTruncate(t *testing.T) {
 	key, _ := age.GenerateHybridIdentity()
 	m := mountAt(t, store, mp, key, 1)
 	defer watchdog(t, m, 120*time.Second)()
-	rss0 := vmrss(t, m.cmd.Process.Pid)
+	rss0 := vmrss(t, m.Cmd.Process.Pid)
 
 	const pib = int64(1) << 50
 	f, err := os.OpenFile(filepath.Join(mp, "hole"), os.O_CREATE|os.O_RDWR, 0o644)
@@ -587,7 +587,7 @@ func TestFUSEPetabyteTruncate(t *testing.T) {
 		t.Fatalf("fstat = %v, %v; want 1 PiB", st, err)
 	}
 	f.Close()
-	grew := vmrss(t, m.cmd.Process.Pid) - rss0
+	grew := vmrss(t, m.Cmd.Process.Pid) - rss0
 	objects := 0
 	filepath.WalkDir(store, func(p string, d os.DirEntry, err error) error {
 		if err == nil && !d.IsDir() && !strings.HasPrefix(d.Name(), ".") {
@@ -605,7 +605,7 @@ func TestFUSEPetabyteTruncate(t *testing.T) {
 	if objects > 12 {
 		t.Errorf("%d objects for a 1 PiB file with three runs of bytes", objects)
 	}
-	m.stop(t)
+	m.Stop(t)
 
 	ro := storeView(t, store, key)
 	in, err := ro.Resolve(context.Background(), "/hole")
@@ -643,7 +643,7 @@ func TestFUSEFileTooBig(t *testing.T) {
 		t.Fatalf("truncate to the maximum: %v", err)
 	}
 	f.Close() // an open file keeps the mount busy
-	m.stop(t)
+	m.Stop(t)
 }
 
 // TestFUSEFsyncSurvivesKill: a file whose fsync(2) returned is in the store when the
@@ -669,8 +669,8 @@ func TestFUSEFsyncSurvivesKill(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	_ = m.cmd.Process.Signal(syscall.SIGKILL)
-	<-m.done
+	_ = m.Cmd.Process.Signal(syscall.SIGKILL)
+	<-m.Done
 	stopdog()
 	for _, f := range open {
 		f.Close() // fails: transport endpoint is not connected
