@@ -2,6 +2,7 @@ package journal_test
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"math/rand"
@@ -113,27 +114,53 @@ func (r *run) reclaim(t testing.TB, j *journal.Journal) {
 // explore checks every crash state of the run.
 func (r *run) explore(t *testing.T, scatter int) {
 	t.Helper()
-	states := 0
+	states, distinct := 0, map[state]bool{}
 	err := r.d.Explore(scatter, 1, func(img *crash.Disk, n int, v crash.Variant) error {
 		states++
+		if _, again := r.novel(distinct, img, n); again {
+			return nil
+		}
 		return r.check(img, n)
 	})
 	if err != nil {
 		t.Fatalf("%v\n%s", err, r.d.Log(min(r.d.Len(), 40)))
 	}
-	t.Logf("%d crash states over %d points", states, r.d.Len())
+	t.Logf("%d crash states over %d points, %d distinct", states, r.d.Len(), len(distinct))
 }
 
-func (r *run) check(img *crash.Disk, n int) error {
-	var ack, pub uint64
+// state is a crash case: the bytes on the media and the two things the Volume
+// knew when it happened.
+type state struct {
+	disk     [sha256.Size]byte
+	ack, pub uint64
+}
+
+func (r *run) state(img *crash.Disk, n int) state {
+	s := state{disk: img.Fingerprint()}
 	for _, note := range r.d.Marks(n) {
 		switch x := note.(type) {
 		case acked:
-			ack = max(ack, uint64(x))
+			s.ack = max(s.ack, uint64(x))
 		case stored:
-			pub = max(pub, uint64(x))
+			s.pub = max(s.pub, uint64(x))
 		}
 	}
+	return s
+}
+
+// novel reports the crash case and whether seen already held it. What recovery
+// must give depends on the disk and on what the Volume knew at the crash; two
+// points that agree on both are one case.
+func (r *run) novel(seen map[state]bool, img *crash.Disk, n int) (s state, again bool) {
+	s = r.state(img, n)
+	again = seen[s]
+	seen[s] = true
+	return s, again
+}
+
+func (r *run) check(img *crash.Disk, n int) error {
+	s := r.state(img, n)
+	ack, pub := s.ack, s.pub
 	// The Volume tells Open the Head's sequence, which is the store's truth.
 	return r.recovered(img.Image(img.Len(), crash.Variant{Kind: crash.All}), pub, ack, pub)
 }
@@ -262,7 +289,7 @@ func TestCrashSequential(t *testing.T) {
 	j := open(t, r.opts(0))
 	rng := rand.New(rand.NewSource(7))
 	var visible, published uint64
-	for i := 0; i < 260; i++ {
+	for i := 0; i < 400; i++ {
 		seq := r.append(t, j, payload(uint64(rng.Intn(1000))))
 		visible = seq
 		switch rng.Intn(10) {

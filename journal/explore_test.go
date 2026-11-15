@@ -18,7 +18,7 @@ import (
 // invariants (prefix, every acknowledged record, second replay equal).
 func TestCrashDuringRecovery(t *testing.T) {
 	for seed := int64(1); seed <= 2; seed++ {
-		crashDuringRecovery(t, seed, 55)
+		crashDuringRecovery(t, seed, 80)
 	}
 }
 
@@ -44,17 +44,14 @@ func crashDuringRecovery(t *testing.T, seed int64, ops int) {
 	j.Close()
 
 	states, second := 0, 0
+	distinct := map[state]bool{}
 	err := r.d.Explore(1, 1, func(img1 *crash.Disk, n int, v crash.Variant) error {
-		states++
-		var ack, pub uint64
-		for _, note := range r.d.Marks(n) {
-			switch x := note.(type) {
-			case acked:
-				ack = max(ack, uint64(x))
-			case stored:
-				pub = max(pub, uint64(x))
-			}
+		s, again := r.novel(distinct, img1, n)
+		if again {
+			return nil
 		}
+		states++
+		ack, pub := s.ack, s.pub
 		// Recover S1 on the logging image; the recovery's own writes are then in
 		// img1's log, and every crash state of those is recovered in turn.
 		j1, err := journal.Open("", r.opts2(img1, pub))
@@ -101,16 +98,13 @@ func TestHeadAheadOfPublish(t *testing.T) {
 	r.sync(t, j, visible)
 	j.Close()
 
+	distinct := map[state]bool{}
 	err := r.d.Explore(1, 3, func(img *crash.Disk, n int, v crash.Variant) error {
-		var pub, seen uint64
-		for _, note := range r.d.Marks(n) {
-			switch x := note.(type) {
-			case stored:
-				pub = max(pub, uint64(x))
-			case acked:
-				seen = max(seen, uint64(x))
-			}
+		s, again := r.novel(distinct, img, n)
+		if again {
+			return nil
 		}
+		pub, seen := s.pub, s.ack
 		for _, extra := range []uint64{1, 5, 1 << 20} {
 			// The Head landed and the process died before Publish. The Volume
 			// publishes only what was durable when it did, so the Head can be
@@ -137,7 +131,7 @@ func TestHeadAheadOfPublish(t *testing.T) {
 // whose every payload is the one appended.
 func TestDamageFuzz(t *testing.T) {
 	rng := rand.New(rand.NewSource(99))
-	for round := 0; round < 900; round++ {
+	for round := 0; round < 1500; round++ {
 		d := crash.New()
 		j := open(t, small(d, newClock(), 0))
 		want := map[uint64][]byte{}

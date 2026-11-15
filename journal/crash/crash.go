@@ -448,7 +448,7 @@ func (d *Disk) Explore(scatter int, seed int64, check func(img *Disk, point int,
 		seen := map[[sha256.Size]byte]bool{}
 		for _, v := range variants(volatile, scatter, seed+int64(n)*1000) {
 			img := image(base, volatile, v)
-			key := img.fingerprint()
+			key := img.Fingerprint()
 			if seen[key] {
 				continue
 			}
@@ -461,8 +461,8 @@ func (d *Disk) Explore(scatter int, seed int64, check func(img *Disk, point int,
 	return nil
 }
 
-// fingerprint is a digest of the names and contents of the files.
-func (d *Disk) fingerprint() [sha256.Size]byte {
+// Fingerprint is a digest of the names and contents of the files.
+func (d *Disk) Fingerprint() [sha256.Size]byte {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	names := make([]string, 0, len(d.files))
