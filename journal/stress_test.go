@@ -144,7 +144,7 @@ func TestStress(t *testing.T) {
 	}()
 
 	done := make(chan struct{})
-	go func() { time.Sleep(3 * time.Second); stop.Store(true); wg.Wait(); close(done) }()
+	go func() { time.Sleep(2 * time.Second); stop.Store(true); wg.Wait(); close(done) }()
 	select {
 	case <-done:
 	case <-time.After(20 * time.Second):

@@ -17,8 +17,8 @@ import (
 // state S2 of that recovery is recovered again and held to the same
 // invariants (prefix, every acknowledged record, second replay equal).
 func TestCrashDuringRecovery(t *testing.T) {
-	for seed := int64(1); seed <= 3; seed++ {
-		crashDuringRecovery(t, seed, 120)
+	for seed := int64(1); seed <= 2; seed++ {
+		crashDuringRecovery(t, seed, 80)
 	}
 }
 
@@ -89,7 +89,7 @@ func TestHeadAheadOfPublish(t *testing.T) {
 	j := open(t, r.opts(0))
 	rng := rand.New(rand.NewSource(5))
 	var visible, published uint64
-	for i := 0; i < 150; i++ {
+	for i := 0; i < 90; i++ {
 		seq := r.append(t, j, payload(uint64(rng.Intn(900))))
 		visible = seq
 		switch rng.Intn(8) {

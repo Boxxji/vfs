@@ -397,14 +397,15 @@ func (j *Journal) failLocked(err error) {
 	}
 	j.err = fmt.Errorf("journal: %w", err)
 	j.finish()
+	// Due first: a caller whose Sync fails must find Due already closed.
+	for _, d := range append([]*due(nil), j.dues...) {
+		j.fire(d)
+	}
 	for _, w := range j.waiters {
 		w.err = j.err
 		close(w.done)
 	}
 	j.waiters = nil
-	for _, d := range append([]*due(nil), j.dues...) {
-		j.fire(d)
-	}
 	j.kick(j.kickw)
 	j.kick(j.kicks)
 	j.broadcast()
