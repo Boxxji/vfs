@@ -113,7 +113,7 @@ func TestMillionInodes(t *testing.T) {
 		return ms.HeapInuse
 	}
 	base := heap()
-	var peak uint64
+	var peak int64
 	var sample []vfs.InodeID // one file in a thousand, for the change below
 	start := time.Now()
 	const dirs, perDir = 1000, 1000
@@ -131,13 +131,13 @@ func TestMillionInodes(t *testing.T) {
 		if d%100 == 99 {
 			flush(t, v)
 			runtime.ReadMemStats(&ms)
-			peak = max(peak, ms.HeapInuse-base-uint64(storeBytes(be)))
+			peak = max(peak, int64(ms.HeapInuse)-int64(base)-int64(storeBytes(be))) // signed: the heap can shrink under the store
 		}
 	}
 	elapsed := time.Since(start)
 	st := v.Stats()
 	stored := uint64(storeBytes(be))
-	held := heap() - base - stored
+	held := int64(heap()) - int64(base) - int64(stored)
 	t.Logf("%d inodes created and committed in %v; the Volume holds %d MiB (peak %d MiB at a commit; the cache bound is %d MiB); the store holds %d objects, %d MiB",
 		st.Inodes, elapsed.Round(time.Millisecond), held>>20, peak>>20, st.CacheMax>>20, be.Count(), stored>>20)
 

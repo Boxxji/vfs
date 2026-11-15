@@ -75,7 +75,7 @@ the last committed tree, whole, and a retry commits the next.
 | takeover during a stream of commits | `TestTakeoverLosesNoAcknowledgedCommit` |
 | a writer on the mount killed mid-write | `TestFUSEKillDuringWrite` |
 | twenty files each acknowledged by `fsync(2)` on the mount, then the server killed | `TestFUSEFsyncSurvivesKill`: all twenty in the store |
-| killed at a random moment, 15 times over a real server | `TestKillOverRealServer`: every acknowledged file present and byte-exact after each kill |
+| killed at a random moment, 10 times over a real server | `TestKillOverRealServer`: every acknowledged file present and byte-exact after each kill |
 
 ## What is guaranteed
 
@@ -106,24 +106,44 @@ the last committed tree, whole, and a retry commits the next.
 | SQLite on the Volume | pass | `TestSQLiteRoundTrip`; over the mount `TestFUSESQLite` (100 rows survive release and remount, `integrity_check` ok) |
 | The mount: Lookup, ReadDir (with `.` and `..`), Mkdir, Create, Remove, Setattr size, Read, Write, Flush, Fsync, Release | pass | `TestFUSEPOSIX`, `TestFUSESemantics`, `TestFUSEHostileNames`, `TestFUSEConcurrentSameFile`, `TestFUSEUnlinkVersusRmdir`; after `fsync(2)` a second read-only view of the store sees the file |
 | The mount says what it cannot do | pass | `TestFUSEUnsupportedIsHonest`: rename, symlink, hard link, chmod and utimens answer ENOSYS (the kernel words link as EPERM), a file too large is EFBIG |
-| A signal reaching a caller is never an `EIO`, and never cancels a commit or a fetch | pass | `TestInterruptIsEINTR`, `TestCommitSurvivesItsCaller` (the caller walks away mid-PUT of the Head; the Head still lands), `TestCloseWaitsForItsCommit`, `TestReadWaitsForItsData`, and through a kernel mount `TestFUSEInterruptsAreNotErrors`: 5,000 fsync+close and 20 GiB of reads, with SIGURG sent to the waiting threads tens of thousands of times a second, zero failures |
+| A signal reaching a caller is never an `EIO`, and never cancels a commit or a fetch | pass | `TestInterruptIsEINTR`, `TestCommitSurvivesItsCaller` (the caller walks away mid-PUT of the Head; the Head still lands), `TestCloseWaitsForItsCommit`, `TestReadWaitsForItsData`, and through a kernel mount `TestFUSEInterruptsAreNotErrors`: 2,000 fsync+close and 8 GiB of reads, with SIGURG sent to the waiting threads thousands of times a second, zero failures |
 
 Mount tests run only with `-tags fuse`, from a child process that serves the mount
 while the test acts as its client; a process that mounts a Volume and also opens a
 file on that mount deadlocks. The real-server tests need an `s3` binary on `PATH`.
 
-CI (`hanzo.yml`, `.github/workflows/cicd.yml`) runs thirteen gates as parallel jobs,
-each under five minutes: `check`; the engine's unit tests under the race detector
-shared three ways (`race-a`, `race-b`, `race-c`); `model`, the random tests against a
+CI (`hanzo.yml`, `.github/workflows/cicd.yml`) runs ten gates as parallel jobs, each
+under five minutes on the runner (measured on the run of the head this round: `check`
+4 m 25 s, `race` 4 m 28 s, `realserver` 4 m 24 s, `unit` 3 m 22 s, `scale-b` 4 m 47 s,
+`sqlite` 3 m 37 s, `scale-a` 3 m 19 s, `realserver-kill` 3 m 12 s, `model` 2 m 48 s,
+`fuzz` 2 m 25 s, all from a cold Go cache): `check` (build, vet and gofmt of what does
+not need the SQLite engine); `unit`; `race`, the tests that have goroutines under the
+race detector, with the handlers of the mount; `model`, the random tests against a
 plain model, without the race detector (they have no goroutines, and the detector
-multiplies their hashing tenfold); `realserver` and `realserver-kill`, which build the
-server from a pinned commit of `hanzoai/s3` and fail if a test they exist for did not
-pass; `mount`, `mount-signals` and `mount-checkout`; the measurements `scale-a` and
-`scale-b`; and `fuzz`. A skip is a failure in every gate that needs a server or a
-mount. The runner is a sandbox whose kernel ignores the setuid bit and gives its user
-no capability, so the mount gates cannot use `fusermount3`; they run inside a user
-namespace (`unshare -Urm`), where the user holds every capability and may mount a
-file system, with `tools/fusemount` on `PATH` as `fusermount3`.
+multiplies their hashing tenfold); `sqlite`, the only gate that builds the SQLite
+engine; `realserver` and `realserver-kill`, against the real Hanzo S3 server, which
+fail if a test they exist for did not pass; the measurements `scale-a` and `scale-b`;
+and `fuzz`. The server is the published image of release v1.0.41, pinned by digest and
+read with `crane`, which needs no docker: building it from its source costs five
+minutes of a cold job, and every real-server test passes against the release as it did
+against a build of the main commit cbf3d650.
+
+**The tests on a kernel mount are not CI gates, and why.** The runner has `/dev/fuse`
+and no `fusermount3`, and cannot install one: its kernel is a sandbox (gVisor) that
+ignores the setuid bit and gives its user no capability, so `sudo` and a setuid helper
+do not work. An unprivileged user can make a user namespace there, in which it holds
+every capability, and mount a file system, and `tools/fusemount` stands in for the
+helper (`tools/ci/mount.sh` runs the tests that way). The mount then works, but the
+sandbox's FUSE answers differently from Linux's: after `fsync(2)` the file is not yet
+in the store, truncate is refused, chmod and utimes answer EPERM and not ENOSYS, close
+is interrupted by the kernel itself, and an unmount does not end the server (thirteen
+tests were tried one at a time; none passed for a reason that is the mount's). A test of
+what Linux does would test the sandbox, so none is gated there and none skips there.
+They run on a Linux kernel (`go test -tags fuse ./pkg/mount ./internal/sqlitecheck`, 68 s
+on the lab machine this round, all passing), and the proposal is a runner with a real
+kernel for them. What the mount does that needs no kernel is gated: the commits, the
+interrupts, the context every read runs on, and the creation of a file that exists are
+tested by calling the handlers, under the race detector.
 
 ## Measurements
 
@@ -131,35 +151,39 @@ file system, with `tools/fusemount` on `PATH` as `fusermount3`.
 |---|---|---|
 | Sequential write, 4 GiB in 1 MiB writes, one handle, Flush every GiB | 143 MB/s; peak heap 361 MiB | `TestSequentialWriteMemory` |
 | Sequential write, 50 GiB, same | 87 MB/s under load (10 min 15 s); peak heap 878 MiB against a 1 GiB bound; 5,254 objects | `TestSequentialWrite50GiB` |
-| Flush after a 4 KiB overwrite in a 16 MiB file | p50 5 ms, p90 9 ms, p98 44 ms, max 55 ms (100 rounds) | `TestFlushLatency` |
-| 64 KiB write then Flush, round-robin over 16 files, 10 s | 274 ops/s, mean 4 ms, p50 2 ms, p99 45 ms, max 78 ms | `TestSustainedWriteWithFsync` |
-| Objects written for 1,000 files of 200 bytes | 6 (5 shards, 1 Head) | `TestObjectsPerThousandSmallFiles` |
-| Objects written for 1,000 files of 2.5 KiB | 36 (their bytes live in the shards, about one shard per 64 KiB) | same |
-| Objects written for 1,000 files of 100 KiB | 14 (6 shards, 7 packs, 1 Head) | same |
-| 100,000 files: create, first Flush, cold stat of every file | 0.5 s, 1.7 s (220 shards, 1 Head), 1.4 µs per Lookup + Stat | `TestHundredThousandFiles` |
-| Ten changed files among 100,000 | a commit of 21 shards of 220, 61 ms | same |
-| The same ten changes at 40,000 and at 120,000 files | 21 and 21 shards: the cost does not grow with the tree | `TestSyncCostDoesNotGrowWithTheTree` |
-| 1,000,000 inodes: create and commit | 5.5 s; the store holds 1,195 objects, 72 MiB | `TestMillionInodes` |
-| Memory at 1,000,000 inodes | the Volume holds 223 MiB after the commits (peak 403 MiB during one), against a cache bound of 256 MiB; a cold reader holds 1.3 MiB after opening and listing three directories | same |
-| Ten changed files among 1,000,000 | a commit of 14 shards | same |
+| Flush after a 4 KiB overwrite in a 16 MiB file | p50 7 ms, p90 16 ms, p98 23 ms, max 46 ms (100 rounds) | `TestFlushLatency` |
+| 64 KiB write then Flush, round-robin over 16 files, 10 s | 122 ops/s, mean 8 ms, p50 6 ms, p99 52 ms, max 69 ms (a box with a load average of 20) | `TestSustainedWriteWithFsync` |
+| Objects written for 1,000 files of 200 bytes | 5 (4 shards, 1 Head) | `TestObjectsPerThousandSmallFiles` |
+| Objects written for 1,000 files of 2.5 KiB | 50 (their bytes live in the shards, about one shard per 64 KiB) | same |
+| Objects written for 1,000 files of 100 KiB | 15 (7 shards, 7 packs, 1 Head) | same |
+| 100,000 files: create, first Flush, cold stat of every file | 0.9 s, 1.8 s (204 shards, 1 Head), 1.6 µs per Lookup + Stat | `TestHundredThousandFiles` |
+| Ten changed files among 100,000 | a commit of 21 shards of 204, 67 ms | same |
+| The same ten changes at 40,000 and at 120,000 files | 19 and 22 shards: the cost does not grow with the tree | `TestSyncCostDoesNotGrowWithTheTree` |
+| 1,000,000 inodes: create and commit | 6.4 s; the store holds 1,150 objects, 72 MiB | `TestMillionInodes` |
+| Memory at 1,000,000 inodes | the Volume holds 218 MiB after the commits (peak 358 MiB during one), against a cache bound of 256 MiB; a cold reader holds 2.8 MiB after opening and listing three directories | same |
+| Ten changed files among 1,000,000 | a commit of 12 shards | same |
 | Chunker, random data | mean chunk 578 KiB (170 chunks in 96 MiB), minimum 64 KiB, maximum 4 MiB | `TestCutBounds` |
 | A 100 byte overwrite, insertion or deletion in the middle of 24 MiB (45 chunks) | 1 chunk changes | `TestCutStableUnderEdit` |
 | A 6 byte edit in a file | 590 KiB of new packs | `TestSmallEditRewritesOneChunk` |
-| Sealing overhead of the default Cipher | +1,676 bytes at 64 KiB, +1,916 at 1 MiB, +2,684 at 4 MiB | `TestAgeFrameOverhead` |
+| Sealing overhead of the default Cipher | +1,756 bytes at 64 KiB, +1,996 at 1 MiB, +2,764 at 4 MiB (the context and the tag are 64 of them) | `TestAgeFrameOverhead` |
 
 ### Under signals, through the mount
 
+Measured on a Linux kernel (the CI runner's kernel cannot run this test; see above). The
+work is bounded by count and by the clock, whichever comes first (2,000 fsyncs and 8 GiB
+of reads, at most 45 s each), so it is fast on a busy disk.
+
 | What | Result | Test |
 |---|---|---|
-| 5,000 small files written, fsynced and closed, two writers, SIGURG at their threads | 62,469 signals in 28.1 s; 0 failures; the callers saw `EINTR` from fsync 29,116 times and restarted it | `TestFUSEInterruptsAreNotErrors` |
-| 20 GiB read back in 1 MiB reads of a 1 GiB file, two readers, same signals | 138,816 signals in 35.4 s (607 MB/s); 0 failures | same |
+| 2,000 small files written, fsynced and closed, two writers, SIGURG at their threads | 28,030 signals in 7.7 s; 0 failures; the callers saw `EINTR` from fsync 7,909 times and restarted it, and none from close | `TestFUSEInterruptsAreNotErrors` |
+| 8 GiB read back in 1 MiB reads of a 256 MiB file, two readers, same signals | 70,861 signals in 11.5 s (744 MB/s); 0 failures | same |
 
 ### Holes
 
 | What | Result | Test |
 |---|---|---|
 | Truncate a file to 64 GiB, then Flush | 7 µs, then 297 µs; no allocation | `TestSparseTruncateIsBoundedWork` |
-| A 1 PiB file: truncate, write at the start, the middle and near the end, Flush, reopen, read back | 2 ms in all; 1 shard (3 KiB), 1 pack, 1 Head; heap +1 MiB; ceilings asserted on seconds, shard count and bytes, and memory | `TestSparsePetabyte` |
+| A 1 PiB file: truncate, write at the start, the middle and near the end, Flush, reopen, read back | 19 ms in all; 1 shard (4 KiB), 1 pack, 1 Head; heap +1 MiB; ceilings asserted on seconds, shard count and bytes, and memory | `TestSparsePetabyte` |
 | The same through the mount, in a child process | truncate, three writes and fsync in 3 ms; the server's RSS +2 MiB; 4 objects in the store | `TestFUSEPetabyteTruncate` |
 | 2,000,000 one-byte writes with no Flush | `Stats.Dirty` 62.9 MB (each write span is charged 64 bytes), the heap grew 297 MiB: about 5 times the accounted bytes, so in that pattern memory is bounded by five times `Config.Dirty` | `TestSmallWritesAmplifyMemory` |
 
@@ -170,12 +194,12 @@ Every `close(2)` on the mount is a commit (see Not yet built), so a tree written
 
 | What | Result | Test |
 |---|---|---|
-| 400 files of 20 KiB written through the mount | 1.1 s (365 files/s); the store went from 2 to 1,269 objects, 3.2 per file; 23.0 MiB held for 7.8 MiB of data (2.94 times) | `TestFUSECommitPerClose` |
-| 500 files of 20 KiB, Flush per file, engine alone | 3.6 objects per file (1 Head, 1.6 shards, 1 pack); at 5 ms store latency 36.9 files/s (13.6 s), at none 673 files/s | `TestCommitPerClose` |
-| A 5,000-file checkout (284.6 MiB; 55% under 4 KiB, 30% to 32 KiB, 12% to 256 KiB, 3% to 2 MiB), a commit per file, through the mount | 37.8 s (132 files/s); the store holds 25,567 objects (5.11 per file) and 1,232.6 MiB (4.33 times the data) | `TestFUSECheckout` |
-| The same 5,000 files, Flush per file, engine alone | 29,143 objects written (5.83 per file: 5,000 Heads, 22,527 shards, 1,616 packs); 24,145 held, 1,402.7 MiB (4.93 times) in 25.4 s | `TestCheckoutCost` |
-| The same 5,000 files, one Flush at the end | 211 objects written (0.04 per file: 1 Head, 192 shards, 18 packs); 212 held, 288.7 MiB (1.01 times) in 5.0 s | same |
-| Ten rewritten chunked files among 30,000 | a commit of 29 shards, 1 pack, 1 Head (ten inline files: 14 to 21 shards) | `TestChunkedFilesCommitCost` |
+| 400 files of 20 KiB written through the mount | 1.1 s (374 files/s); the store went from 2 to 802 objects, 2.0 per file; 23.0 MiB held for 7.8 MiB of data (2.94 times). The count per file differs from run to run (2.0 to 3.2 in the runs of this round): each Volume draws its own seed, and with it where its nodes end | `TestFUSECommitPerClose` |
+| 500 files of 20 KiB, Flush per file, engine alone | 3.0 objects per file (1 Head, 1 shard, 1 pack) at no latency, 360 files/s; at 5 ms store latency 4.8 per file and 23.8 files/s | `TestCommitPerClose` |
+| A 5,000-file checkout (284.6 MiB; 55% under 4 KiB, 30% to 32 KiB, 12% to 256 KiB, 3% to 2 MiB), a commit per file, through the mount | 35.1 s (143 files/s); the store holds 24,537 objects (4.91 per file) and 1,333.0 MiB (4.68 times the data) | `TestFUSECheckout` |
+| The same 5,000 files, Flush per file, engine alone | 28,283 objects written (5.66 per file: 5,000 Heads, 21,667 shards, 1,616 packs); 23,285 held, 1,461.7 MiB (5.14 times) in 31.0 s | `TestCheckoutCost` |
+| The same 5,000 files, one Flush at the end | 223 objects written (0.04 per file: 1 Head, 204 shards, 18 packs); 224 held, 288.8 MiB (1.01 times) in 6.6 s | same |
+| Ten rewritten chunked files among 30,000 | a commit of 30 shards, 1 pack, 1 Head (ten inline files: 14 to 21 shards) | `TestChunkedFilesCommitCost` |
 
 The 4 to 5 times is the shards a commit replaces: each commit rewrites the leaves it
 touched and their ancestors, and the old ones stay until a collector exists. One
@@ -185,8 +209,8 @@ Flush at the end of the same tree leaves nothing behind.
 
 | What | Result | Test |
 |---|---|---|
-| 200 appends of 4 KiB with a Flush each | 64,399 KiB of packs written for 800 KiB of data (80 times): each Flush re-chunks the tail chunk | `TestAppendWithFsyncAmplification` |
-| A cold 4 KiB read | fetches the whole chunk holding it: 243 to 584 KiB (61 to 146 times) | `TestColdReadAmplification` |
+| 200 appends of 4 KiB with a Flush each | 82,828 KiB of packs written for 800 KiB of data (104 times): each Flush re-chunks the tail chunk | `TestAppendWithFsyncAmplification` |
+| A cold 4 KiB read | fetches the whole chunk holding it: 528 to 815 KiB (132 to 204 times) | `TestColdReadAmplification` |
 
 ### The object budget: 100,000 files, 150 GiB
 
@@ -197,8 +221,8 @@ objects for the same bytes.
 
 | Shape | Chunks | Metadata shards | Packs | Objects |
 |---|---|---|---|---|
-| mixed (70,000 files of 4 KiB, 25,000 of 100 KiB, 4,900 of 2 MiB, 100 huge) | 285,700 | 5,109 (312 MiB) | 9,632 | 14,742 |
-| the worst shape: 99,000 files of exactly 16 KiB (all inline) and 1,000 huge | 260,000 | 25,559 (1,585 MiB) | 9,629 | 35,189 |
+| mixed (70,000 files of 4 KiB, 25,000 of 100 KiB, 4,900 of 2 MiB, 100 huge) | 285,700 | 5,056 (313 MiB) | 9,633 | 14,690 |
+| the worst shape: 99,000 files of exactly 16 KiB (all inline) and 1,000 huge | 260,000 | 25,306 (1,586 MiB) | 9,630 | 34,937 |
 
 Both are under 40,000. The second shows where the margin goes: inline bytes cost one
 shard per 64 KiB, so a tree dominated by files just under 16 KiB approaches it.
@@ -207,7 +231,7 @@ shard per 64 KiB, so a tree dominated by files just under 16 KiB approaches it.
 
 | What | Result | Test |
 |---|---|---|
-| 300 small files, a commit per file, over HTTP to a Hanzo S3 server | 96 files/s; a commit p50 9.5 ms, p99 32 ms | `TestCommitRateOnRealServer` |
+| 300 small files, a commit per file, over HTTP to a Hanzo S3 server | 96 files/s; a commit p50 9.5 ms, p99 32 ms (measured against a build of the main commit cbf3d650; the gates now run the published release v1.0.41, which passes every test) | `TestCommitRateOnRealServer` |
 | The same 300 files, one Flush | 218 ms (1,373 files/s) | same |
 | Reads that return a version that is not the MD5 of their body, under writers | 0 in 14,660 reads and 8,611 writes | `TestGetPairsBodyWithVersion` |
 
@@ -242,7 +266,7 @@ content, a chunk-reuse rule, the commit order, the fence comparison, a missing
 conditional header, an unchecked hash, a Cipher check removed, a hole that stores
 chunks, a Get that reads past its bound, and so on), copies the repository, applies
 the change, and runs the test that should catch it. `tools/mutate/mutations.json` is
-the list; `go run ./tools/mutate -j 5` runs it. The list has 95 mutations and every one is killed by a test (a run takes about eight minutes on four workers).
+the list; `go run ./tools/mutate -j 5` runs it. The list has 105 mutations and every one is killed by a test (a run takes about fifteen minutes on four workers).
 
 ## Not yet built
 
@@ -292,10 +316,11 @@ Plain statements of fact; each is its own change.
 ## Running the tests
 
 ```bash
-go test -short -race ./...             # the unit step of CI
+go test -short -race ./...             # the race detector over the lot (CI runs it on the tests with goroutines)
 go test ./...                          # adds the scale tests and the full failure sweep
-go test -tags fuse ./pkg/mount         # a kernel mount (Linux with /dev/fuse and fusermount)
-PATH=$DIR:$PATH go test ./...          # $DIR holds an `s3` built from github.com/hanzoai/s3: adds the real-server tests
+go test -tags fuse ./pkg/mount ./internal/sqlitecheck  # a kernel mount (Linux with /dev/fuse and fusermount3)
+tools/ci/mount.sh ./pkg/mount run '^TestFUSEPOSIX$'    # the same as an unprivileged user, in a user namespace
+PATH=$DIR:$PATH go test ./...          # $DIR holds the `s3` server (tools/ci/s3server.sh $DIR): adds the real-server tests
 go test -run xxx -bench . .            # throughput
 go run ./tools/mutate -j 5             # every mutation must be killed by a test
 ```

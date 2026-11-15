@@ -207,21 +207,25 @@ and hides that from the caller: retries and deadlines are not built yet.
 
 ```
 go test ./...                                    # fast + scale tests
-go test -short -race ./...                       # the unit step of CI
+go test -short -race ./...                       # the race detector over the lot (CI runs it on the tests with goroutines)
 go test -tags fuse ./pkg/mount                   # needs /dev/fuse + fusermount3
-tools/ci/mount.sh run '^TestFUSEPOSIX$'          # the same with no helper and no privilege, in a user namespace
-PATH=$DIR:$PATH go test ./...                    # $DIR holds an `s3` built from github.com/hanzoai/s3 (tools/ci/s3server.sh DIR)
+tools/ci/mount.sh ./pkg/mount run '^TestFUSEPOSIX$'   # the same with no helper and no privilege, in a user namespace
+PATH=$DIR:$PATH go test ./...                    # $DIR holds the `s3` server (tools/ci/s3server.sh DIR fetches the published image)
 go run ./tools/mutate                            # every mutation must be killed by a test
 ```
 
 The real-server tests start `s3 server` (own-storage mode) in a temp dir with a
 throwaway key pair, race 16 and 128 writers on one version, run whole Volumes on it,
 and kill a writer at random moments. CI (`hanzo.yml`, `.github/workflows/cicd.yml`)
-runs thirteen gates as parallel jobs, each under five minutes: the real-server gates
-build that server from a pinned commit of `hanzoai/s3` and fail if a test did not
-pass; the mount gates run on a kernel mount inside a user namespace (the runner is a
-sandbox with no setuid helper and no privilege; `tools/fusemount` does what
-fusermount3 does there) and fail on a skip. Crash tests kill a
+runs ten gates as parallel jobs, each under five minutes: `check`, `unit`, `race`,
+`model`, `sqlite` (the only gate that builds the SQLite engine), `realserver` and
+`realserver-kill` (against the published image of the server, pinned by digest, which
+fail if a test did not pass), `scale-a`, `scale-b` and `fuzz`. The tests on a kernel
+mount are not gates: the runner's kernel is a sandbox whose FUSE is not Linux's, and
+`docs/PRODUCTION-READINESS.md` says what it does differently. They run on a Linux
+kernel, with `go test -tags fuse ./pkg/mount ./internal/sqlitecheck`, or with
+`tools/ci/mount.sh` where there is no `fusermount3` (it mounts in a user namespace
+through `tools/fusemount`). Crash tests kill a
 re-executed test binary with SIGKILL at every point of a commit (the key arrives on
 its stdin). A mount test serves the Volume from a child process, always: a process
 that mounts a Volume and also opens a file on that mount deadlocks. Go registers the
