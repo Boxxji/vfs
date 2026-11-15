@@ -1,13 +1,16 @@
 //go:build fuse && darwin
 
-// macOS FUSE driver. bazil.org/fuse dropped macOS support upstream
-// (commit 65cc252+); we use github.com/jacobsa/fuse instead, which
-// still supports both macFUSE and fuse-t.
+// macOS FUSE driver. bazil.org/fuse dropped macOS support upstream (commit
+// 65cc252+); we use github.com/jacobsa/fuse instead, which still supports both
+// macFUSE and fuse-t.
 //
 // Build with: `go build -tags fuse ./...`
-// Requires either macFUSE (https://macfuse.io) or fuse-t
-// (https://www.fuse-t.org). fuse-t is preferred — no kernel extension,
-// runs as a userspace NFSv4 server, works under SIP.
+// Requires either macFUSE (https://macfuse.io) or fuse-t (https://www.fuse-t.org).
+// fuse-t is preferred: no kernel extension, runs as a userspace NFSv4 server,
+// works under SIP.
+//
+// A mounted Volume is durable at FlushFile and SyncFile, which return only after
+// the Volume's Head has advanced in the store, and once more when the mount ends.
 package mount
 
 import (
@@ -16,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync"
 	"syscall"
 	"time"
 
@@ -26,17 +30,16 @@ import (
 	"github.com/hanzoai/vfs"
 )
 
-// Mount mounts the given *vfs.FS at mountpoint and serves until the
-// context is cancelled or the kernel unmounts the filesystem.
-func Mount(ctx context.Context, fs *vfs.FS, mountpoint string) error {
-	if fs == nil {
-		return errors.New("mount: vfs.FS required")
+// Mount mounts vol at mountpoint and serves until ctx is cancelled or the kernel
+// unmounts it, then flushes the Volume. The caller owns vol and closes it.
+func Mount(ctx context.Context, vol *vfs.Volume, mountpoint string) error {
+	if vol == nil {
+		return errors.New("mount: Volume required")
 	}
 	if mountpoint == "" {
 		return errors.New("mount: mountpoint required")
 	}
-	srv := newServer(ctx, fs)
-	mfs, err := fuse.Mount(mountpoint, fuseutil.NewFileSystemServer(srv), &fuse.MountConfig{
+	mfs, err := fuse.Mount(mountpoint, fuseutil.NewFileSystemServer(newServer(vol)), &fuse.MountConfig{
 		FSName:                    "vfs",
 		Subtype:                   "hanzovfs",
 		ReadOnly:                  false,
@@ -47,235 +50,132 @@ func Mount(ctx context.Context, fs *vfs.FS, mountpoint string) error {
 	if err != nil {
 		return fmt.Errorf("fuse.Mount %q: %w", mountpoint, err)
 	}
-
 	go func() {
 		<-ctx.Done()
 		_ = fuse.Unmount(mountpoint)
 	}()
-
-	return mfs.Join(context.Background())
+	return finish(vol, mfs.Join(context.Background()))
 }
 
-// MountWithVFSAdapter mirrors the linux helper.
-func MountWithVFSAdapter(ctx context.Context, v *vfs.VFS, mountpoint string) error {
-	fs, err := vfs.NewFS(ctx, v)
-	if err != nil {
-		return fmt.Errorf("mount: NewFS: %w", err)
-	}
-	return Mount(ctx, fs, mountpoint)
-}
-
-// ============================================================================
-// FileSystem implementation
-// ============================================================================
-
+// server maps FUSE inode numbers straight onto Volume inodes; both start the
+// root at 1.
 type server struct {
 	fuseutil.NotImplementedFileSystem
-	ctx context.Context
-	fs  *vfs.FS
+	vol *vfs.Volume
 
-	// FUSE inode IDs are u64 starting at 1 (fuseops.RootInodeID).
-	// We map directly: VFS InodeID == FUSE InodeID.
-	//
-	// Open file handles are u64; we allocate sequential IDs.
-	nextHandle fuseops.HandleID
-	handles    map[fuseops.HandleID]*vfs.File
+	mu      sync.Mutex
+	next    fuseops.HandleID
+	handles map[fuseops.HandleID]*vfs.File
 }
 
-func newServer(ctx context.Context, fs *vfs.FS) *server {
-	return &server{
-		ctx:        ctx,
-		fs:         fs,
-		nextHandle: 1,
-		handles:    map[fuseops.HandleID]*vfs.File{},
-	}
+func newServer(vol *vfs.Volume) *server {
+	return &server{vol: vol, next: 1, handles: map[fuseops.HandleID]*vfs.File{}}
 }
 
-func (s *server) inodeAttrs(in *vfs.Inode) fuseops.InodeAttributes {
+func attrs(in vfs.Inode) fuseops.InodeAttributes {
 	return fuseops.InodeAttributes{
-		Size:   in.Size,
-		Nlink:  1,
-		Mode:   os.FileMode(in.Mode),
-		Atime:  in.Atime,
-		Mtime:  in.Mtime,
-		Ctime:  in.Ctime,
-		Crtime: in.Ctime,
-		Uid:    uint32(os.Getuid()),
-		Gid:    uint32(os.Getgid()),
+		Size: in.Size, Nlink: 1, Mode: os.FileMode(in.Mode),
+		Atime: in.Atime, Mtime: in.Mtime, Ctime: in.Ctime, Crtime: in.Ctime,
+		Uid: uint32(os.Getuid()), Gid: uint32(os.Getgid()),
 	}
 }
 
-// pathOfInode walks the FS metadata tree to recover the absolute path
-// for a given inode ID. Used by every FUSE op the kernel sends as
-// (parent_id, name) tuples.
-func (s *server) pathOfInode(id fuseops.InodeID) (string, error) {
-	if id == fuseops.RootInodeID {
-		return "/", nil
+func entry(in vfs.Inode) fuseops.ChildInodeEntry {
+	exp := time.Now().Add(time.Second)
+	return fuseops.ChildInodeEntry{
+		Child: fuseops.InodeID(in.ID), Attributes: attrs(in),
+		AttributesExpiration: exp, EntryExpiration: exp,
 	}
-	// vfs.FS doesn't currently expose a reverse map (id → path) — walk
-	// from the root by joining names up the parent chain. The tree is
-	// in memory; this is O(depth).
-	return s.fs.PathOfInode(vfs.InodeID(id))
 }
 
-// LookUpInode (parent + name) → child attrs.
-func (s *server) LookUpInode(_ context.Context, op *fuseops.LookUpInodeOp) error {
-	parentPath, err := s.pathOfInode(op.Parent)
+func (s *server) LookUpInode(ctx context.Context, op *fuseops.LookUpInodeOp) error {
+	in, err := s.vol.Lookup(ctx, vfs.InodeID(op.Parent), op.Name)
 	if err != nil {
-		return err
+		return errno(err)
 	}
-	child := joinPath(parentPath, op.Name)
-	in, err := s.fs.Lookup(child)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return fuse.ENOENT
-		}
-		return err
-	}
-	op.Entry = fuseops.ChildInodeEntry{
-		Child:                fuseops.InodeID(in.ID),
-		Attributes:           s.inodeAttrs(in),
-		AttributesExpiration: time.Now().Add(time.Second),
-		EntryExpiration:      time.Now().Add(time.Second),
-	}
+	op.Entry = entry(in)
 	return nil
 }
 
-func (s *server) GetInodeAttributes(_ context.Context, op *fuseops.GetInodeAttributesOp) error {
-	p, err := s.pathOfInode(op.Inode)
+func (s *server) GetInodeAttributes(ctx context.Context, op *fuseops.GetInodeAttributesOp) error {
+	in, err := s.vol.Stat(ctx, vfs.InodeID(op.Inode))
 	if err != nil {
-		return err
+		return errno(err)
 	}
-	in, err := s.fs.Lookup(p)
-	if err != nil {
-		return err
-	}
-	op.Attributes = s.inodeAttrs(in)
+	op.Attributes = attrs(in)
 	op.AttributesExpiration = time.Now().Add(time.Second)
 	return nil
 }
 
 func (s *server) SetInodeAttributes(ctx context.Context, op *fuseops.SetInodeAttributesOp) error {
-	p, err := s.pathOfInode(op.Inode)
-	if err != nil {
-		return err
-	}
 	if op.Size != nil {
-		f, err := s.fs.Open(s.ctx, p)
-		if err != nil {
-			return err
-		}
-		if err := f.Truncate(*op.Size); err != nil {
-			_ = f.Close()
-			return err
-		}
-		if err := f.Sync(); err != nil {
-			_ = f.Close()
-			return err
-		}
-		if err := f.Close(); err != nil {
-			return err
+		if err := s.vol.Truncate(ctx, vfs.InodeID(op.Inode), *op.Size); err != nil {
+			return errno(err)
 		}
 	}
-	in, err := s.fs.Lookup(p)
+	in, err := s.vol.Stat(ctx, vfs.InodeID(op.Inode))
 	if err != nil {
-		return err
+		return errno(err)
 	}
-	op.Attributes = s.inodeAttrs(in)
+	op.Attributes = attrs(in)
 	op.AttributesExpiration = time.Now().Add(time.Second)
 	return nil
 }
 
-func (s *server) MkDir(_ context.Context, op *fuseops.MkDirOp) error {
-	parentPath, err := s.pathOfInode(op.Parent)
+func (s *server) MkDir(ctx context.Context, op *fuseops.MkDirOp) error {
+	in, err := s.vol.Mkdir(ctx, vfs.InodeID(op.Parent), op.Name, op.Mode.Perm())
 	if err != nil {
-		return err
+		return errno(err)
 	}
-	in, err := s.fs.Mkdir(joinPath(parentPath, op.Name), uint32(op.Mode.Perm()))
-	if err != nil {
-		return err
-	}
-	op.Entry = fuseops.ChildInodeEntry{
-		Child:                fuseops.InodeID(in.ID),
-		Attributes:           s.inodeAttrs(in),
-		AttributesExpiration: time.Now().Add(time.Second),
-		EntryExpiration:      time.Now().Add(time.Second),
-	}
+	op.Entry = entry(in)
 	return nil
 }
 
 func (s *server) CreateFile(ctx context.Context, op *fuseops.CreateFileOp) error {
-	parentPath, err := s.pathOfInode(op.Parent)
+	in, err := s.vol.Create(ctx, vfs.InodeID(op.Parent), op.Name, op.Mode.Perm())
 	if err != nil {
-		return err
+		return errno(err)
 	}
-	child := joinPath(parentPath, op.Name)
-	in, err := s.fs.Create(child, uint32(op.Mode.Perm()))
+	f, err := s.vol.Open(ctx, in.ID)
 	if err != nil {
-		return err
+		return errno(err)
 	}
-	f, err := s.fs.Open(s.ctx, child)
-	if err != nil {
-		return err
-	}
-	op.Entry = fuseops.ChildInodeEntry{
-		Child:                fuseops.InodeID(in.ID),
-		Attributes:           s.inodeAttrs(in),
-		AttributesExpiration: time.Now().Add(time.Second),
-		EntryExpiration:      time.Now().Add(time.Second),
-	}
-	op.Handle = s.allocHandle(f)
+	op.Entry = entry(in)
+	op.Handle = s.add(f)
 	return nil
 }
 
-func (s *server) Unlink(_ context.Context, op *fuseops.UnlinkOp) error {
-	parentPath, err := s.pathOfInode(op.Parent)
-	if err != nil {
-		return err
-	}
-	return s.fs.Remove(joinPath(parentPath, op.Name))
+func (s *server) Unlink(ctx context.Context, op *fuseops.UnlinkOp) error {
+	return errno(s.vol.Remove(ctx, vfs.InodeID(op.Parent), op.Name))
 }
 
-func (s *server) RmDir(_ context.Context, op *fuseops.RmDirOp) error {
-	parentPath, err := s.pathOfInode(op.Parent)
-	if err != nil {
-		return err
-	}
-	return s.fs.Remove(joinPath(parentPath, op.Name))
+func (s *server) RmDir(ctx context.Context, op *fuseops.RmDirOp) error {
+	return errno(s.vol.Remove(ctx, vfs.InodeID(op.Parent), op.Name))
 }
 
-// ─── directory ops ──────────────────────────────────────────────────────────
+// ─── directories ────────────────────────────────────────────────────────────
 
 func (s *server) OpenDir(_ context.Context, op *fuseops.OpenDirOp) error {
-	op.Handle = s.allocHandle(nil) // dirs use handle ID but no *vfs.File
+	op.Handle = s.add(nil) // a directory needs a handle id, not a file
 	return nil
 }
 
-func (s *server) ReadDir(_ context.Context, op *fuseops.ReadDirOp) error {
-	p, err := s.pathOfInode(op.Inode)
+func (s *server) ReadDir(ctx context.Context, op *fuseops.ReadDirOp) error {
+	ents, err := s.vol.ReadDir(ctx, vfs.InodeID(op.Inode))
 	if err != nil {
-		return err
+		return errno(err)
 	}
-	children, err := s.fs.ReadDir(p)
-	if err != nil {
-		return err
-	}
-	off := int(op.Offset)
-	for i, c := range children {
-		if i < off {
+	for i, e := range ents {
+		if i < int(op.Offset) {
 			continue
 		}
 		typ := fuseutil.DT_File
-		if c.IsDir() {
+		if e.Mode.IsDir() {
 			typ = fuseutil.DT_Directory
 		}
-		entry := fuseutil.Dirent{
-			Offset: fuseops.DirOffset(i + 1),
-			Inode:  fuseops.InodeID(c.ID),
-			Name:   c.Name,
-			Type:   typ,
-		}
-		n := fuseutil.WriteDirent(op.Dst[op.BytesRead:], entry)
+		n := fuseutil.WriteDirent(op.Dst[op.BytesRead:], fuseutil.Dirent{
+			Offset: fuseops.DirOffset(i + 1), Inode: fuseops.InodeID(e.ID), Name: e.Name, Type: typ,
+		})
 		if n == 0 {
 			break
 		}
@@ -285,96 +185,89 @@ func (s *server) ReadDir(_ context.Context, op *fuseops.ReadDirOp) error {
 }
 
 func (s *server) ReleaseDirHandle(_ context.Context, op *fuseops.ReleaseDirHandleOp) error {
-	delete(s.handles, op.Handle)
+	s.drop(op.Handle)
 	return nil
 }
 
-// ─── file ops ───────────────────────────────────────────────────────────────
+// ─── files ──────────────────────────────────────────────────────────────────
 
-func (s *server) OpenFile(_ context.Context, op *fuseops.OpenFileOp) error {
-	p, err := s.pathOfInode(op.Inode)
+func (s *server) OpenFile(ctx context.Context, op *fuseops.OpenFileOp) error {
+	f, err := s.vol.Open(ctx, vfs.InodeID(op.Inode))
 	if err != nil {
-		return err
+		return errno(err)
 	}
-	f, err := s.fs.Open(s.ctx, p)
-	if err != nil {
-		return err
-	}
-	op.Handle = s.allocHandle(f)
+	op.Handle = s.add(f)
 	op.KeepPageCache = false
 	return nil
 }
 
-func (s *server) ReadFile(_ context.Context, op *fuseops.ReadFileOp) error {
-	f := s.handles[op.Handle]
+func (s *server) ReadFile(ctx context.Context, op *fuseops.ReadFileOp) error {
+	f := s.file(op.Handle)
 	if f == nil {
 		return syscall.EBADF
 	}
-	n, err := f.ReadAt(op.Dst, op.Offset)
+	n, err := f.ReadAt(ctx, op.Dst, op.Offset)
 	op.BytesRead = n
 	if err != nil && !errors.Is(err, io.EOF) {
-		return err
+		return errno(err)
 	}
 	return nil
 }
 
-func (s *server) WriteFile(_ context.Context, op *fuseops.WriteFileOp) error {
-	f := s.handles[op.Handle]
+func (s *server) WriteFile(ctx context.Context, op *fuseops.WriteFileOp) error {
+	f := s.file(op.Handle)
 	if f == nil {
 		return syscall.EBADF
 	}
-	_, err := f.WriteAt(op.Data, op.Offset)
-	return err
+	_, err := f.WriteAt(ctx, op.Data, op.Offset)
+	return errno(err)
 }
 
-func (s *server) SyncFile(_ context.Context, op *fuseops.SyncFileOp) error {
-	f := s.handles[op.Handle]
-	if f == nil {
-		return nil
-	}
-	return f.Sync()
+func (s *server) SyncFile(ctx context.Context, _ *fuseops.SyncFileOp) error {
+	return errno(s.vol.Flush(ctx))
 }
 
-func (s *server) FlushFile(_ context.Context, op *fuseops.FlushFileOp) error {
-	f := s.handles[op.Handle]
-	if f == nil {
-		return nil
-	}
-	return f.Sync()
+func (s *server) FlushFile(ctx context.Context, _ *fuseops.FlushFileOp) error {
+	return errno(s.vol.Flush(ctx))
 }
 
 func (s *server) ReleaseFileHandle(_ context.Context, op *fuseops.ReleaseFileHandleOp) error {
-	if f, ok := s.handles[op.Handle]; ok && f != nil {
+	if f := s.file(op.Handle); f != nil {
 		_ = f.Close()
 	}
-	delete(s.handles, op.Handle)
+	s.drop(op.Handle)
 	return nil
 }
 
 func (s *server) StatFS(_ context.Context, op *fuseops.StatFSOp) error {
-	op.BlockSize = vfs.BlockSize
-	// Pretend to have ~1 PiB available. Backend is "unlimited".
+	op.BlockSize = blockSize
+	// The store has no capacity to run out of: report about a pebibyte free.
 	op.Blocks = 1 << 38
 	op.BlocksFree = 1 << 38
 	op.BlocksAvailable = 1 << 38
-	op.IoSize = vfs.BlockSize
+	op.IoSize = blockSize
 	return nil
 }
 
 // ─── handle table ───────────────────────────────────────────────────────────
 
-func (s *server) allocHandle(f *vfs.File) fuseops.HandleID {
-	id := s.nextHandle
-	s.nextHandle++
+func (s *server) add(f *vfs.File) fuseops.HandleID {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id := s.next
+	s.next++
 	s.handles[id] = f
 	return id
 }
 
-// joinPath is shared with fuse_unix.go via the package; declared here
-// for the build-tag-isolated darwin file.
-func joinPath(parent, name string) string {
-	if parent == "/" {
-		return "/" + name
-	}
-	return parent + "/" + name
+func (s *server) file(id fuseops.HandleID) *vfs.File {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.handles[id]
+}
+
+func (s *server) drop(id fuseops.HandleID) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.handles, id)
 }

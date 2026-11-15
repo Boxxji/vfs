@@ -1,10 +1,16 @@
 # Go virtual filesystem with SQLite replication. Library + cmd/.
 # Gate: the module compiles and the unit suite runs under the race detector —
 # this package is concurrent by construction, so -race is the assertion that
-# matters. The image is built by the release lane, not on every push.
+# matters. The scale tests (100,000 files, the 150 GiB object budget, sync cost
+# against tree size) run in their own step without -race, which would only slow
+# the cryptography; the image is built by the release lane, not on every push.
 test:
   - name: test
     run: |
       set -euo pipefail
       go build ./...
-      go test -race ./...
+      go test -race -short ./...
+  - name: scale
+    run: |
+      set -euo pipefail
+      go test -count=1 -run 'TestHundredThousandFiles|TestSyncCostDoesNotGrowWithTheTree|TestObjectBudget150GiB' .

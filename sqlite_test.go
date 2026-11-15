@@ -1,201 +1,88 @@
 package vfs_test
 
-// SQLite roundtrip — proves a real SQLite database file written through
-// VFS (open → INSERT → close) is byte-identical to one usable by SQLite
-// after restore from VFS bytes. The path is:
-//
-//   1. Build a SQLite DB on a normal file (the "reference path") —
-//      sqlite3 driver opens, runs CREATE/INSERT, closes.
-//   2. Read the DB bytes off disk, write them to a vfs.File at offset 0,
-//      Sync.
-//   3. Open the VFS, ReadAt the entire file back into an in-memory
-//      buffer.
-//   4. Hand the buffer to SQLite via the deserialize() API and run
-//      SELECT — values must match.
-//
-// What this proves:
-//   - byte-for-byte fidelity through encrypt → backend → decrypt across
-//     hundreds of 4 KiB pages
-//   - block-aligned writes + reads at non-zero offsets
-//   - file size tracking matches exact byte count, not block-rounded
-//   - the file produced by VFS is usable as a SQLite database
-//
-// What FUSE would add (post-0.2.0):
-//   - SQLite opens the file directly via the kernel VFS (no copy step)
-//   - fcntl locking semantics
-//   - mmap (optional in SQLite)
-
 import (
-	"context"
 	"database/sql"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	_ "github.com/hanzoai/sqlite"
-	"github.com/luxfi/age"
 
 	"github.com/hanzoai/vfs"
-	"github.com/hanzoai/vfs/pkg/backend"
-	_ "github.com/hanzoai/vfs/pkg/backend/file"
 )
 
+// TestSQLiteRoundTrip writes a real SQLite database through a Volume the way
+// SQLite does, in page-sized writes at page offsets and out of order, commits,
+// reads it back from a fresh read-only Open, and checks SQLite itself accepts the
+// result: the same row count and a clean integrity_check.
 func TestSQLiteRoundTrip(t *testing.T) {
 	tmp := t.TempDir()
 	refPath := filepath.Join(tmp, "ref.db")
 
-	// 1. Build a reference SQLite DB on a normal file.
-	{
-		db, err := sql.Open("sqlite", refPath)
-		if err != nil {
-			t.Fatalf("sql.Open ref: %v", err)
-		}
-		if _, err := db.Exec(`CREATE TABLE coins (sym TEXT PRIMARY KEY, name TEXT, decimals INT)`); err != nil {
-			t.Fatalf("CREATE: %v", err)
-		}
-		stmt, err := db.Prepare(`INSERT INTO coins (sym, name, decimals) VALUES (?, ?, ?)`)
-		if err != nil {
-			t.Fatalf("Prepare: %v", err)
-		}
-		rows := []struct {
-			sym, name string
-			dec       int
-		}{
-			{"USDC", "USD Coin", 6},
-			{"USDT", "Tether", 6},
-			{"BTC", "Bitcoin", 8},
-			{"ETH", "Ethereum", 18},
-		}
-		for i := range 200 {
-			r := rows[i%len(rows)]
-			if _, err := stmt.Exec(fmt.Sprintf("%s_%d", r.sym, i), r.name, r.dec); err != nil {
-				t.Fatalf("INSERT: %v", err)
-			}
-		}
-		_ = stmt.Close()
-		if err := db.Close(); err != nil {
-			t.Fatalf("Close ref: %v", err)
-		}
-	}
-	refBytes, err := os.ReadFile(refPath)
+	db, err := sql.Open("sqlite", refPath)
 	if err != nil {
-		t.Fatalf("read ref: %v", err)
+		t.Fatal(err)
 	}
-	if len(refBytes) < vfs.BlockSize {
-		t.Fatalf("ref DB too small: %d bytes", len(refBytes))
+	if _, err := db.Exec(`CREATE TABLE coins (sym TEXT PRIMARY KEY, name TEXT, decimals INT)`); err != nil {
+		t.Fatal(err)
 	}
-	t.Logf("reference DB is %d bytes (%d blocks)", len(refBytes), (len(refBytes)+vfs.BlockSize-1)/vfs.BlockSize)
-
-	// 2. Write those bytes through VFS.
-	fs := newFS(t)
-	if _, err := fs.Create("/test.db", 0o644); err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-	f, err := fs.Open(context.Background(), "/test.db")
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	if _, err := f.WriteAt(refBytes, 0); err != nil {
-		t.Fatalf("WriteAt: %v", err)
-	}
-	if err := f.Sync(); err != nil {
-		t.Fatalf("Sync: %v", err)
-	}
-
-	stat, _ := f.Stat()
-	if stat.Size != uint64(len(refBytes)) {
-		t.Fatalf("size mismatch: vfs=%d ref=%d", stat.Size, len(refBytes))
-	}
-	if err := f.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-
-	// 3. Read them back from VFS.
-	f2, err := fs.Open(context.Background(), "/test.db")
-	if err != nil {
-		t.Fatalf("re-Open: %v", err)
-	}
-	buf := make([]byte, len(refBytes))
-	n, err := f2.ReadAt(buf, 0)
-	if err != nil && err != io.EOF {
-		t.Fatalf("ReadAt: %v", err)
-	}
-	if n != len(refBytes) {
-		t.Fatalf("ReadAt n=%d want %d", n, len(refBytes))
-	}
-	_ = f2.Close()
-
-	if string(buf) != string(refBytes) {
-		// Find first divergence to localise the bug
-		for i := range refBytes {
-			if buf[i] != refBytes[i] {
-				start := max(i-16, 0)
-				end := min(i+16, len(refBytes))
-				t.Fatalf("byte mismatch at offset %d (block %d, off %d): vfs=% x ref=% x",
-					i, i/vfs.BlockSize, i%vfs.BlockSize, buf[start:end], refBytes[start:end])
-			}
+	for i := range 20000 {
+		if _, err := db.Exec(`INSERT INTO coins VALUES (?, ?, ?)`, fmt.Sprintf("SYM_%d", i), strings.Repeat("name ", 1+i%9), i%19); err != nil {
+			t.Fatal(err)
 		}
-		t.Fatal("buffers differ but identical scan — this should not happen")
 	}
-
-	// 4. Hand the bytes to SQLite via a fresh on-disk file and verify
-	// the database is fully usable: SELECT count, integrity_check.
-	rebuiltPath := filepath.Join(tmp, "rebuilt.db")
-	if err := os.WriteFile(rebuiltPath, buf, 0o644); err != nil {
-		t.Fatalf("WriteFile rebuilt: %v", err)
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
 	}
-	db, err := sql.Open("sqlite", rebuiltPath)
+	ref, err := os.ReadFile(refPath)
 	if err != nil {
-		t.Fatalf("sql.Open rebuilt: %v", err)
+		t.Fatal(err)
+	}
+	const page = 4096
+	if len(ref) < 100*page {
+		t.Fatalf("reference database is only %d bytes", len(ref))
+	}
+	t.Logf("reference database: %d bytes, %d pages", len(ref), len(ref)/page)
+
+	be, c, v := newMem(t)
+	in, err := v.Create(ctx, vfs.RootInode, "test.db", 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := v.Open(ctx, in.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	pages := len(ref) / page
+	for i := range pages { // backwards, as a b-tree's writes land
+		p := pages - 1 - i
+		if _, err := f.WriteAt(ctx, ref[p*page:(p+1)*page], int64(p*page)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	flush(t, v)
+
+	got := readAll(t, reopen(t, be, c), in.ID)
+	mustEqual(t, "database bytes", got, ref)
+
+	rebuilt := filepath.Join(tmp, "rebuilt.db")
+	if err := os.WriteFile(rebuilt, got, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	db, err = sql.Open("sqlite", rebuilt)
+	if err != nil {
+		t.Fatal(err)
 	}
 	defer db.Close()
-
 	var count int
-	if err := db.QueryRow(`SELECT count(*) FROM coins`).Scan(&count); err != nil {
-		t.Fatalf("SELECT count: %v", err)
+	if err := db.QueryRow(`SELECT count(*) FROM coins`).Scan(&count); err != nil || count != 20000 {
+		t.Fatalf("count = %d, %v; want 20000", count, err)
 	}
-	if count != 200 {
-		t.Fatalf("count=%d want 200", count)
-	}
-
-	// SQLite's own DB-integrity check
 	var ok string
-	if err := db.QueryRow(`PRAGMA integrity_check`).Scan(&ok); err != nil {
-		t.Fatalf("integrity_check: %v", err)
+	if err := db.QueryRow(`PRAGMA integrity_check`).Scan(&ok); err != nil || !strings.EqualFold(ok, "ok") {
+		t.Fatalf("integrity_check = %q, %v", ok, err)
 	}
-	if !strings.EqualFold(ok, "ok") {
-		t.Fatalf("integrity_check = %q want ok", ok)
-	}
-	t.Logf("SQLite integrity_check: %s (200 rows verified)", ok)
-}
-
-func newFSScoped(t *testing.T) *vfs.FS {
-	t.Helper()
-	dir := t.TempDir()
-	be, err := backend.Open(context.Background(), "file://"+dir)
-	if err != nil {
-		t.Fatalf("backend.Open: %v", err)
-	}
-	t.Cleanup(func() { _ = be.Close() })
-
-	id, err := age.GenerateX25519Identity()
-	if err != nil {
-		t.Fatalf("age: %v", err)
-	}
-	c, err := vfs.NewCrypto([]age.Recipient{id.Recipient()}, []age.Identity{id})
-	if err != nil {
-		t.Fatalf("NewCrypto: %v", err)
-	}
-	v, err := vfs.New(vfs.Config{Backend: be, Crypto: c})
-	if err != nil {
-		t.Fatalf("vfs.New: %v", err)
-	}
-	fs, err := vfs.NewFS(context.Background(), v)
-	if err != nil {
-		t.Fatalf("NewFS: %v", err)
-	}
-	return fs
 }

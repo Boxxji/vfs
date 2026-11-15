@@ -1,481 +1,117 @@
-# Production readiness for VFS-backed stateful workloads
-
-Status: **production-grade for finalized-block streaming; not for hot
-zapdb WAL writes** — see "Verdict" below.
-
-This doc answers the seven concerns that gate using VFS as the durable
-backing store for stateful services like `luxd` (Lux primary network
-node, zapdb storage), liquid-EVM chain pods, indexer DBs, etc. The
-first four ("code-level concerns") have automated tests in
-[`production_test.go`](../production_test.go); the last three
-("operational concerns") are runbooks against a real cluster.
-
-| # | Concern                                  | Status      | Evidence                                                                |
-|---|------------------------------------------|-------------|-------------------------------------------------------------------------|
-| 1 | crash / restart recovery                 | **PASS**    | `TestCrashRecovery_Synced_Persists`, `TestCrashRecovery_UnsyncedWriteIsLost_NotCorrupted` |
-| 4 | compaction behavior under load           | **PASS**    | `TestCompaction_SustainedWrite` — finalized writes are non-fsync stream |
-| 5 | backend outage behavior                  | **PASS**    | `TestBackendOutage_PutErrorBubblesUp`, `TestBackendOutage_GetErrorBubblesUp` |
-| 6 | KMS / age key rotation                   | **PASS**    | `TestKeyRotation_MultiRecipientAllowsRollingRotation`                   |
-| 2 | empty-cache bootstrap timing             | runbook §A  | execute against staging                                                 |
-| 3 | warm-cache bootstrap timing              | runbook §B  | execute against staging                                                 |
-| 7 | rollback path to PVC-local state         | runbook §C  | doc'd procedure                                                         |
-
-## Verdict
-
-For blockchain state the right model is **hot-tier on local disk,
-finalized-tier on VFS**. Blocks past finality are immutable forever —
-they only need to be written ONCE and only ever read. This is
-content-addressed VFS's ideal workload:
-
-- One-shot streaming write per finalized SST → never mutated
-- No `fsync` round-trip per write (batched commit at finality)
-- Content-hash dedup across all replicas (the same canonical block
-  written by N validators = one VFS object on the backend)
-- Local disk only holds the unfinalized hot tier (WAL + memtable + last
-  K SSTs that may still merge before finality)
-
-This pattern means the §4 benchmark (6.4 fsync'd ops/s) is **not on the
-critical path** for chain state — it would only matter if we tried to
-serve `zapdb` WAL writes through VFS, which we don't. zapdb keeps its
-WAL on local SSD and streams finalized SSTs into VFS in batches.
-
-✅ Production-grade now for:
-
-- Finalized chain blocks (luxd archive tier — write once, immutable)
-- zapdb SST files past finality (stream + delete local copy)
-- Snapshots / pruned-state archives
-- Off-cluster backups of structured state
-- Analytics SQLite that batch-writes on schedule (e.g. indexer DBs)
-- Config + secret storage where audit trail + PQ encryption matter
-
-❌ Not the right tool for:
-
-- zapdb WAL on the hot path (use local SSD)
-- zapdb memtable spill on the hot path (use local SSD)
-- Anything that needs >10 sustained fsync'd ops/s in the steady state
-
-The mitigation roadmap below (Sync coalescer, async upload pipeline,
-sharded metadata) only matters for cases outside the immutable
-finalized-block use case.
-
-## The hot/cold split for zapdb
-
-zapdb is luxd's LSM-tree storage engine (analogous to Pebble/Rocks, but the
-Lux fork). Its on-disk layout splits naturally along the finality line:
-
-```
-Local PVC (SSD, bounded, ~50 GB)
-  ├─ wal/                   ← hot writes, fsync per commit
-  ├─ memtable               ← in-RAM, persisted via WAL
-  ├─ recent SST/            ← last K compactions; SSTs may still merge
-  │                           with newer data until they are >F blocks
-  │                           below current chain head ("finality depth")
-  └─ manifest               ← metadata index pointing at both tiers
-
-VFS → S3 (object store, unbounded)
-  ├─ finalized SST/<hash>   ← every SST that crossed finality depth
-  │                           gets streamed up, ONCE, then deleted from
-  │                           the local PVC; the manifest now points
-  │                           at the VFS-side block ID
-  ├─ snapshots/             ← periodic checkpoint exports
-  └─ pruned-state-trie/     ← evicted Merkle trie nodes (history mode)
-```
-
-The lifecycle of a finalized SST:
-
-1. zapdb compaction emits a new SST file at level L on local SSD.
-2. The SST sits in `recent SST/` until its highest block height is
-   `> chain_head - F` blocks (F = network finality depth; in Quasar/PQ
-   strict mode this is ~30 blocks).
-3. Background "vfs-promoter" goroutine in zapdb streams the SST through
-   VFS:
-   - Read SST file → `vfs.PutBlock(chunk)` for each 4 KiB block
-   - Receive back content-addressed `BlockID`s
-   - Write a small metadata file recording the SST → [BlockID...] map
-   - The metadata file lives on local PVC (small, ~1 KB per SST)
-   - Delete the local SST file
-4. Next read of that SST height range: zapdb sees the SST is "VFS-only",
-   fetches the metadata, reads the BlockIDs via `vfs.GetBlock`, caches
-   the hot blocks in vfsd's LRU.
-
-Key properties:
-
-- Local PVC stays bounded at `WAL + memtable + recent_window`. For a
-  Lux mainnet validator that's ~50 GB regardless of how long the chain
-  has been running.
-- The S3 archive grows monotonically but ~$23/TB/month vs $0.10/GB/month
-  for DOKS PVC = 4× cheaper at scale.
-- Cross-validator dedup: the same canonical SST emitted by N validators
-  hashes to the same blocks → one S3 object backs N replicas.
-
-## §1 — Crash / restart recovery
-
-**Question:** if `vfsd` (or its host) crashes mid-write, is the FS view
-after restart consistent? Specifically:
-
-- writes Sync()-ed before the crash must be visible byte-for-byte after
-  the restart
-- writes not Sync()-ed before the crash must NOT resurface (no
-  "phantom" data, no torn blocks)
-
-**Verified by:**
-
-```
-go test -run TestCrashRecovery -v
-```
-
-The two test cases pin both halves of the durability contract. Both
-PASS on file backend; S3 inherits the same guarantee because the
-metadata blob is replaced atomically (S3 PUT is atomic at the object
-level).
-
-**Caveats:**
-
-- The metadata blob is a single object (`metadata/root.zap.age`) holding
-  the entire inode tree. At >100K files this becomes too large to load
-  on every reopen; sharded metadata (`metadata/<inode_id>.zap.age`) is
-  on the roadmap. For the finalized-SST use case (~1 file per SST, with
-  zapdb compaction emitting on the order of 1000s of SSTs per year of
-  mainnet activity) we are within the headroom.
-- `Sync` is the durability boundary. POSIX consumers MUST call `fsync(2)`
-  on every write they want durable across crash. The zapdb VFS-promoter
-  fsyncs once at the end of each SST upload (after all its blocks are
-  in), not once per block — matching the immutable-finalized model.
-
-## §4 — Compaction behavior under load
-
-**Question:** can VFS keep up with sustained write pressure from a
-zapdb-style LSM-tree workload?
-
-**Answer for the hot-path workload (zapdb WAL + memtable spill):**
-No, VFS is not the right place. Use local SSD. See §4 details below
-for the measured numbers.
-
-**Answer for the finalized-SST workload:**
-Yes, by a large margin. Finalized SSTs are streamed sequentially
-(no random writes), batched at the end (one fsync per SST), and never
-mutated again. The throughput bound is just network bandwidth to S3,
-which on a single DOKS node is ~1 GB/s — well above the SST emission
-rate (~10s of MB/s under sustained chain load).
-
-**Measured by:**
-
-```
-VFS_PROD_TEST=1 VFS_PROD_TEST_DURATION=20s go test -run TestCompaction_SustainedWrite -v
-```
-
-The benchmark writes 64 KiB chunks to a 16-file rotation with `Sync`
-after every write — this models the worst case (heavy fsync from a
-naive consumer), not the finalized-SST stream pattern.
-
-**Observed (Apple M-series, file backend, 2026-06-03):**
-
-| Metric | Value           |
-|--------|-----------------|
-| ops    | 128 in 20s      |
-| mean   | 157 ms / op     |
-| p100   | 321 ms / op     |
-| thru   | 6.4 ops/s       |
-
-**Interpretation:**
-
-This is the "worst case" measurement — fsync-per-write through the
-metadata-blob rewrite path. The finalized-SST stream pattern looks
-nothing like this:
-
-- One Sync per SST file at the end of upload (not per 64 KiB chunk)
-- Block uploads can be parallelized (currently serialized inside
-  `File.Sync`, but trivial to parallelize)
-- The metadata blob is rewritten ONCE per SST, not per chunk
-
-A representative measurement of the finalized-SST pattern (one Sync
-per 100 MB SST file) would be: `100 MB / 5 MB/s upload = 20s wall
-time, dominated by S3 PUT throughput`. That's well within the budget
-since SSTs are emitted at ~10 per minute under heavy load.
-
-**Mitigations on the roadmap (only relevant if you push fsync-heavy
-workloads through VFS):**
-
-1. **Sync coalescing.** Debounce metadata writes: flush at most once per
-   200ms even if multiple `File.Sync` calls land in between. Reduces
-   the metadata-blob churn by ~10×.
-2. **Async upload pipeline.** Pipeline block uploads in N parallel
-   workers; Sync returns once blocks are queued + the metadata stub is
-   written to a local WAL on the same backend. Recovery replays the
-   WAL.
-3. **Sharded metadata.** Per-inode metadata blobs (one age-encrypted
-   object per file) eliminate the whole-tree rewrite on every Sync.
-4. **Local cache spill-to-disk.** Hot blocks stay on local ephemeral
-   SSD as well as object store; reads can be served from disk without
-   round-tripping S3.
-
-For zapdb-finalized-SST streaming, none of these are required.
-
-## §1 — Crash / restart recovery
-
-**Question:** if `vfsd` (or its host) crashes mid-write, is the FS view
-after restart consistent? Specifically:
-
-- writes Sync()-ed before the crash must be visible byte-for-byte after
-  the restart
-- writes not Sync()-ed before the crash must NOT resurface (no
-  "phantom" data, no torn blocks)
-
-**Verified by:**
-
-```
-go test -run TestCrashRecovery -v
-```
-
-The two test cases pin both halves of the durability contract. Both
-PASS on file backend; S3 inherits the same guarantee because the
-metadata blob is replaced atomically (S3 PUT is atomic at the object
-level).
-
-**Caveats:**
-
-- The metadata blob is a single object (`metadata/root.zap.age`) holding
-  the entire inode tree. At >100K files this becomes too large to load
-  on every reopen; sharded metadata (`metadata/<inode_id>.zap.age`) is
-  on the roadmap. For luxd zapdb (~10-100 files in a typical RocksDB
-  layout) we are well below this limit.
-- `Sync` is the durability boundary. POSIX consumers MUST call `fsync(2)`
-  on every write they want durable across crash — exactly what zapdb
-  / SQLite already do.
-
-## §4 — Compaction behavior under load
-
-**Question:** can VFS keep up with sustained write pressure from a
-zapdb-style LSM-tree workload (many small files, frequent fsync,
-occasional bulk rewrite during compaction)?
-
-**Measured by:**
-
-```
-VFS_PROD_TEST=1 VFS_PROD_TEST_DURATION=20s go test -run TestCompaction_SustainedWrite -v
-```
-
-The benchmark writes 64 KiB chunks to a 16-file rotation with `Sync`
-after every write — a coarse approximation of LSM compaction's IO
-pattern. The test runs locally against the `file://` backend (no
-network); S3/GCS results will be slower.
-
-**Observed (Apple M-series, file backend, 2026-06-03):**
-
-| Metric | Value           |
-|--------|-----------------|
-| ops    | 128 in 20s      |
-| mean   | 157 ms / op     |
-| p100   | 321 ms / op     |
-| thru   | 6.4 ops/s       |
-
-**Interpretation:**
-
-Each Sync re-encrypts + re-uploads every dirty block AND rewrites the
-entire metadata blob (whole inode tree as one age-encrypted object).
-This makes Sync linear in the number of dirty blocks + the metadata
-size. For an LSM workload with thousands of fsync'd writes per second
-on local SSD, VFS is ~150× too slow to be the hot-tier store.
-
-**Mitigations on the roadmap (none of which are required for the
-cold/archive use case):**
-
-1. **Sync coalescing.** Debounce metadata writes: flush at most once per
-   200ms even if multiple `File.Sync` calls land in between. Reduces
-   the metadata-blob churn by ~10×.
-2. **Async upload pipeline.** Pipeline block uploads in N parallel
-   workers; Sync returns once blocks are queued + the metadata stub is
-   written to a local WAL on the same backend. Recovery replays the
-   WAL.
-3. **Sharded metadata.** Per-inode metadata blobs (one age-encrypted
-   object per file) eliminate the whole-tree rewrite on every Sync.
-4. **Local cache spill-to-disk.** Hot blocks stay on local ephemeral
-   SSD as well as object store; reads can be served from disk without
-   round-tripping S3.
-
-Until at least (1)+(2) land, do not target hot luxd state.
-
-## §5 — Backend outage behavior
-
-**Question:** when the backend (S3 / GCS / DO Spaces) is unreachable,
-does VFS hang, retry forever, lose data silently, or surface the error
-to the caller?
-
-**Verified by:**
-
-```
-go test -run TestBackendOutage -v
-```
-
-Two tests inject backend errors and confirm:
-
-- `TestBackendOutage_PutErrorBubblesUp`: a backend Put failure surfaces
-  as a `Sync` error. The POSIX consumer sees fsync return non-nil and
-  can treat the write as failed.
-- `TestBackendOutage_GetErrorBubblesUp`: a backend Get failure surfaces
-  as a ReadAt error. The consumer never sees zero bytes silently.
-
-Both PASS.
-
-**Operational implication:** when S3 is partitioned, luxd's zapdb
-will get `fsync: EIO` and crash-loop. That's the correct behavior —
-better to fail hard than to acknowledge a write that's lost.
-
-**What does NOT exist yet:**
-
-- Per-request retry with exponential backoff in the backend. The
-  current behavior is fail-fast on first error. Adding bounded retries
-  (e.g. 3 tries with 1s/2s/4s backoff) would let the FS ride out
-  transient 5xx responses without bubbling.
-- A circuit breaker / health endpoint that goes "degraded" before going
-  "failed", letting orchestration page on warning rather than on
-  crash-loop.
-
-## §6 — KMS / age key rotation
-
-**Question:** can we rotate the age key without rewriting every
-encrypted block in the store?
-
-**Verified by:**
-
-```
-go test -run TestKeyRotation -v
-```
-
-The test walks through the rolling rotation procedure:
-
-1. Write blocks under `Crypto{recipients: [old], identities: [old]}`.
-2. Enter rotation window: switch to
-   `Crypto{recipients: [old, new], identities: [old, new]}`. New writes
-   include stanzas for both recipients; reads work via either identity.
-3. Exit rotation window: switch to
-   `Crypto{recipients: [new], identities: [new]}`. Blocks written
-   during the rotation window remain readable (newID is in the
-   envelope); blocks written before the rotation are NO LONGER readable
-   under just `[new]`.
-
-This pins the contract that rotation is **real** (dropping the old key
-loses access to pre-rotation blocks) **and** non-destructive (no bulk
-re-encrypt required).
-
-**Operational procedure:**
-
-1. Generate a new age identity (`luxfi/age` CLI or
-   `age.GenerateX25519Identity()`). Store the private key in Hanzo KMS
-   at `secret/vfs/<service>/<env>/keys/<key-id>`.
-2. Update the `vfsd` config to list BOTH the old and the new key.
-   Restart vfsd (rolling). Length of rotation window = how long you
-   need old blocks readable; typically 30-90 days.
-3. (Optional) Run the migration tool (TBD — not yet written) to
-   re-encrypt pre-rotation blocks under the new key. Necessary only if
-   you want to drop the old key from KMS before the rotation window
-   ends.
-4. After the window: update vfsd config to drop the old key. Restart.
-5. Delete the old key from KMS (or mark it `historical`).
-
-## §2 — Empty-cache bootstrap timing (runbook)
-
-**Procedure:**
-
-1. Provision a fresh luxd pod with vfsd sidecar. Mount VFS at
-   `/data/db-vfs`. No pre-populated cache.
-2. Configure backend = S3 bucket holding a previously-snapshotted luxd
-   state directory.
-3. Start luxd with `--data-dir=/data/db-vfs`.
-4. Measure wall-clock from luxd start to `info.isBootstrapped == true`
-   on the P-chain.
-
-**Expected:** because zapdb on cold-start reads thousands of SST
-files to rebuild the manifest, expect **hours** on an empty cache with
-S3 latencies (50-100ms × thousands of reads). Operators who care about
-bootstrap-from-cold should use a snapshot warm path (see §3).
-
-**Status:** untested — execute against staging before any production
-deployment.
-
-## §3 — Warm-cache bootstrap timing (runbook)
-
-**Procedure:**
-
-1. Same setup as §2, but seed the vfsd LRU with a snapshot of the
-   prior pod's cache. Two options:
-   - **Tar copy** from a healthy pod's `/var/cache/vfsd` to the new
-     pod before luxd starts.
-   - **Persistent cache PVC**: vfsd's LRU stored on a small
-     local-disk PVC (e.g. 64 GB SSD) so cache survives pod restart.
-2. Start luxd. Measure same metric as §2.
-
-**Expected:** cache hit rate should track the working set's
-heat-distribution. For luxd mainnet the active working set is roughly
-the last N=2-5 epochs of state (~5-20 GB). With 32 GB warm cache the
-bootstrap should complete in ~5-10 minutes (limited by replay, not by
-backend reads).
-
-**Status:** untested — same gate as §2.
-
-## §7 — Rollback path to PVC-local state
-
-If VFS proves unworkable (hot-path latency, backend SLA, anything),
-this is the documented rollback to plain PVC-local state. Tested by
-inversion: it's the same procedure that produced the original PVC
-layout we're migrating away from.
-
-### Pre-rollback checklist
-
-- Decide the cutoff height (e.g. "luxd block N at unix-time T").
-- Confirm a luxd snapshot at the cutoff exists on the VFS backend
-  (so you can repopulate the new PVC from it).
-
-### Procedure
-
-1. **Drain.** Stop luxd cleanly (`kubectl delete pod luxd-0 --grace=600`).
-2. **Snapshot via vfsd.** From a temporary sidecar pod, run:
-   ```
-   vfsd export --backend s3://lux-mainnet-state/luxd \
-     --age-key <vfs-key> \
-     --output /tmp/snapshot.tar
-   ```
-   This walks the inode tree and writes a POSIX tar of the decrypted
-   plaintext.
-3. **Provision a fresh PVC** of size = snapshot uncompressed +
-   headroom. e.g. `kubectl create -f pvc-luxd-fresh.yaml`.
-4. **Restore.** Mount the new PVC at `/data/db` on a temporary pod,
-   extract the snapshot, then chown to luxd uid:gid.
-5. **Switch the StatefulSet.** Update `luxd-startup` configmap:
-   - Remove `vfsd` sidecar.
-   - Repoint `--data-dir` from `/data/db-vfs` to `/data/db`.
-   - Remove the `emptyDir` volume that held the FUSE mount.
-6. **Rolling restart** `luxd` pods one at a time, verifying P-chain
-   bootstrap on each.
-7. **Decommission VFS.** Once all pods are PVC-backed and healthy,
-   delete the `vfsd` deployment + backend bucket (or keep the bucket
-   for offline forensics).
-
-### What does NOT exist yet
-
-- A `vfsd export` subcommand that walks the inode tree and emits a tar.
-  Today, an operator would need to FUSE-mount the VFS and `tar -c .`
-  from the mountpoint. Equivalent but less ergonomic.
-- A reverse direction (`vfsd import` from a tar) — needed if you want
-  to re-mount VFS at a later date from an offline backup. Not on the
-  critical path; you can always replay from chain.
+# Production readiness of a Volume (format 2)
+
+This replaces the notes written for format 1 (4 KiB blocks, one metadata blob),
+whose numbers no longer describe the code. Everything here was measured on the
+tests named; nothing is a claim without one.
+
+Machine: GB10 arm64, 20 cores, Go 1.27.1, shared with other jobs (load average
+14 to 20 during the runs, so throughput is a floor, not a peak). The file backend
+sat on tmpfs, so its own fsync costs nothing: the figures are the engine's (chunking,
+hashing, sealing, shard and Head writes), not a disk's.
+
+## What is guaranteed
+
+| Concern | Status | Evidence |
+|---|---|---|
+| Crash at any point leaves the last committed tree, whole | pass | `TestSigkill` kills a process with SIGKILL before the first pack write, before the first shard write, before the Head write and after it; `TestFailureAtEveryWrite` fails each of the 14 writes of a Flush in turn; `TestLostAcknowledgementOfHead` loses the reply of a Head that landed. In every case a fresh Open equals the last committed state exactly, and a retry commits the next |
+| A deposed writer cannot commit; takeover loses no acknowledged commit | pass | `TestFenceRefusesOlderRound`, `TestAttachNeedsAHigherRound`, `TestTakeoverLosesNoAcknowledgedCommit`, `TestRacingClaims`, on the in-memory store, the file backend, the S3 backend against an S3 protocol server, and a real Hanzo S3 server |
+| Exactly one of N writers on one Head version wins | pass | the conformance suite on every backend; against the real server `TestRealServerRaceStress` races 16 clients for 150 rounds on one version and for 100 keys on creation: exactly one winner every time |
+| Backend outage surfaces, loses nothing | pass | the same failure sweeps: an error from the store is an error from `Flush`, the changes stay in memory, the store is untouched |
+| Wrong key fails closed; tampered or swapped objects are refused | pass | `TestWrongKeyFailsClosed`, `TestTamperedObjectsAreRefused`, `TestSwappedChunkIsRefused`, `TestTreeDetectsSwappedShard` |
+| Key rotation | pass | `TestRotation`: a Cipher with the new key and the old one reads everything and seals under the new; once the old is dropped, what only it sealed no longer opens |
+| No key, plaintext or name on disk; the Cipher is the only door | pass | `TestNothingKeyShapedOnDisk`, `TestCipherIsTheOnlyDoor`, `TestCLIRoundTrip` (the key comes from standard input; an environment variable is ignored) |
+| SQLite on the Volume | pass | `TestSQLiteRoundTrip`; over FUSE `TestFUSESQLite` (100 rows survive release and remount, `integrity_check` ok) |
+| FUSE: Lookup, ReadDir, Mkdir, Create, Remove, Setattr size, Read, Write, Flush, Fsync, Release | pass | `TestFUSEPOSIX`: after `fsync(2)` a second read-only view of the store sees the file |
+
+The tests that need a kernel mount skip where there is no `/dev/fuse` or no
+`fusermount`; the real-server tests skip where no `s3` binary is on PATH. Both ran
+for these results.
+
+### Flush and Fsync
+
+`Flush` returns only after the Head naming everything written so far has advanced
+in the store. `Fsync` is `Flush`: there is no node-local journal yet, so no cheaper
+durable point exists. A FUSE mount calls it on every close and every fsync. Writes are held
+in memory until then, bounded by `Config.Dirty`; a bound on staleness is a deadline
+timer owned by the caller of the Volume.
+
+## Measurements
+
+| What | Result | Test |
+|---|---|---|
+| Sequential write, 128 MiB of distinct data, 1 MiB writes, file backend | 84 to 111 MB/s | `BenchmarkSequentialWrite` (3 runs of 5) |
+| Sequential read, same file, cold read-only Volume | 152 to 230 MB/s | `BenchmarkSequentialRead` |
+| Flush after a 4 KiB overwrite in a 16 MiB file | p50 5 ms, p90 12 ms, p98 54 ms, max 55 ms (100 rounds) | `TestFlushLatency` |
+| Format 1's workload: 64 KiB write then Flush, round-robin over 16 files, 10 s | 167 ops/s, mean 6 ms, p50 5 ms, p99 42 ms, max 58 ms. Format 1 recorded 6.4 ops/s, mean 157 ms, on a different machine and a disk, so read this as an order of magnitude, not a ratio | `TestSustainedWriteWithFsync` |
+| Objects written for 1,000 files of 200 bytes | 6 (5 shards, 1 Head) | `TestObjectsPerThousandSmallFiles` |
+| Objects written for 1,000 files of 2.5 KiB | 36 (their bytes live in the shards, about one shard per 64 KiB) | same |
+| Objects written for 1,000 files of 100 KiB | 14 (6 shards, 7 packs, 1 Head) | same |
+| 100,000 files: create, first Flush, cold stat of every file | 0.7 s, 1.3 s (197 shards, 1 Head), 2.1 µs per Lookup + Stat | `TestHundredThousandFiles` |
+| Ten changed files among 100,000 | a commit of 21 shards of 197, plus the Head | same |
+| The same ten changes at 40,000 and at 120,000 files | 19 and 21 shards: the cost does not grow with the tree | `TestSyncCostDoesNotGrowWithTheTree` |
+| 1,000,000 inodes: create and commit | 5 s; the store holds 1,030 objects, 62 MiB | `TestMillionInodes` |
+| Memory at 1,000,000 inodes | the Volume holds about 200 MiB after the commits (peak 267 MiB at one), bounded by `Config.Cache` (256 MiB, split between shards and chunks), not by the inode count; a cold reader holds 1.3 MiB after opening and listing three directories | same |
+| Ten changed files among 1,000,000 | a commit of 14 shards | same |
+| Chunker, random data | mean chunk 581 KiB (169 chunks in 96 MiB), minimum 64 KiB, maximum 4 MiB | `TestCutBounds` |
+| A 100 byte overwrite, insertion or deletion in the middle of 24 MiB (43 chunks) | 1 chunk changes | `TestCutStableUnderEdit` |
+| A 6 byte edit in a 16 MiB file | 235 KiB of new packs | `TestSmallEditRewritesOneChunk` |
+| Sealing overhead of the default Cipher | about 1,660 bytes + 16 per 64 KiB of chunk | `TestAgeFrameOverhead` |
+
+### The object budget: 100,000 files, 150 GiB
+
+`TestObjectBudget150GiB` builds every metadata record such a tree would have into a
+real tree on a counting store, and models the data from the measured chunk mean and
+sealing overhead (150 GiB is not written). Format 1 needed 39,321,600 objects.
+
+| Shape | Chunks | Metadata shards | Packs | Objects |
+|---|---|---|---|---|
+| mixed (70,000 files of 4 KiB, 25,000 of 100 KiB, 4,900 of 2 MiB, 100 huge) | 294,500 | 5,085 | 9,632 | 14,718 |
+| the worst shape: 99,000 files of exactly 16 KiB (all inline) and 1,000 huge | 270,000 | 25,543 | 9,629 | 35,173 |
+
+Both are under the ~40,000 budget. The second shows where the margin goes: inline
+bytes cost one shard per 64 KiB, so a tree dominated by files just under 16 KiB
+approaches it.
+
+## Mutation check
+
+47 deliberate breakages of the engine (a node cut by position instead of content,
+the chunk-reuse rules, the commit order, the fence comparison, a missing
+conditional header, an unchecked hash, a key id ignored, a Get that asks for the
+version before the body, and so on) were applied one at a
+time to a copy and the tests that should catch each were run: all 47 fail a test.
+Six first survived and each exposed a missing or weak test, since fixed:
+a shifted-boundary tree edit (the first test changed a value without changing a
+record count), a chunk list that differed from a cut of the whole file (now
+`TestChunkListIsTheWholeFileCut` compares it with the reference after every kind of
+edit), stale chunk references after a shrink, reads served from the open pack (the cache hid
+them), a lost-race retry in the fence that a scheduler decided (now forced, as is the
+same retry in a same-round write), and one clamp the callers make redundant (removed).
+
+## Not yet built
+
+Plain statements of fact, each its own change:
+
+* POSIX operations beyond the ones above: rename, symlink, hard link,
+  chmod/chown/utimens, statfs, xattr, locks, unlink-while-open (handles of a removed
+  file fail).
+* The node cache and journal: reads and writes go to the store; `Fsync` costs a commit;
+  uploads are sequential; there is no read-ahead.
+* `vfs serve` and the agent.
+* Garbage collection: chunks, packs and shards that a failed or superseded commit
+  left, and chunks of removed files, stay until a collector exists. Nor are
+  Snapshot, Clone, Usage, import or export built.
+* Retries with backoff, a circuit breaker, metrics, handling of a store's slow-down
+  responses: the first store error is returned to the caller.
+* Sparse files: extending a file with a truncate writes zero chunks (all alike, so
+  stored once).
+* Compression.
 
 ## Running the tests
 
 ```bash
-# Default — quick coverage (skips the long sustained-write benchmark)
-GOWORK=off go test ./...
-
-# Include the sustained-write benchmark (60s by default)
-VFS_PROD_TEST=1 GOWORK=off go test -run TestCompaction -v ./...
-
-# Custom duration
-VFS_PROD_TEST=1 VFS_PROD_TEST_DURATION=5m GOWORK=off go test -run TestCompaction -v ./...
-```
-
-For the FUSE end-to-end (TestFUSESQLite in `pkg/mount/`) you need
-Linux + kernel FUSE + privileges:
-
-```bash
-VFS_FUSE_E2E=1 GOWORK=off go test -tags fuse -run TestFUSESQLite -v ./pkg/mount/
+go test -short -race ./...             # what CI runs (a couple of minutes)
+go test ./...                          # adds the scale tests and the full failure sweep
+go test -tags fuse ./pkg/mount         # a kernel mount (Linux with /dev/fuse and fusermount)
+PATH=$DIR:$PATH go test ./...          # $DIR holds an `s3` built from github.com/hanzoai/s3: adds the real-server tests
+go test -run xxx -bench . .            # throughput
 ```

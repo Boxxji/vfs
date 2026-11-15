@@ -3,7 +3,7 @@
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 
-package replica
+package fence
 
 import (
 	"context"
@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"sync"
 	"testing"
+
+	"github.com/hanzoai/vfs/pkg/backend"
 )
 
 // fakeCAS is an in-process model of a keyed object store's atomic conditional
@@ -36,29 +38,36 @@ type fakeObj struct {
 
 func newFakeCAS() *fakeCAS { return &fakeCAS{objects: map[string]*fakeObj{}} }
 
-func (s *fakeCAS) Get(_ context.Context, key string) ([]byte, string, error) {
+func (s *fakeCAS) Get(_ context.Context, key string) ([]byte, backend.Version, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	obj, ok := s.objects[key]
 	if !ok {
-		return nil, "", ErrNotFound
+		return nil, "", backend.ErrNotFound
 	}
-	return append([]byte(nil), obj.data...), strconv.Itoa(obj.ver), nil
+	return append([]byte(nil), obj.data...), backend.Version(strconv.Itoa(obj.ver)), nil
 }
 
-func (s *fakeCAS) PutIfVersion(_ context.Context, key string, data []byte, expectVersion string) (string, error) {
+func (s *fakeCAS) PutIfAbsent(_ context.Context, key string, data []byte) (backend.Version, error) {
+	return s.cas(key, data, "", true)
+}
+
+func (s *fakeCAS) PutIfVersion(_ context.Context, key string, data []byte, v backend.Version) (backend.Version, error) {
+	return s.cas(key, data, v, false)
+}
+
+func (s *fakeCAS) cas(key string, data []byte, expect backend.Version, absent bool) (backend.Version, error) {
 	if s.beforeCAS != nil {
 		s.beforeCAS(key)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	obj, ok := s.objects[key]
-	cur := ""
-	if ok {
-		cur = strconv.Itoa(obj.ver)
-	}
-	if cur != expectVersion {
-		return "", fmt.Errorf("fakeCAS: %w: have %q want %q", ErrConflict, cur, expectVersion)
+	switch {
+	case absent && ok, !absent && !ok:
+		return "", fmt.Errorf("fakeCAS: %w", backend.ErrConflict)
+	case !absent && backend.Version(strconv.Itoa(obj.ver)) != expect:
+		return "", fmt.Errorf("fakeCAS: %w: have %d want %q", backend.ErrConflict, obj.ver, expect)
 	}
 	if !ok {
 		obj = &fakeObj{}
@@ -66,7 +75,7 @@ func (s *fakeCAS) PutIfVersion(_ context.Context, key string, data []byte, expec
 	}
 	obj.ver++
 	obj.data = append([]byte(nil), data...)
-	return strconv.Itoa(obj.ver), nil
+	return backend.Version(strconv.Itoa(obj.ver)), nil
 }
 
 // barrierAt2 blocks the first two callers until both arrive, then releases both
@@ -87,14 +96,14 @@ func barrierAt2() func(string) {
 	}
 }
 
-func mustPut(t *testing.T, f *FencedStore, key, payload string, round uint64) {
+func mustPut(t *testing.T, f *Store, key, payload string, round uint64) {
 	t.Helper()
 	if err := f.Put(context.Background(), key, []byte(payload), round); err != nil {
 		t.Fatalf("Put(%s, round=%d): unexpected error: %v", key, round, err)
 	}
 }
 
-func read(t *testing.T, f *FencedStore, key string) (uint64, string) {
+func read(t *testing.T, f *Store, key string) (uint64, string) {
 	t.Helper()
 	payload, round, err := f.Get(context.Background(), key)
 	if err != nil {
@@ -107,7 +116,7 @@ func read(t *testing.T, f *FencedStore, key string) (uint64, string) {
 // advanced the recorded round, the predecessor's ship at its (now-lower) round is
 // refused with ErrStaleRound and the object is left untouched.
 func TestFencedPutRejectsLowerRound(t *testing.T) {
-	f := NewFencedStore(newFakeCAS())
+	f := New(newFakeCAS())
 	mustPut(t, f, "orgs/acme/kv.db", "v-round6", 6) // new owner sealed at round 6.
 
 	err := f.Put(context.Background(), "orgs/acme/kv.db", []byte("v-stale"), 3)
@@ -124,7 +133,7 @@ func TestFencedPutRejectsLowerRound(t *testing.T) {
 // overwrite is admitted (the last one wins) — this is why the fence uses `>=`,
 // not the one-shot `>`.
 func TestFencedPutAdmitsSameRoundReship(t *testing.T) {
-	f := NewFencedStore(newFakeCAS())
+	f := New(newFakeCAS())
 	mustPut(t, f, "orgs/acme/kv.db", "tick-1", 4)
 	mustPut(t, f, "orgs/acme/kv.db", "tick-2", 4)
 	mustPut(t, f, "orgs/acme/kv.db", "tick-3", 4)
@@ -137,7 +146,7 @@ func TestFencedPutAdmitsSameRoundReship(t *testing.T) {
 // strictly higher round is admitted (sealing the object), after which the
 // predecessor at the old round is fenced forever.
 func TestFencedPutHigherRoundLocksOutLower(t *testing.T) {
-	f := NewFencedStore(newFakeCAS())
+	f := New(newFakeCAS())
 	mustPut(t, f, "orgs/acme/kv.db", "old-owner", 5) // predecessor at round 5.
 	mustPut(t, f, "orgs/acme/kv.db", "new-owner", 6) // successor claims round 6.
 
@@ -156,7 +165,7 @@ func TestFencedPutHigherRoundLocksOutLower(t *testing.T) {
 func TestFencedPutConcurrentSameRoundOwnerReship(t *testing.T) {
 	store := newFakeCAS()
 	store.beforeCAS = barrierAt2()
-	f := NewFencedStore(store)
+	f := New(store)
 
 	results := make([]error, 2)
 	var wg sync.WaitGroup
@@ -193,7 +202,7 @@ func TestFencedPutConcurrentSameRoundOwnerReship(t *testing.T) {
 // happen is round 5 surviving.
 func TestFencedPutConcurrentHigherVsLower(t *testing.T) {
 	store := newFakeCAS()
-	f := NewFencedStore(store)
+	f := New(store)
 	mustPut(t, f, "orgs/acme/kv.db", "base", 5) // both racers read this as the prior state.
 
 	store.beforeCAS = barrierAt2()
@@ -223,7 +232,7 @@ func TestFencedPutConcurrentHigherVsLower(t *testing.T) {
 // successor's takeover seal at the higher round — never lost — and every
 // subsequent predecessor ship is then fenced.
 func TestCarryForwardPreservesLastWriteThenFences(t *testing.T) {
-	f := NewFencedStore(newFakeCAS())
+	f := New(newFakeCAS())
 	key := "orgs/acme/kv.db"
 	mustPut(t, f, key, "base", 5)
 	mustPut(t, f, key, "base+X", 5) // predecessor's last acknowledged ship at round 5.
@@ -231,7 +240,7 @@ func TestCarryForwardPreservesLastWriteThenFences(t *testing.T) {
 	// Successor takes over at lease round 6, carrying forward the LATEST payload and
 	// hydrating it (proving it sees X).
 	var hydrated string
-	if err := f.CarryForward(context.Background(), key, 6, func(p []byte) error { hydrated = string(p); return nil }); err != nil {
+	if err := f.CarryForward(context.Background(), key, 6, func(p []byte, _ uint64) error { hydrated = string(p); return nil }); err != nil {
 		t.Fatalf("CarryForward: %v", err)
 	}
 	if hydrated != "base+X" {
@@ -255,7 +264,7 @@ func TestCarryForwardPreservesLastWriteThenFences(t *testing.T) {
 // predecessor's ship returns nil (would be acknowledged) yet X is lost.
 func TestCarryForwardVsConcurrentPredecessorShipNoLoss(t *testing.T) {
 	store := newFakeCAS()
-	f := NewFencedStore(store)
+	f := New(store)
 	key := "orgs/acme/kv.db"
 	mustPut(t, f, key, "base", 5) // both read this version.
 
@@ -289,9 +298,9 @@ func TestCarryForwardVsConcurrentPredecessorShipNoLoss(t *testing.T) {
 // absent key is ErrNotFound, and Round reports 0 for an absent key (the value a
 // first owner increments to 1 to claim).
 func TestFencedGetRoundTripAndAbsent(t *testing.T) {
-	f := NewFencedStore(newFakeCAS())
+	f := New(newFakeCAS())
 
-	if _, _, err := f.Get(context.Background(), "orgs/absent/kv.db"); !errors.Is(err, ErrNotFound) {
+	if _, _, err := f.Get(context.Background(), "orgs/absent/kv.db"); !errors.Is(err, backend.ErrNotFound) {
 		t.Fatalf("absent Get: got %v, want ErrNotFound", err)
 	}
 	if r, err := f.Round(context.Background(), "orgs/absent/kv.db"); err != nil || r != 0 {
@@ -310,7 +319,7 @@ func TestFencedGetRoundTripAndAbsent(t *testing.T) {
 func TestFencedPutCreateOnlyFirstWrite(t *testing.T) {
 	store := newFakeCAS()
 	store.beforeCAS = barrierAt2()
-	f := NewFencedStore(store)
+	f := New(store)
 
 	results := make([]error, 2)
 	var wg sync.WaitGroup
@@ -343,10 +352,10 @@ func TestFencedPutCreateOnlyFirstWrite(t *testing.T) {
 func TestFencedRejectsCorruptForeignObject(t *testing.T) {
 	store := newFakeCAS()
 	// A foreign writer put raw bytes (no fence header) at the key.
-	if _, err := store.PutIfVersion(context.Background(), "orgs/acme/kv.db", []byte("not-a-fence-record"), ""); err != nil {
+	if _, err := store.PutIfAbsent(context.Background(), "orgs/acme/kv.db", []byte("not-a-fence-record")); err != nil {
 		t.Fatalf("seed foreign object: %v", err)
 	}
-	f := NewFencedStore(store)
+	f := New(store)
 
 	if _, _, err := f.Get(context.Background(), "orgs/acme/kv.db"); !errors.Is(err, errCorrupt) {
 		t.Fatalf("Get of foreign object: got %v, want errCorrupt", err)
@@ -356,4 +365,95 @@ func TestFencedRejectsCorruptForeignObject(t *testing.T) {
 	}
 }
 
-var _ ConditionalStore = (*fakeCAS)(nil)
+var _ Backend = (*fakeCAS)(nil)
+
+// TestCreateIsCreateOnly proves Create births an object at round 0 exactly once:
+// a second Create, and a Create racing an existing round-0 object, are refused,
+// where Put would admit round 0 over round 0.
+func TestCreateIsCreateOnly(t *testing.T) {
+	f := New(newFakeCAS())
+	ctx := context.Background()
+	if err := f.Create(ctx, "head", []byte("first")); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := f.Create(ctx, "head", []byte("second")); !errors.Is(err, backend.ErrConflict) {
+		t.Fatalf("second Create: got %v, want ErrConflict", err)
+	}
+	if round, payload := read(t, f, "head"); round != 0 || payload != "first" {
+		t.Fatalf("Create overwrote: round=%d payload=%q, want 0/first", round, payload)
+	}
+}
+
+// TestCarryForwardHydrateSeesRecordedRound proves hydrate receives the round
+// recorded with the payload, and that a hydrate error refuses the takeover and
+// leaves the object untouched.
+func TestCarryForwardHydrateSeesRecordedRound(t *testing.T) {
+	f := New(newFakeCAS())
+	ctx := context.Background()
+	mustPut(t, f, "k", "p", 4)
+	refuse := errors.New("refused")
+	err := f.CarryForward(ctx, "k", 5, func(_ []byte, recorded uint64) error {
+		if recorded != 4 {
+			t.Errorf("hydrate saw recorded=%d, want 4", recorded)
+		}
+		return refuse
+	})
+	if !errors.Is(err, refuse) {
+		t.Fatalf("CarryForward: got %v, want the hydrate error", err)
+	}
+	if round, payload := read(t, f, "k"); round != 4 || payload != "p" {
+		t.Fatalf("refused takeover mutated the object: round=%d payload=%q", round, payload)
+	}
+}
+
+// TestCarryForwardRetriesWhenAWriteLandsFirst is the lost race made certain, not
+// left to a scheduler: a predecessor's write lands after the successor has read and
+// before its compare-and-set. The successor must retry, hydrate the newer payload and
+// seal that.
+func TestCarryForwardRetriesWhenAWriteLandsFirst(t *testing.T) {
+	store := newFakeCAS()
+	f := New(store)
+	ctx := context.Background()
+	key := "orgs/acme/kv.db"
+	mustPut(t, f, key, "base", 5)
+
+	var once sync.Once
+	store.beforeCAS = func(string) {
+		once.Do(func() {
+			store.beforeCAS = nil
+			mustPut(t, f, key, "base+X", 5) // the predecessor's last write, between read and seal
+		})
+	}
+	var hydrated []string
+	if err := f.CarryForward(ctx, key, 6, func(p []byte, _ uint64) error { hydrated = append(hydrated, string(p)); return nil }); err != nil {
+		t.Fatalf("CarryForward: %v", err)
+	}
+	if len(hydrated) != 2 || hydrated[0] != "base" || hydrated[1] != "base+X" {
+		t.Fatalf("hydrated %v, want [base base+X]: the takeover did not re-read after losing the race", hydrated)
+	}
+	if round, payload := read(t, f, key); round != 6 || payload != "base+X" {
+		t.Fatalf("after takeover: round=%d payload=%q, want 6/base+X", round, payload)
+	}
+}
+
+// TestPutRetriesWhenAWriteLandsFirst: the owner's own write loses a race to another
+// same-round write; it re-reads and writes again rather than failing or clobbering.
+func TestPutRetriesWhenAWriteLandsFirst(t *testing.T) {
+	store := newFakeCAS()
+	f := New(store)
+	key := "orgs/acme/kv.db"
+	mustPut(t, f, key, "base", 4)
+	var once sync.Once
+	store.beforeCAS = func(string) {
+		once.Do(func() {
+			store.beforeCAS = nil
+			mustPut(t, f, key, "interloper", 4)
+		})
+	}
+	if err := f.Put(context.Background(), key, []byte("ours"), 4); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if round, payload := read(t, f, key); round != 4 || payload != "ours" {
+		t.Fatalf("round=%d payload=%q, want 4/ours", round, payload)
+	}
+}

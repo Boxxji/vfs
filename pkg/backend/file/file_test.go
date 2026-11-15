@@ -3,9 +3,11 @@ package file
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/hanzoai/vfs/internal/storetest"
 	"github.com/hanzoai/vfs/pkg/backend"
 )
 
@@ -27,7 +29,7 @@ func TestFilePutGetDelete(t *testing.T) {
 	if err := be.Put(ctx, "blocks/aa/abc.zap.age", []byte("hello")); err != nil {
 		t.Fatalf("put: %v", err)
 	}
-	got, err := be.Get(ctx, "blocks/aa/abc.zap.age")
+	got, _, err := be.Get(ctx, "blocks/aa/abc.zap.age")
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
@@ -46,7 +48,7 @@ func TestFilePutGetDelete(t *testing.T) {
 	if err := be.Delete(ctx, "blocks/aa/abc.zap.age"); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
-	if _, err := be.Get(ctx, "blocks/aa/abc.zap.age"); !errors.Is(err, backend.ErrNotFound) {
+	if _, _, err := be.Get(ctx, "blocks/aa/abc.zap.age"); !errors.Is(err, backend.ErrNotFound) {
 		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
 
@@ -92,5 +94,35 @@ func TestFileTraversalBlocked(t *testing.T) {
 	ctx := context.Background()
 	if err := be.Put(ctx, "../../../etc/evil", []byte("x")); err == nil {
 		t.Fatal("path traversal should be blocked")
+	}
+}
+
+func TestFileConforms(t *testing.T) {
+	storetest.Run(t, func(t *testing.T) backend.Backend {
+		be, _ := newFileBE(t)
+		return be
+	})
+}
+
+// TestFileListHidesBookkeeping: the store lock and in-flight temp files are not objects.
+func TestFileListHidesBookkeeping(t *testing.T) {
+	be, dir := newFileBE(t)
+	ctx := context.Background()
+	if err := be.Put(ctx, "a/b", []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "a", ".vfs-b-123"), []byte("tmp"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ch, errCh := be.List(ctx, "")
+	var got []string
+	for k := range ch {
+		got = append(got, k)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0] != "a/b" {
+		t.Fatalf("List = %v, want [a/b]", got)
 	}
 }
