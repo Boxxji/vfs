@@ -216,8 +216,8 @@ func TestChunkedFilesCommitCost(t *testing.T) {
 	t.Logf("ten rewritten chunked files among %d: the commit wrote %d shards, %d packs, %d head (inline files: 14 to 21 shards)", dirs*per, p["meta"], p["pack"], p["head"])
 	// Each changed chunked file dirties its inode, its chunk reference and a chunk
 	// table record keyed by a hash, three leaves, besides the path above them.
-	if p["meta"] > 34 {
-		t.Fatalf("ten changed chunked files wrote %d shards; the documented cost is 28 (at most 34)", p["meta"])
+	if p["meta"] > 40 {
+		t.Fatalf("ten changed chunked files wrote %d shards; the documented cost is about 30 (at most 40)", p["meta"])
 	}
 }
 

@@ -1,6 +1,6 @@
 # Go virtual filesystem with SQLite replication. Library + cmd/.
 #
-# The gates below run as parallel jobs, one per entry: .github/workflows/cicd.yml
+# The gates below run as jobs, three at a time, one per entry: .github/workflows/cicd.yml
 # has a matrix that names each by `gates:`, and its last entry takes everything the
 # others do not, so an entry added here is gated by default. Each is under five
 # minutes, and what makes that possible is what each job has to compile: the SQLite
@@ -15,8 +15,8 @@
 #                    -short size: no goroutines, so no race detector, which would
 #                    multiply the hashing and sealing they do tenfold
 #   sqlite           the packages that run a real SQLite engine on a Volume
-#   realserver       the engine and its store client against a real Hanzo S3 server
-#   realserver-kill  a writer killed at random moments, and the fence racing, against it
+#   realserver       the engine, its store client and the fence against a real Hanzo S3 server
+#   realserver-kill  a writer killed at random moments, against the real server
 #   scale-a/b/c      the measurements: 100,000 files, a million inodes, sync cost, the
 #                    object budget, a petabyte, amplification (-short skips them)
 #   fuzz             the model run over many more seeds
@@ -45,12 +45,13 @@ test:
       export PATH="$bin:$PATH"
       log="$bin/realserver.log"
       go test -count=1 -v -timeout 4m \
-        -run '^(TestRealServerConforms|TestRealServerRaceStress|TestRealServerMultipartIsConditional|TestPrefixConfinement|TestCommitRateOnRealServer|TestGetPairsBodyWithVersion|TestCancelledS3RequestsAreNotFaults|TestConditionalWriteAtTheSingleRequestBound|TestVolumeOnEveryStore)$' \
+        -run '^(TestRealServerConforms|TestRealServerRaceStress|TestRealServerCAS|TestRealServerMultipartIsConditional|TestPrefixConfinement|TestCommitRateOnRealServer|TestGetPairsBodyWithVersion|TestCancelledS3RequestsAreNotFaults|TestConditionalWriteAtTheSingleRequestBound|TestSameRoundRace|TestFenceRefusesOlderRound|TestAttachNeedsAHigherRound|TestTakeoverLosesNoAcknowledgedCommit|TestRacingClaims|TestVolumeOnEveryStore)$' \
         . ./pkg/backend/s3 | tee "$log"
-      for t in TestRealServerConforms TestRealServerRaceStress TestRealServerMultipartIsConditional \
+      for t in TestRealServerConforms TestRealServerRaceStress TestRealServerCAS TestRealServerMultipartIsConditional \
                TestPrefixConfinement TestCommitRateOnRealServer TestGetPairsBodyWithVersion \
                TestCancelledS3RequestsAreNotFaults TestConditionalWriteAtTheSingleRequestBound \
-               TestVolumeOnEveryStore/hanzo-s3; do
+               TestSameRoundRace/hanzo-s3 TestFenceRefusesOlderRound/hanzo-s3 TestAttachNeedsAHigherRound/hanzo-s3 \
+               TestTakeoverLosesNoAcknowledgedCommit/hanzo-s3 TestRacingClaims/hanzo-s3 TestVolumeOnEveryStore/hanzo-s3; do
         grep -q -- "--- PASS: $t " "$log" || { echo "did not pass against the real server: $t"; exit 1; }
       done
   - name: realserver-kill
@@ -60,13 +61,8 @@ test:
       tools/ci/s3server.sh "$bin"
       export PATH="$bin:$PATH"
       log="$bin/kill.log"
-      go test -count=1 -v -timeout 4m \
-        -run '^(TestKillOverRealServer|TestRealServerCAS|TestSameRoundRace|TestFenceRefusesOlderRound|TestAttachNeedsAHigherRound|TestTakeoverLosesNoAcknowledgedCommit|TestRacingClaims)$' . | tee "$log"
-      for t in TestKillOverRealServer TestRealServerCAS \
-               TestSameRoundRace/hanzo-s3 TestFenceRefusesOlderRound/hanzo-s3 TestAttachNeedsAHigherRound/hanzo-s3 \
-               TestTakeoverLosesNoAcknowledgedCommit/hanzo-s3 TestRacingClaims/hanzo-s3; do
-        grep -q -- "--- PASS: $t " "$log" || { echo "did not pass against the real server: $t"; exit 1; }
-      done
+      go test -count=1 -v -timeout 4m -run '^TestKillOverRealServer$' . | tee "$log"
+      grep -q -- '--- PASS: TestKillOverRealServer ' "$log" || { echo "TestKillOverRealServer did not pass"; exit 1; }
   - name: check
     run: |
       set -euo pipefail
