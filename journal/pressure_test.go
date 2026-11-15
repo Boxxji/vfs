@@ -84,9 +84,7 @@ func TestBackpressure(t *testing.T) {
 
 	// Recovery drains in order: publish half, reclaim, and the journal takes records again.
 	half := uint64(len(seqs) / 2)
-	if err := j.Publish(half); err != nil {
-		t.Fatal(err)
-	}
+	publish(t, j, half)
 	if err := j.Reclaim(); err != nil {
 		t.Fatal(err)
 	}
@@ -180,9 +178,7 @@ func TestOutageIsReported(t *testing.T) {
 	if s := j.State(); s.Age != 10*time.Second {
 		t.Fatalf("age %v after another write", s.Age)
 	}
-	if err := j.Publish(10); err != nil {
-		t.Fatal(err)
-	}
+	publish(t, j, 10)
 	if s := j.State(); s.Degraded || s.Age != 0 || s.Backlog != 28+4 {
 		t.Fatalf("state %+v after publishing the old records", s)
 	}
@@ -200,9 +196,7 @@ func TestStateBacklogIsExact(t *testing.T) {
 	if s := j.State(); s.Backlog != total {
 		t.Fatalf("backlog %d, want %d", s.Backlog, total)
 	}
-	if err := j.Publish(3); err != nil {
-		t.Fatal(err)
-	}
+	publish(t, j, 3)
 	if s := j.State(); s.Backlog != int64(28+300+28+5) {
 		t.Fatalf("backlog %d after Publish(3)", s.Backlog)
 	}

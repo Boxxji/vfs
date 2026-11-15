@@ -68,6 +68,7 @@ func (r *run) append(t testing.TB, j *journal.Journal, p []byte) uint64 {
 		if seq, err = j.Append(ctx, p); !errors.Is(err, journal.ErrFull) {
 			break
 		}
+		r.sync(t, j, j.Marks().Visible)
 		r.publish(t, j, j.Marks().Visible)
 		r.reclaim(t, j)
 	}
@@ -89,12 +90,18 @@ func (r *run) sync(t testing.TB, j *journal.Journal, seq uint64) {
 	r.d.Mark(acked(seq))
 }
 
+// publish tells the journal the store holds seq, or as much of it as is
+// durable: Publish refuses a record no sync has covered. The store holds it
+// before the journal is told, so the mark goes into the log first.
 func (r *run) publish(t testing.TB, j *journal.Journal, seq uint64) {
-	if err := j.Publish(seq); err != nil {
-		t.Errorf("Publish(%d): %v", seq, err)
+	seq = min(seq, j.Marks().Durable)
+	if seq <= j.Marks().Published {
 		return
 	}
 	r.d.Mark(stored(seq))
+	if err := j.Publish(seq); err != nil {
+		t.Errorf("Publish(%d): %v", seq, err)
+	}
 }
 
 func (r *run) reclaim(t testing.TB, j *journal.Journal) {
@@ -330,8 +337,8 @@ func TestCrashSessions(t *testing.T) {
 				r.sync(t, j, seq)
 			}
 			if i%11 == 10 {
-				published = seq - 3
-				r.publish(t, j, published)
+				r.publish(t, j, seq-3)
+				published = j.Marks().Published // what the store holds, which the next session is told
 				r.reclaim(t, j)
 			}
 		}

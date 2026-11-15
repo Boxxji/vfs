@@ -2,6 +2,7 @@
 //
 //	bench -what journal -writers 32 -size 4096     # Append+Sync per writer, group commit
 //	bench -what plain   -writers 32 -size 4096     # pwrite+fdatasync per writer, no journal
+//	bench -what group   -writers 32 -size 4096     # one shared file, one shared fdatasync, written by hand
 //	bench -what journal -seq -total 8GiB           # 1 MiB sequential Append, then Sync
 //	bench -what plain   -seq -total 8GiB -every 1MiB
 //	bench -what strategy                           # how to make a write durable: the measurement behind the journal
@@ -32,7 +33,7 @@ import (
 
 var (
 	dir     = flag.String("dir", "/var/tmp/journal-bench", "directory on the disk under test")
-	what    = flag.String("what", "journal", "journal or plain")
+	what    = flag.String("what", "journal", "journal, plain (one fdatasync per writer), group (one shared file and one shared fdatasync) or strategy")
 	writers = flag.Int("writers", 1, "concurrent writers")
 	size    = flag.Int("size", 4096, "bytes per operation")
 	dur     = flag.Duration("dur", 5*time.Second, "how long a latency run lasts")
@@ -81,6 +82,8 @@ func main() {
 		journalSequential(work)
 	case *what == "plain" && !*seq:
 		plainLatency(work)
+	case *what == "group" && !*seq:
+		groupLatency(work)
 	case *what == "plain":
 		plainSequential(work)
 	case *what == "strategy":
@@ -189,7 +192,7 @@ func open(work string) (*journal.Journal, *counting, func()) {
 	files, err := journal.Files(work)
 	check(err)
 	disk := &counting{Disk: files}
-	j, err := journal.Open(work, journal.Options{Capacity: parseSize(*capa), Segment: parseSize(*segment), Disk: disk})
+	j, err := journal.Open(work, journal.Options{Capacity: parseSize(*capa), Segment: parseSize(*segment), Retry: 5 * time.Millisecond, Disk: disk})
 	check(err)
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
@@ -199,10 +202,12 @@ func open(work string) (*journal.Journal, *counting, func()) {
 		published := time.Now()
 		var credit float64
 		for {
+			c, cancel := context.WithCancel(context.Background())
 			select {
-			case <-j.Due(5 * time.Millisecond):
+			case <-j.Due(c, 5*time.Millisecond):
+				cancel()
 				m := j.Marks()
-				upto := m.Visible
+				upto := m.Durable // only what a local sync has covered: Publish refuses more
 				if *drain > 0 {
 					// pace the drain: at most -drain MB/s of records
 					credit += time.Since(published).Seconds() * *drain * 1e6
@@ -218,10 +223,11 @@ func open(work string) (*journal.Journal, *counting, func()) {
 					check(j.Publish(upto))
 					check(j.Reclaim())
 				}
-				if *drain > 0 && upto < m.Visible {
+				if *drain > 0 && upto < m.Durable {
 					time.Sleep(2 * time.Millisecond) // the store is the slow side
 				}
 			case <-stop:
+				cancel()
 				return
 			}
 		}

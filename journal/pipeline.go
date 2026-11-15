@@ -1,5 +1,7 @@
 package journal
 
+import "io"
+
 // The pipeline has two goroutines. The writer takes the batches Append queued
 // and writes them to the segment files; it never waits for a sync, so the next
 // batch is written while the previous one is being synced. The syncer is the
@@ -55,7 +57,10 @@ func (j *Journal) writer() {
 			<-b.slot.ready
 			err := b.slot.err
 			if err == nil {
-				_, err = b.slot.file.WriteAt(b.data, b.off)
+				var n int
+				if n, err = b.slot.file.WriteAt(b.data, b.off); err == nil && n != len(b.data) {
+					err = io.ErrShortWrite
+				}
 			}
 			if err == nil {
 				// Ask for the data to start going out while more is being
@@ -75,6 +80,7 @@ func (j *Journal) writer() {
 				return
 			}
 			j.written = b.last
+			j.last = b.slot
 			if !b.slot.dirty {
 				b.slot.dirty = true
 				j.dirty = append(j.dirty, b.slot)
@@ -134,13 +140,22 @@ func (j *Journal) syncer() {
 		}
 		round := j.unsynced
 		j.unsynced = 0
+		last, through, floor := j.last, j.synced, j.published
 		j.mu.Unlock()
 
+		// The mark goes in with this round's sync, and says what the rounds
+		// before it had already made durable: it can only be on the media
+		// together with, or after, everything it claims. It is written to the
+		// segment this round dirtied, so this round's fdatasync carries it.
 		var err error
+		if last != nil {
+			_, err = j.writeMark(last, through, floor)
+		}
 		for _, s := range files {
-			if err = s.file.Sync(); err != nil {
+			if err != nil {
 				break
 			}
+			err = s.file.Sync()
 		}
 
 		j.mu.Lock()

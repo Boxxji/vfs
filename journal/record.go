@@ -1,52 +1,108 @@
 package journal
 
 import (
+	"crypto/sha256"
 	"encoding/binary"
 	"hash/crc32"
 )
 
 // On-disk layout.
 //
-// A segment file starts with a header, then holds records back to back until
-// the first byte that does not parse as the next record of this segment:
+// A segment file starts with a header and two marks, then holds records back
+// to back until the first byte that does not parse as the next record of this
+// segment:
 //
-//	header  checksum u32 | first u64 | life u64
+//	header  checksum u32 | first u64 | life u64 | lineage [16]byte
+//	mark    checksum u32 | through u64 | floor u64                       (two slots)
 //	record  checksum u32 | length u32 | sequence u64 | acknowledged i64 | payload checksum u32 | payload
 //
-// The header checksum covers first and life. The record checksum covers every
-// record header field after itself and is seeded from the segment's life, so a
-// record left in the file by an earlier use of the same file never validates
-// in a later one. The payload checksum is computed before the journal takes
-// its lock; the record checksum then binds it to the sequence and the time.
-// All integers are little endian. A zero header is a free segment.
+// The header checksum covers first, life and lineage. The lineage is a digest
+// of an identity the caller supplies (a volume and a fencing round): a journal
+// opened under another identity is refused, not read. The record and mark
+// checksums are seeded from the segment's life and the lineage, so a record
+// left in the file by an earlier use of the same file, or by another lineage,
+// never validates in a later one. The payload checksum is computed before the
+// journal takes its lock; the record checksum then binds it to the sequence and
+// the time.
+//
+// A mark says what the journal knew when it was written: through, every record
+// up to this sequence had been made durable by a completed sync; floor, the
+// store held every record up to this sequence, and the segments that held them
+// may be gone. A mark is written after the sync it describes, so wherever one
+// survives, everything it claims is on the media. The two slots are written
+// alternately; a torn write damages one and the other still stands, and a
+// recovery takes the highest through and the highest floor of the slots that
+// validate. All integers are little endian. A zero header is a free segment.
 const (
-	headerSize   = 20
+	headerSize   = 36
+	markSize     = 20
+	dataStart    = headerSize + 2*markSize // where the records begin
 	recordHeader = 28
 )
 
 var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 
-func seedOf(life uint64) uint32 { return uint32(life) ^ uint32(life>>32) }
+// lineage is the digest of the identity a journal belongs to.
+type lineage [16]byte
 
-func appendHeader(dst []byte, first, life uint64) []byte {
+func lineageOf(identity []byte) lineage {
+	sum := sha256.Sum256(identity)
+	var l lineage
+	copy(l[:], sum[:])
+	return l
+}
+
+func seedOf(life uint64, l lineage) uint32 {
+	var b [8 + len(lineage{})]byte
+	binary.LittleEndian.PutUint64(b[:], life)
+	copy(b[8:], l[:])
+	return crc32.Checksum(b[:], castagnoli)
+}
+
+// appendPreamble encodes the header and the first mark of a segment.
+func appendPreamble(dst []byte, first, life uint64, l lineage, through, floor uint64) []byte {
 	var h [headerSize]byte
 	binary.LittleEndian.PutUint64(h[4:], first)
 	binary.LittleEndian.PutUint64(h[12:], life)
+	copy(h[20:], l[:])
 	binary.LittleEndian.PutUint32(h[0:], crc32.Checksum(h[4:], castagnoli))
-	return append(dst, h[:]...)
+	dst = append(dst, h[:]...)
+	dst = appendMark(dst, seedOf(life, l), through, floor)
+	return append(dst, make([]byte, markSize)...) // the other slot
 }
 
-// parseHeader reports the first sequence and the life of a segment, or false
-// when b is not a header (free, torn or foreign).
-func parseHeader(b []byte) (first, life uint64, ok bool) {
+// parseHeader reports the first sequence, the life and the lineage of a
+// segment, or false when b is not a header (free, torn or foreign).
+func parseHeader(b []byte) (first, life uint64, l lineage, ok bool) {
 	if len(b) < headerSize {
-		return 0, 0, false
+		return 0, 0, l, false
 	}
 	if crc32.Checksum(b[4:headerSize], castagnoli) != binary.LittleEndian.Uint32(b) {
-		return 0, 0, false
+		return 0, 0, l, false
 	}
 	first = binary.LittleEndian.Uint64(b[4:])
-	return first, binary.LittleEndian.Uint64(b[12:]), first != 0
+	copy(l[:], b[20:])
+	return first, binary.LittleEndian.Uint64(b[12:]), l, first != 0
+}
+
+func appendMark(dst []byte, seed uint32, through, floor uint64) []byte {
+	var m [markSize]byte
+	binary.LittleEndian.PutUint64(m[4:], through)
+	binary.LittleEndian.PutUint64(m[12:], floor)
+	binary.LittleEndian.PutUint32(m[0:], crc32.Update(seed, castagnoli, m[4:]))
+	return append(dst, m[:]...)
+}
+
+// parseMarks reads the two mark slots of a segment whose preamble is b.
+func parseMarks(b []byte, seed uint32) (through, floor uint64) {
+	for i := 0; i < 2; i++ {
+		m := b[headerSize+i*markSize : headerSize+(i+1)*markSize]
+		if crc32.Update(seed, castagnoli, m[4:]) == binary.LittleEndian.Uint32(m) {
+			through = max(through, binary.LittleEndian.Uint64(m[4:]))
+			floor = max(floor, binary.LittleEndian.Uint64(m[12:]))
+		}
+	}
+	return through, floor
 }
 
 // appendRecord encodes one record onto dst, which must have room for it.
@@ -138,7 +194,7 @@ func (w *window) view(off int64, n int64) ([]byte, error) {
 // valid records end.
 func scan(f File, seed uint32, expect uint64, fn func(record, int64) error) (uint64, int64, error) {
 	w := window{f: f}
-	off := int64(headerSize)
+	off := int64(dataStart)
 	for {
 		b, err := w.view(off, recordHeader)
 		if err != nil {

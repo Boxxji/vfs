@@ -11,7 +11,8 @@ import (
 // touches the operating system directly, so a test double can record every
 // persistence point and replay a crash after each one.
 //
-// Names are flat (no directories). A Disk may be used by one Journal at a time.
+// Names are flat (no directories). A Disk may be used by one Journal at a time,
+// and the Journal owns it from Open to Close.
 type Disk interface {
 	// List returns the names of the files in the journal's directory.
 	List() ([]string, error)
@@ -24,12 +25,16 @@ type Disk interface {
 	Open(name string) (File, error)
 	// Remove deletes a file. The deletion is durable when Remove returns.
 	Remove(name string) error
+	// Close releases what the Disk holds, such as the lock on its directory. The
+	// journal calls it from Close, and after an Open that failed.
+	Close() error
 }
 
 // File is one segment file. WriteAt and ReadAt may run concurrently with each
 // other and with Sync.
 type File interface {
 	ReadAt(p []byte, off int64) (int, error)
+	// WriteAt writes all of p, or returns an error.
 	WriteAt(p []byte, off int64) (int, error)
 	// Writeback asks the system to start writing the range to the media now,
 	// without waiting and without any guarantee. The journal asks as it writes,
@@ -38,7 +43,9 @@ type File interface {
 	Writeback(off, n int64) error
 	// Sync makes every write that completed before Sync was called durable,
 	// without the cost of flushing file metadata that did not change (fdatasync).
-	// A write that overlaps the call may or may not be covered.
+	// A write that overlaps the call may or may not be covered. On macOS the
+	// operating system call behind Go's File.Sync is F_FULLFSYNC, which asks the
+	// drive to flush its own cache and is much slower than fdatasync on Linux.
 	Sync() error
 	// Size is the file's length in bytes. It never changes.
 	Size() int64
@@ -67,21 +74,56 @@ func parseSlot(name string) (uint64, bool) {
 	return id, true
 }
 
-// directory is the Disk over a directory of the operating system's files.
-type directory struct{ path string }
+// directory is the Disk over a directory of the operating system's files. It
+// holds an exclusive lock on the directory until it is closed, or until the
+// process dies, when the kernel releases it.
+type directory struct {
+	path     string
+	lock     *os.File
+	warnings []string
+}
 
-// Files returns the Disk over the operating system's files in dir, creating
-// the directory if needed. It is what Open uses when Options.Disk is nil; a
-// caller wraps it to observe or count what the journal does to the files.
+// Files returns the Disk over the operating system's files in dir, creating the
+// directory (readable by its owner alone: the journal holds every write of the
+// volume in the clear; the Volume seals what it appends) and the entry of the
+// directory in its parent durably. It takes an exclusive lock on the directory
+// and returns ErrLocked if another journal has it, and ErrVolatile for a
+// directory on memory, where a sync makes nothing durable. It is what Open uses
+// when Options.Disk is nil; a caller wraps it to observe or count what the
+// journal does to the files.
 func Files(dir string) (Disk, error) {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	dir = filepath.Clean(dir)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	return directory{dir}, nil
+	if err := syncDirectory(filepath.Dir(dir)); err != nil {
+		return nil, err
+	}
+	warnings, err := inspect(dir)
+	if err != nil {
+		return nil, err
+	}
+	lock, err := lockDirectory(dir)
+	if err != nil {
+		return nil, err
+	}
+	return &directory{path: dir, lock: lock, warnings: warnings}, nil
+}
+
+// Warnings lists the risks of the directory's file system.
+func (d *directory) Warnings() []string { return d.warnings }
+
+func (d *directory) Close() error {
+	if d.lock == nil {
+		return nil
+	}
+	err := d.lock.Close()
+	d.lock = nil
+	return err
 }
 
 // List also removes the temporary files an interrupted Create leaves behind.
-func (d directory) List() ([]string, error) {
+func (d *directory) List() ([]string, error) {
 	entries, err := os.ReadDir(d.path)
 	if err != nil {
 		return nil, err
@@ -104,10 +146,10 @@ func (d directory) List() ([]string, error) {
 // Create writes the whole file under a temporary name, syncs it, then renames
 // it into place and syncs the directory, so a crash leaves either no file or a
 // complete one.
-func (d directory) Create(name string, size int64) (File, error) {
+func (d *directory) Create(name string, size int64) (File, error) {
 	final := filepath.Join(d.path, name)
 	temp := final + tempSuffix
-	f, err := os.OpenFile(temp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	f, err := os.OpenFile(temp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return nil, err
 	}
@@ -131,14 +173,14 @@ func (d directory) Create(name string, size int64) (File, error) {
 		os.Remove(temp)
 		return nil, err
 	}
-	if err := d.sync(); err != nil {
+	if err := syncDirectory(d.path); err != nil {
 		f.Close()
 		return nil, err
 	}
 	return &osFile{f, size}, nil
 }
 
-func (d directory) Open(name string) (File, error) {
+func (d *directory) Open(name string) (File, error) {
 	f, err := os.OpenFile(filepath.Join(d.path, name), os.O_RDWR, 0)
 	if err != nil {
 		return nil, err
@@ -151,15 +193,15 @@ func (d directory) Open(name string) (File, error) {
 	return &osFile{f, info.Size()}, nil
 }
 
-func (d directory) Remove(name string) error {
+func (d *directory) Remove(name string) error {
 	if err := os.Remove(filepath.Join(d.path, name)); err != nil {
 		return err
 	}
-	return d.sync()
+	return syncDirectory(d.path)
 }
 
-func (d directory) sync() error {
-	f, err := os.Open(d.path)
+func syncDirectory(path string) error {
+	f, err := os.Open(path)
 	if err != nil {
 		return err
 	}
@@ -173,6 +215,6 @@ type osFile struct {
 }
 
 func (f *osFile) Sync() error { return datasync(f.File) }
+func (f *osFile) Size() int64 { return f.size }
 
 func (f *osFile) Writeback(off, n int64) error { return writeback(f.File, off, n) }
-func (f *osFile) Size() int64                  { return f.size }

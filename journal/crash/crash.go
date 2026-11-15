@@ -125,6 +125,10 @@ func (d *Disk) List() ([]string, error) {
 	return names, nil
 }
 
+// Close does nothing: the disk outlives the journals opened on it, so a test can
+// close one and open the next on the same files.
+func (d *Disk) Close() error { return nil }
+
 func (d *Disk) Create(name string, size int64) (journal.File, error) {
 	if err := d.intercept(Event{"create", name, 0, int(size)}); err != nil {
 		return nil, err

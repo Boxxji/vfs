@@ -10,9 +10,9 @@
 //	published  the record is in the object store. The publisher reports it
 //	           with Publish, and the journal then reclaims the space.
 //
-// Publication is allowed to be ahead of local durability (the publisher reads
-// the in-memory state, not the journal), so the durable watermark is the larger
-// of what the disk has made durable and what the store holds.
+// Published <= Durable <= Visible. The publisher may only publish what is
+// durable: Publish refuses a sequence a local sync has not covered, so the store
+// never holds a record the journal could still lose.
 //
 // The ideas, studied and implemented independently here: a commit pipeline in
 // which sequence assignment is separate from the write and from a sync queue
@@ -34,6 +34,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"math"
 	"math/bits"
 	"sync"
 	"time"
@@ -41,16 +42,37 @@ import (
 
 var (
 	// ErrFull is returned by Append when the journal's capacity is used up by
-	// records the publisher has not yet published. Nothing was appended.
+	// records the publisher has not yet published, or when no segment file can
+	// be made. Nothing was appended.
 	ErrFull = errors.New("journal: full")
 	// ErrClosed is returned after Close.
 	ErrClosed = errors.New("journal: closed")
 	// ErrTooLarge is returned by Append for a payload that cannot fit in one segment.
 	ErrTooLarge = errors.New("journal: payload larger than a segment")
-	// ErrAhead is returned for a sequence that has not been appended.
-	ErrAhead = errors.New("journal: sequence not appended")
-	// ErrCorrupt is returned by Replay when a record that should be on disk is not.
+	// ErrAhead is returned for a sequence that is ahead of what the call needs:
+	// Sync of a record not yet appended, Publish of a record not yet durable.
+	ErrAhead = errors.New("journal: sequence ahead of the journal")
+	// ErrCorrupt is returned by Open and Replay when a record that was made
+	// durable is not on the disk any more or no longer validates.
 	ErrCorrupt = errors.New("journal: corrupt record")
+	// ErrMismatch is returned by Open when the sequence the caller says the
+	// store holds does not fit the journal: the store is behind what the journal
+	// has already reclaimed (a stale or wrong Head), behind the first record the
+	// journal holds, or ahead of the last one. Open wrote nothing. Discard is the
+	// explicit way to give up the records.
+	ErrMismatch = errors.New("journal: sequence does not match the store")
+	// ErrLineage is returned by Open when the directory holds a journal of
+	// another identity (another volume, or an older fencing round). Open wrote
+	// nothing. Discard is the explicit way to give up the records.
+	ErrLineage = errors.New("journal: directory belongs to another lineage")
+	// ErrLocked is returned by Open when another journal has the directory.
+	ErrLocked = errors.New("journal: directory is in use by another journal")
+	// ErrVolatile is returned by Open for a directory on memory (tmpfs, ramfs),
+	// where a sync makes nothing durable.
+	ErrVolatile = errors.New("journal: directory is on volatile memory")
+	// ErrRange is returned by Discard when the journal does not hold exactly the
+	// records the caller named.
+	ErrRange = errors.New("journal: records are not the range named")
 )
 
 // Options configure Open.
@@ -58,19 +80,28 @@ type Options struct {
 	// Capacity is the most disk the journal may use, in bytes. It is required:
 	// set it from the node's NVMe budget. At least two segments.
 	Capacity int64
-	// Segment is the size of one segment file. Default 64 MiB.
+	// Segment is the size of one segment file, at most 4 GiB. Default 64 MiB.
 	Segment int64
 	// Bound is the longest an acknowledged record should stay unpublished.
 	// State reports Degraded when the oldest one is older. Default 5 s.
 	Bound time.Duration
+	// Retry is the least time between two firings of Due. A publisher whose
+	// publication fails sees the same overdue record each time; Retry keeps its
+	// loop from spinning. Default 100 ms.
+	Retry time.Duration
 	// Published is the highest sequence the store holds (the Head's journal
 	// sequence; 0 for a store with none). It is the truth about what is
-	// published. Records at or below it are not replayed. New sequences continue
-	// after it even if the disk lost the tail. A log that ends at or before it
-	// is discarded, and so is one that begins after Published+1: it is missing
-	// the records in between and what follows a gap is not a prefix.
+	// published, and it must be the store's: Open returns ErrMismatch rather than
+	// guess when it does not fit the journal. Records at or below it are not
+	// replayed, and new sequences continue after it.
 	Published uint64
+	// Lineage is the identity of the history this journal belongs to, such as a
+	// volume and its fencing round. It is written into every segment and mixed
+	// into every checksum. Open refuses a directory of another lineage, so an
+	// old owner's records cannot be replayed over a newer Head.
+	Lineage []byte
 	// Disk is the file layer. Nil means the operating system's files in dir.
+	// The journal owns it after Open and closes it with the journal.
 	Disk Disk
 	// Clock supplies time. Nil means the wall clock.
 	Clock Clock
@@ -93,10 +124,33 @@ type State struct {
 	// Backlog is the bytes of acknowledged records not yet published.
 	Backlog int64
 	// Age is how long the oldest unpublished record has been acknowledged. It
-	// is never reset by later writes. Zero when nothing is unpublished.
+	// is never reset by later writes, and a restart never lengthens it. Zero
+	// when nothing is unpublished.
 	Age time.Duration
 	// Err is the error that stopped the journal, if any.
 	Err error
+}
+
+// Range is a run of sequence numbers.
+type Range struct{ First, Last uint64 }
+
+// Report is what Open found and what it gave up.
+type Report struct {
+	// First and Last are the sequences Open kept after Published. Last < First
+	// when there are none.
+	First, Last uint64
+	// Proven is the highest sequence the log proves had been made durable by a
+	// sync before it stopped. Records after it, up to Last, were recovered
+	// but nothing shows their sync had finished; Open synced them.
+	Proven uint64
+	// Dropped lists intact segments Open wiped because they follow a gap in the
+	// log: what follows a gap is not a prefix, and nothing there was proven
+	// durable. Bytes after Last in the last segment that did not parse as records
+	// are never read again; they are not listed.
+	Dropped []Range
+	// Warnings name risks of the directory's file system (a layered or remote
+	// one, where a sync may not reach the media).
+	Warnings []string
 }
 
 // Record is one journal record.
@@ -118,14 +172,14 @@ type Stats struct {
 }
 
 const (
-	batchCap   = 4 << 20                 // bytes one write holds before the next record starts another
-	maxPending = 16 << 20                // bytes queued for the file before Append waits for the writer
-	syncBytes  = 8 << 20                 // unsynced bytes that start a sync nobody asked for
-	exposed    = 16 << 20                // bytes written but not synced before the writer waits for a sync
-	hintBytes  = 1 << 20                 // bytes written to a segment before the system is asked to start writing them out
-	quantum    = int64(time.Millisecond) // acknowledgement times closer than this share a span
-	slowFrom   = 0.75                    // fill at which Append starts to slow
-	slowRate   = 64 << 20                // bytes per second Append is held to at a full journal
+	batchCap   = 4 << 20          // bytes one write holds before the next record starts another
+	maxPending = 16 << 20         // bytes queued for the file before Append waits for the writer
+	syncBytes  = 8 << 20          // unsynced bytes that start a sync nobody asked for
+	exposed    = 16 << 20         // bytes written but not synced before the writer waits for a sync
+	hintBytes  = 1 << 20          // bytes written to a segment before the system is asked to start writing them out
+	slowFrom   = 0.75             // fill at which Append starts to slow
+	slowRate   = 64 << 20         // bytes per second Append is held to at a full journal
+	quantum    = time.Millisecond // acknowledgement times closer than this share a span
 )
 
 // slot is one segment file and, while it is in the log, the segment it holds.
@@ -144,6 +198,10 @@ type slot struct {
 	seed  uint32
 	dirty bool  // written since it was last synced
 	hint  int64 // offset up to which writeback has been requested
+
+	// The mark last written, and how many; guarded by Journal.markmu.
+	through, floor uint64
+	marks          uint64
 }
 
 type batch struct {
@@ -160,17 +218,9 @@ type waiter struct {
 }
 
 type span struct {
-	first uint64 // first sequence in the span
-	ack   int64  // acknowledgement time of that record
-	cum   uint64 // bytes appended before it
-}
-
-type due struct {
-	age   time.Duration
-	ch    chan struct{}
-	timer Timer
-	gen   int
-	fired bool
+	first uint64    // first sequence in the span
+	ack   time.Time // acknowledgement time of that record
+	cum   uint64    // bytes appended before it
 }
 
 // Journal is safe for concurrent use.
@@ -180,23 +230,29 @@ type Journal struct {
 	segment int64
 	limit   int // most segment files
 	bound   time.Duration
+	retry   time.Duration
+	lineage lineage
+	report  Report
 
-	rw sync.RWMutex // Replay holds it shared, Reclaim exclusive: a segment is not recycled while it is read
-	mu sync.Mutex
+	rw     sync.RWMutex // Replay holds it shared, Reclaim exclusive: a segment is not recycled while it is read
+	mu     sync.Mutex
+	markmu sync.Mutex // guards the mark fields of every slot, and the writes of marks
 
 	next      uint64 // next sequence to assign
 	written   uint64 // highest sequence written to a file
 	synced    uint64 // highest sequence a completed sync covered
 	published uint64
-	ack       int64 // last acknowledgement time given
+	ack       time.Time // last acknowledgement time given
 
 	queue   []*batch // batches not yet written, in order
 	cur     *batch   // last batch of queue, still open to Append
 	pending int64    // bytes in queue
 	room    chan struct{}
 
+	all    []*slot // every segment file the journal opened or made
 	segs   []*slot // log segments, oldest first; the last is the tail
 	tail   *slot
+	last   *slot // segment of the last batch written
 	spare  *slot // next segment, ready or being created
 	free   []*slot
 	nextID uint64
@@ -214,7 +270,8 @@ type Journal struct {
 	total uint64
 	debt  time.Duration
 
-	dues []*due
+	dues  []*due
+	fired time.Time // when Due last fired
 
 	err    error
 	closed bool
@@ -225,45 +282,66 @@ type Journal struct {
 	stats  Stats
 }
 
-// Open opens the journal in dir, recovering what is on disk: it keeps the
-// longest prefix of valid records, discards anything after the first torn or
-// stale byte, and makes what it kept durable before it returns. New records go
-// to a fresh segment, never behind a torn tail.
-func Open(dir string, opt Options) (*Journal, error) {
+func newJournal(opt Options) (*Journal, error) {
 	if opt.Segment == 0 {
 		opt.Segment = 64 << 20
 	}
 	if opt.Bound == 0 {
 		opt.Bound = 5 * time.Second
 	}
-	if opt.Segment <= headerSize+recordHeader {
+	if opt.Retry == 0 {
+		opt.Retry = 100 * time.Millisecond
+	}
+	if opt.Segment <= dataStart+recordHeader {
 		return nil, fmt.Errorf("journal: segment of %d bytes is too small", opt.Segment)
+	}
+	if opt.Segment > math.MaxUint32 {
+		return nil, fmt.Errorf("journal: segment of %d bytes is larger than 4 GiB", opt.Segment)
 	}
 	limit := opt.Capacity / opt.Segment
 	if limit < 2 {
 		return nil, fmt.Errorf("journal: capacity %d holds fewer than two segments of %d", opt.Capacity, opt.Segment)
 	}
-	if opt.Disk == nil {
-		d, err := Files(dir)
-		if err != nil {
-			return nil, err
-		}
-		opt.Disk = d
-	}
 	if opt.Clock == nil {
 		opt.Clock = wallClock{}
 	}
-	j := &Journal{
+	return &Journal{
 		disk:    opt.Disk,
 		clock:   opt.Clock,
 		segment: opt.Segment,
 		limit:   int(limit),
 		bound:   opt.Bound,
+		retry:   opt.Retry,
+		lineage: lineageOf(opt.Lineage),
 		room:    make(chan struct{}),
 		done:    make(chan struct{}),
 		kickw:   make(chan struct{}, 1),
 		kicks:   make(chan struct{}, 1),
+	}, nil
+}
+
+// Open opens the journal in dir, recovering what is on disk: it keeps the
+// longest prefix of valid records and makes what it kept durable before it
+// returns. New records go to a fresh segment, never behind a torn tail.
+//
+// Open returns an error and writes nothing when the directory is in use
+// (ErrLocked), is on memory (ErrVolatile), belongs to another lineage
+// (ErrLineage), does not fit Options.Published (ErrMismatch), or has lost
+// records that were made durable (ErrCorrupt). It wipes only segments that
+// follow a gap in a log with no proof of a finished sync past the gap, a torn
+// tail, and Recovery says which. Discard is the explicit way to give up records.
+func Open(dir string, opt Options) (*Journal, error) {
+	j, err := newJournal(opt)
+	if err != nil {
+		return nil, err
 	}
+	disk := opt.Disk
+	if disk == nil {
+		if disk, err = Files(dir); err != nil {
+			return nil, err
+		}
+	}
+	j.disk = disk
 	if err := j.recover(opt.Published); err != nil {
 		j.wg.Wait()
 		j.release()
@@ -274,6 +352,9 @@ func Open(dir string, opt Options) (*Journal, error) {
 	go j.syncer()
 	return j, nil
 }
+
+// Recovery reports what Open kept and what it gave up.
+func (j *Journal) Recovery() Report { return j.report }
 
 func (j *Journal) kick(c chan struct{}) {
 	select {
@@ -294,7 +375,8 @@ func (j *Journal) fault() error {
 }
 
 // failLocked stops the journal on an I/O error. After a failed write or sync
-// the state of the file is unknown, so nothing is retried.
+// the state of the file is unknown, so nothing is retried. Everything waiting
+// on the journal learns of it: waiters get the error and Due fires.
 func (j *Journal) failLocked(err error) {
 	if j.err != nil {
 		return
@@ -306,6 +388,9 @@ func (j *Journal) failLocked(err error) {
 		close(w.done)
 	}
 	j.waiters = nil
+	for _, d := range append([]*due(nil), j.dues...) {
+		j.fire(d)
+	}
 	j.kick(j.kickw)
 	j.kick(j.kicks)
 	j.broadcast()
@@ -325,8 +410,6 @@ func (j *Journal) broadcast() {
 	j.room = make(chan struct{})
 }
 
-func (j *Journal) durable() uint64 { return max(j.synced, j.published) }
-
 // Append adds payload to the journal and returns its sequence number. The
 // record is visible when Append returns; it is durable only after Sync. Near
 // capacity Append slows down; at capacity it returns ErrFull.
@@ -334,8 +417,8 @@ func (j *Journal) Append(ctx context.Context, payload []byte) (uint64, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	n := int64(recordHeader + len(payload))
-	if n > j.segment-headerSize {
+	n := int64(recordHeader) + int64(len(payload))
+	if n > j.segment-dataStart {
 		return 0, ErrTooLarge
 	}
 	sum := crc32.Checksum(payload, castagnoli)
@@ -359,21 +442,22 @@ func (j *Journal) Append(ctx context.Context, payload []byte) (uint64, error) {
 			j.mu.Unlock()
 			return 0, err
 		}
-		if j.pending >= maxPending {
-			wait := j.room
-			j.mu.Unlock()
-			select {
-			case <-wait:
-				continue
-			case <-ctx.Done():
-				return 0, ctx.Err()
-			case <-j.done:
-				continue
+		var wait <-chan struct{} = j.room
+		if j.pending < maxPending {
+			var seq uint64
+			var err error
+			if seq, wait, err = j.place(payload, sum, n); wait == nil {
+				j.mu.Unlock()
+				return seq, err
 			}
 		}
-		seq, err := j.place(payload, sum, n)
 		j.mu.Unlock()
-		return seq, err
+		select {
+		case <-wait:
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-j.done:
+		}
 	}
 }
 
@@ -413,17 +497,22 @@ func (j *Journal) sleep(ctx context.Context, d time.Duration) error {
 	}
 }
 
-// place assigns the next sequence to payload and queues its record. Caller holds mu.
-func (j *Journal) place(payload []byte, sum uint32, n int64) (uint64, error) {
+// place assigns the next sequence to payload and queues its record. When the
+// record needs a segment that is still being made it queues nothing and returns
+// a channel to wait on. Caller holds mu.
+func (j *Journal) place(payload []byte, sum uint32, n int64) (uint64, <-chan struct{}, error) {
 	if j.tail == nil || j.tail.end+n > j.tail.size {
-		if err := j.rotate(); err != nil {
-			return 0, err
+		if wait, err := j.rotate(); err != nil || wait != nil {
+			return 0, wait, err
 		}
 	}
 	t := j.tail
 	seq := j.next
-	ack := max(j.clock.Now().UnixNano(), j.ack)
-	j.ack = ack
+	now := j.clock.Now()
+	if now.Before(j.ack) {
+		now = j.ack
+	}
+	j.ack = now
 
 	header := t.first == 0
 	if header {
@@ -433,7 +522,7 @@ func (j *Journal) place(payload []byte, sum uint32, n int64) (uint64, error) {
 	if b == nil || b.slot != t || int64(cap(b.data)-len(b.data)) < n {
 		b = j.open(t, header, n)
 	}
-	b.data = appendRecord(b.data, t.seed, seq, ack, payload, sum)
+	b.data = appendRecord(b.data, t.seed, seq, now.UnixNano(), payload, sum)
 	b.last = seq
 	t.end += n
 	t.last = seq
@@ -444,15 +533,15 @@ func (j *Journal) place(payload []byte, sum uint32, n int64) (uint64, error) {
 	j.stats.Bytes += uint64(n)
 
 	fresh := j.head == len(j.spans) // nothing was unpublished
-	if fresh || ack-j.spans[len(j.spans)-1].ack >= quantum {
-		j.spans = append(j.spans, span{seq, ack, j.total})
+	if fresh || now.Sub(j.spans[len(j.spans)-1].ack) >= quantum {
+		j.spans = append(j.spans, span{seq, now, j.total})
 	}
 	j.total += uint64(n)
 	if fresh {
 		j.rearm()
 	}
 	j.kick(j.kickw)
-	return seq, nil
+	return seq, nil, nil
 }
 
 // open starts a batch for slot t. The first batch of a segment starts at its
@@ -462,58 +551,77 @@ func (j *Journal) open(t *slot, header bool, n int64) *batch {
 	size := int64(batchCap)
 	if header {
 		b.off = 0
-		size += headerSize
+		size += dataStart
 	}
 	if n > size {
-		size = n + headerSize
+		size = n + dataStart
 	}
 	b.data = getBuffer(int(size))
 	if header {
-		b.data = appendHeader(b.data, t.first, t.life)
-		j.pending += headerSize
+		j.markmu.Lock()
+		through, floor := t.through, t.floor
+		j.markmu.Unlock()
+		b.data = appendPreamble(b.data, t.first, t.life, j.lineage, through, floor)
+		j.pending += dataStart
 	}
 	j.queue = append(j.queue, b)
 	j.cur = b
 	return b
 }
 
-var buffers = sync.Pool{New: func() any { return make([]byte, 0, batchCap+headerSize) }}
+var buffers = sync.Pool{New: func() any { return make([]byte, 0, batchCap+dataStart) }}
 
 func getBuffer(size int) []byte {
-	if size <= batchCap+headerSize {
+	if size <= batchCap+dataStart {
 		return buffers.Get().([]byte)[:0]
 	}
 	return make([]byte, 0, size)
 }
 
 func putBuffer(b []byte) {
-	if cap(b) == batchCap+headerSize {
+	if cap(b) == batchCap+dataStart {
 		buffers.Put(b[:0]) //nolint:staticcheck // a slice header per pooled buffer is cheaper than a boxed pointer here
 	}
 }
 
-// rotate makes the spare segment the tail. Caller holds mu.
-func (j *Journal) rotate() error {
+// rotate makes the spare segment the tail. If the spare is still being made it
+// changes nothing and returns a channel to wait on; if making it failed, which
+// is a full disk more often than a broken one, the segment is given up and the
+// caller gets ErrFull, not a dead journal. Caller holds mu.
+func (j *Journal) rotate() (<-chan struct{}, error) {
 	if j.spare == nil {
 		j.refill()
 	}
 	s := j.spare
 	if s == nil {
-		return ErrFull
+		return nil, ErrFull
+	}
+	select {
+	case <-s.ready:
+	default:
+		return s.ready, nil
+	}
+	if s.err != nil {
+		j.spare = nil
+		j.nslots--
+		return nil, fmt.Errorf("%w: making a segment: %v", ErrFull, s.err)
 	}
 	j.spare = nil
 	var life [8]byte
 	if _, err := rand.Read(life[:]); err != nil {
-		return err
+		return nil, err
 	}
 	s.life = binary.LittleEndian.Uint64(life[:])
-	s.seed = seedOf(s.life)
-	s.first, s.last, s.end = 0, 0, headerSize
+	s.seed = seedOf(s.life, j.lineage)
+	s.first, s.last, s.end = 0, 0, dataStart
+	j.markmu.Lock()
+	s.through, s.floor, s.marks = j.synced, j.published, 0
+	j.markmu.Unlock()
 	j.tail = s
 	j.segs = append(j.segs, s)
-	j.held += headerSize
+	j.held += dataStart
 	j.refill()
-	return nil
+	return nil, nil
 }
 
 // refill makes sure a spare segment exists or is being created, if the
@@ -532,11 +640,12 @@ func (j *Journal) refill() {
 	}
 }
 
-// create starts a new segment file in the background. The writer waits for
-// ready before it writes there, so a segment being created never delays Append.
+// create starts a new segment file in the background. Append never waits for
+// it unless it needs the segment, and then only for as long as it takes.
 func (j *Journal) create() *slot {
 	s := &slot{id: j.nextID, size: j.segment, ready: make(chan struct{})}
 	s.name = slotName(s.id)
+	j.all = append(j.all, s)
 	j.nextID++
 	j.nslots++
 	j.wg.Add(1)
@@ -548,12 +657,29 @@ func (j *Journal) create() *slot {
 	return s
 }
 
+// writeMark records in s what the journal knew: through is durable, floor is
+// in the store. It writes nothing when s already says as much, and reports
+// whether it wrote.
+func (j *Journal) writeMark(s *slot, through, floor uint64) (bool, error) {
+	j.markmu.Lock()
+	defer j.markmu.Unlock()
+	through, floor = max(through, s.through), max(floor, s.floor)
+	if through == s.through && floor == s.floor {
+		return false, nil
+	}
+	s.through, s.floor = through, floor
+	s.marks++
+	m := appendMark(make([]byte, 0, markSize), s.seed, through, floor)
+	_, err := s.file.WriteAt(m, int64(headerSize)+int64(s.marks&1)*markSize)
+	return true, err
+}
+
 // Sync returns once the record with sequence seq, and every record before it,
 // is durable. Concurrent calls share one fsync. A call is released only by an
 // fsync that began after the record was written, never by an earlier one.
 func (j *Journal) Sync(ctx context.Context, seq uint64) error {
 	j.mu.Lock()
-	if seq <= j.durable() {
+	if seq <= j.synced {
 		j.mu.Unlock()
 		return nil
 	}
@@ -597,17 +723,18 @@ func (j *Journal) Sync(ctx context.Context, seq uint64) error {
 func (j *Journal) Marks() Marks {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	return Marks{Visible: j.next - 1, Durable: j.durable(), Published: j.published}
+	return Marks{Visible: j.next - 1, Durable: j.synced, Published: j.published}
 }
 
 // Publish records that the store holds every record up to seq. The call is
-// monotonic: a lower seq than before is ignored. It releases Sync calls the
-// store now satisfies and moves the Due deadline to the next record. The
-// space is recycled by Reclaim.
+// monotonic: a lower seq than before is ignored. seq must be durable: the
+// store never gets ahead of the journal's disk, which is what lets Open treat
+// the store's sequence as the truth. It moves the Due deadline to the next
+// record and does no I/O; the space is recycled by Reclaim.
 func (j *Journal) Publish(seq uint64) error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	if seq >= j.next {
+	if seq > j.synced {
 		return ErrAhead
 	}
 	if seq <= j.published {
@@ -616,7 +743,6 @@ func (j *Journal) Publish(seq uint64) error {
 	j.published = seq
 	j.trim()
 	j.rearm()
-	j.releaseLocked()
 	return nil
 }
 
@@ -637,9 +763,9 @@ func (j *Journal) trim() {
 
 // oldest is the acknowledgement time of the oldest unpublished record, rounded
 // down to the span it started. Caller holds mu.
-func (j *Journal) oldest() (int64, bool) {
+func (j *Journal) oldest() (time.Time, bool) {
 	if j.head == len(j.spans) {
-		return 0, false
+		return time.Time{}, false
 	}
 	return j.spans[j.head].ack, true
 }
@@ -647,11 +773,10 @@ func (j *Journal) oldest() (int64, bool) {
 // releaseLocked frees every waiter the durable watermark now covers and
 // returns how many it freed. Caller holds mu.
 func (j *Journal) releaseLocked() int {
-	d := j.durable()
 	kept := j.waiters[:0]
 	freed := 0
 	for _, w := range j.waiters {
-		if w.seq <= d {
+		if w.seq <= j.synced {
 			close(w.done)
 			freed++
 		} else {
@@ -669,7 +794,7 @@ func (j *Journal) State() State {
 	defer j.mu.Unlock()
 	s := State{Err: j.err}
 	if ack, ok := j.oldest(); ok {
-		s.Age = max(0, time.Duration(j.clock.Now().UnixNano()-ack))
+		s.Age = max(0, j.clock.Now().Sub(ack))
 		s.Backlog = int64(j.total - j.spans[j.head].cum)
 	}
 	fill := float64(j.held) / float64(int64(j.limit)*j.segment)
@@ -684,80 +809,9 @@ func (j *Journal) Stats() Stats {
 	return j.stats
 }
 
-// Due returns a channel that is closed when the oldest unpublished record has
-// been acknowledged for at least age. The age is the record's own: later writes
-// never reset it, and when Publish retires the oldest record the deadline moves
-// to the next one. If nothing is unpublished the deadline starts with the next
-// Append. The channel fires once; call Due again after publishing. It is also
-// closed when the journal closes or fails. It is driven by a timer set for the
-// exact deadline, not by polling.
-func (j *Journal) Due(age time.Duration) <-chan struct{} {
-	d := &due{age: age, ch: make(chan struct{})}
-	j.mu.Lock()
-	defer j.mu.Unlock()
-	if j.err != nil || j.closed {
-		close(d.ch)
-		return d.ch
-	}
-	j.dues = append(j.dues, d)
-	j.arm(d)
-	return d.ch
-}
-
-// rearm moves every pending deadline to the oldest unpublished record. Caller holds mu.
-func (j *Journal) rearm() {
-	if len(j.dues) == 0 {
-		return
-	}
-	for _, d := range append([]*due(nil), j.dues...) {
-		j.arm(d)
-	}
-}
-
-// arm sets d's timer for the oldest unpublished record's deadline, or fires d
-// if it has passed. Caller holds mu.
-func (j *Journal) arm(d *due) {
-	if d.fired {
-		return
-	}
-	d.gen++
-	if d.timer != nil {
-		d.timer.Stop()
-		d.timer = nil
-	}
-	ack, ok := j.oldest()
-	if !ok {
-		return
-	}
-	wait := time.Duration(ack + int64(d.age) - j.clock.Now().UnixNano())
-	if wait <= 0 {
-		j.fire(d)
-		return
-	}
-	gen := d.gen
-	d.timer = j.clock.AfterFunc(wait, func() {
-		j.mu.Lock()
-		defer j.mu.Unlock()
-		if d.gen == gen {
-			d.timer = nil
-			j.arm(d)
-		}
-	})
-}
-
-func (j *Journal) fire(d *due) {
-	d.fired = true
-	for i, x := range j.dues {
-		if x == d {
-			j.dues = append(j.dues[:i], j.dues[i+1:]...)
-			break
-		}
-	}
-	close(d.ch)
-}
-
-// Close makes everything appended durable, stops the journal and closes its
-// files. Records stay on disk for the next Open.
+// Close makes everything appended durable, writes the final mark, stops the
+// journal, closes its files and releases the directory. Records stay on disk
+// for the next Open. Close must not run while Reclaim or Replay is running.
 func (j *Journal) Close() error {
 	j.mu.Lock()
 	if j.closed {
@@ -772,14 +826,23 @@ func (j *Journal) Close() error {
 
 	j.mu.Lock()
 	err := j.err
-	j.finish()
-	for _, d := range j.dues {
-		close(d.ch)
-		if d.timer != nil {
-			d.timer.Stop()
+	last, through, floor := j.last, j.synced, j.published
+	j.mu.Unlock()
+	if err == nil && last != nil {
+		// The mark that proves everything appended is durable: without it the
+		// last group's records are indistinguishable from a torn tail.
+		if wrote, werr := j.writeMark(last, through, floor); werr != nil {
+			err = werr
+		} else if wrote {
+			err = last.file.Sync()
 		}
 	}
-	j.dues = nil
+
+	j.mu.Lock()
+	j.finish()
+	for _, d := range append([]*due(nil), j.dues...) {
+		j.fire(d)
+	}
 	for _, w := range j.waiters {
 		w.err = ErrClosed
 		close(w.done)
@@ -787,21 +850,30 @@ func (j *Journal) Close() error {
 	j.waiters = nil
 	j.broadcast()
 	j.mu.Unlock()
-	j.release()
+	if rerr := j.release(); err == nil {
+		err = rerr
+	}
 	return err
 }
 
-// release closes every file. Called once the goroutines have stopped.
-func (j *Journal) release() {
-	all := append(append([]*slot(nil), j.segs...), j.free...)
-	if j.spare != nil {
-		all = append(all, j.spare)
-	}
-	for _, s := range all {
+// release closes every file and the disk. Called once the goroutines have
+// stopped.
+func (j *Journal) release() error {
+	var first error
+	for _, s := range j.all {
 		if s.file != nil {
-			s.file.Close()
+			if err := s.file.Close(); err != nil && first == nil {
+				first = err
+			}
+			s.file = nil
 		}
 	}
+	if j.disk != nil {
+		if err := j.disk.Close(); err != nil && first == nil {
+			first = err
+		}
+	}
+	return first
 }
 
 // bucket is the histogram index for a group of n waiters.

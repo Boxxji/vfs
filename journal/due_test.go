@@ -28,7 +28,7 @@ func TestDueFiresAtTheDeadline(t *testing.T) {
 	j, clk := newDue(t)
 	defer j.Close()
 	mustAppend(t, j, []byte("a"))
-	due := j.Due(5 * time.Second)
+	due := j.Due(ctx, 5*time.Second)
 	clk.Advance(5*time.Second - time.Millisecond)
 	if fired(due) {
 		t.Fatal("fired 1 ms early")
@@ -44,7 +44,7 @@ func TestDueIsNotResetByLaterWrites(t *testing.T) {
 	j, clk := newDue(t)
 	defer j.Close()
 	mustAppend(t, j, []byte("old"))
-	due := j.Due(5 * time.Second)
+	due := j.Due(ctx, 5*time.Second)
 	for i := 0; i < 4; i++ {
 		clk.Advance(time.Second)
 		mustAppend(t, j, []byte("newer"))
@@ -65,11 +65,9 @@ func TestDueMovesWhenOldestIsPublished(t *testing.T) {
 	mustAppend(t, j, []byte("one"))
 	clk.Advance(3 * time.Second)
 	mustAppend(t, j, []byte("two"))
-	due := j.Due(5 * time.Second)
+	due := j.Due(ctx, 5*time.Second)
 	clk.Advance(time.Second)
-	if err := j.Publish(1); err != nil {
-		t.Fatal(err)
-	}
+	publish(t, j, 1)
 	clk.Advance(time.Second) // 5 s after one, 2 s after two
 	if fired(due) {
 		t.Fatal("fired for a record that was published")
@@ -89,7 +87,7 @@ func TestDueMovesWhenOldestIsPublished(t *testing.T) {
 func TestDueWaitsForTheNextWrite(t *testing.T) {
 	j, clk := newDue(t)
 	defer j.Close()
-	due := j.Due(5 * time.Second)
+	due := j.Due(ctx, 5*time.Second)
 	clk.Advance(time.Hour)
 	if fired(due) || clk.Pending() != 0 {
 		t.Fatalf("idle journal fired=%v with %d timers", fired(due), clk.Pending())
@@ -102,15 +100,19 @@ func TestDueWaitsForTheNextWrite(t *testing.T) {
 	if !fired(due) {
 		t.Fatal("did not fire 5 s after the write")
 	}
-	// Publishing everything leaves nothing to fire for.
-	due = j.Due(5 * time.Second)
+	// An overdue record fires again, but not at once: a publisher whose
+	// publication fails would otherwise spin on it. Retry apart.
+	due = j.Due(ctx, 5*time.Second)
+	if fired(due) {
+		t.Fatal("Due fired again within Retry of firing")
+	}
+	clk.Advance(100 * time.Millisecond)
 	if !fired(due) {
-		t.Fatal("a record 5 s old at the time of the call must fire at once")
+		t.Fatal("an overdue record must fire Retry after the last firing")
 	}
-	if err := j.Publish(1); err != nil {
-		t.Fatal(err)
-	}
-	due = j.Due(time.Second)
+	// Publishing everything leaves nothing to fire for.
+	publish(t, j, 1)
+	due = j.Due(ctx, time.Second)
 	clk.Advance(time.Hour)
 	if fired(due) {
 		t.Fatal("fired with nothing unpublished")
@@ -122,7 +124,7 @@ func TestDueUsesOneTimer(t *testing.T) {
 	clk := newClock()
 	j := open(t, journal.Options{Capacity: 1 << 20, Segment: 64 << 10, Disk: crash.New(), Clock: clk})
 	defer j.Close()
-	j.Due(5 * time.Second)
+	j.Due(ctx, 5*time.Second)
 	for i := 0; i < 1000; i++ {
 		mustAppend(t, j, []byte("x"))
 		clk.Advance(time.Millisecond)
@@ -134,12 +136,12 @@ func TestDueUsesOneTimer(t *testing.T) {
 
 func TestDueEndsWithTheJournal(t *testing.T) {
 	j, _ := newDue(t)
-	due := j.Due(5 * time.Second)
+	due := j.Due(ctx, 5*time.Second)
 	j.Close()
 	if !fired(due) {
 		t.Fatal("Close left a Due channel open")
 	}
-	if !fired(j.Due(time.Second)) {
+	if !fired(j.Due(ctx, time.Second)) {
 		t.Fatal("Due on a closed journal blocks")
 	}
 }
@@ -156,15 +158,13 @@ func TestBoundHoldsUnderContinuousWrites(t *testing.T) {
 
 	var worst time.Duration
 	step := 10 * time.Millisecond
-	due := j.Due(bound)
+	due := j.Due(ctx, bound)
 	publish := func() {
-		if err := j.Publish(j.Marks().Visible); err != nil {
-			t.Fatal(err)
-		}
+		publish(t, j, j.Marks().Visible)
 		if err := j.Reclaim(); err != nil {
 			t.Fatal(err)
 		}
-		due = j.Due(bound)
+		due = j.Due(ctx, bound)
 	}
 	for i := 0; i < 6000; i++ { // one minute
 		mustAppend(t, j, payload(uint64(i)))

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"runtime"
 	"sort"
 	"sync"
@@ -204,7 +205,7 @@ type parked struct {
 }
 
 func park(d *crash.Disk) *parked {
-	p := &parked{make(chan struct{}), make(chan struct{})}
+	p := &parked{make(chan struct{}, 64), make(chan struct{})}
 	d.Intercept(func(e crash.Event) error {
 		if e.Kind == "sync" {
 			p.entered <- struct{}{}
@@ -213,4 +214,32 @@ func park(d *crash.Disk) *parked {
 		return nil
 	})
 	return p
+}
+
+// publish tells the journal the store holds seq, as a publisher does once the
+// Head carries it. The record is made durable first: Publish refuses a record
+// no local sync has covered.
+func publish(t testing.TB, j *journal.Journal, seq uint64) {
+	t.Helper()
+	mustSync(t, j, seq)
+	if err := j.Publish(seq); err != nil {
+		t.Fatalf("Publish(%d): %v", seq, err)
+	}
+}
+
+// scratch is a directory for a test that needs the operating system's files.
+// It is made next to the tests, not in the temporary directory: that may be
+// memory (tmpfs), where the journal refuses to run.
+func scratch(t testing.TB) string {
+	t.Helper()
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir, err := os.MkdirTemp(wd, ".scratch-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	return dir
 }

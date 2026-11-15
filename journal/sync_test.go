@@ -97,30 +97,34 @@ func TestSyncGenerationOrder(t *testing.T) {
 	close(p.release)
 }
 
-// Publication satisfies Sync: the store holds the record, so waiting for the
-// local disk is pointless.
-func TestPublishReleasesSync(t *testing.T) {
+// The store never gets ahead of the disk: Publish refuses a record no sync has
+// covered. That is what lets Open treat the store's sequence as the truth, and
+// what keeps a Sync from being satisfied by a publication that did not wait
+// for the disk.
+func TestPublishRefusesWhatIsNotDurable(t *testing.T) {
 	d := crash.New()
 	p := park(d)
 	j := open(t, small(d, newClock(), 0))
 	a := mustAppend(t, j, []byte("a"))
 	done := make(chan error)
 	go func() { done <- j.Sync(ctx, a) }()
-	<-p.entered // the disk is stuck
-	if err := j.Publish(a); err != nil {
-		t.Fatal(err)
+	<-p.entered // the disk is stuck in the sync that covers a
+	if err := j.Publish(a); !errors.Is(err, journal.ErrAhead) {
+		t.Fatalf("Publish of a record no sync has covered: %v", err)
 	}
-	if err := <-done; err != nil {
-		t.Fatalf("Sync after Publish: %v", err)
-	}
-	if m := j.Marks(); m.Durable != a || m.Published != a || m.Visible != a {
-		t.Fatalf("marks %+v", m)
-	}
-	// A call for a published record never touches the disk.
-	if err := j.Sync(ctx, a); err != nil {
-		t.Fatal(err)
+	if m := j.Marks(); m.Published != 0 || m.Durable != 0 {
+		t.Fatalf("marks %+v after a refused Publish", m)
 	}
 	close(p.release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Publish(a); err != nil {
+		t.Fatalf("Publish after the sync: %v", err)
+	}
+	if m := j.Marks(); m != (journal.Marks{Visible: a, Durable: a, Published: a}) {
+		t.Fatalf("marks %+v", m)
+	}
 	j.Close()
 }
 
@@ -427,9 +431,7 @@ func TestWritebackStartsOverInARecycledSegment(t *testing.T) {
 		last = mustAppend(t, j, chunk)
 	}
 	mustSync(t, j, last)
-	if err := j.Publish(last); err != nil {
-		t.Fatal(err)
-	}
+	publish(t, j, last)
 	if err := j.Reclaim(); err != nil {
 		t.Fatal(err)
 	}

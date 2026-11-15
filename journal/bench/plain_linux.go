@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -129,4 +130,104 @@ func plainSequential(work string) {
 	durable := time.Since(start)
 	report("written", len(lat), bytes, written, append([]time.Duration(nil), lat...), 0, 0, "", "")
 	report("durable", len(lat), bytes, durable, lat, syncs, 0, "", fmt.Sprintf("every=%s syncs=%d", *every, syncs))
+}
+
+// groupSync is the loop a careful engineer writes by hand to get what the
+// journal's sync queue gives: writers append to one shared file, and one
+// fdatasync serves every writer whose write finished before it began. The first
+// writer to find no sync running becomes its leader.
+type groupSync struct {
+	f       *os.File
+	mu      sync.Mutex
+	cond    *sync.Cond
+	written uint64 // writes completed
+	synced  uint64 // writes covered by a completed fdatasync
+	syncing bool
+	calls   atomic.Int64
+}
+
+func newGroupSync(f *os.File) *groupSync {
+	g := &groupSync{f: f}
+	g.cond = sync.NewCond(&g.mu)
+	return g
+}
+
+// wait returns once an fdatasync that began after this writer's write has finished.
+func (g *groupSync) wait() {
+	g.mu.Lock()
+	g.written++
+	mine := g.written
+	for g.synced < mine {
+		if g.syncing {
+			g.cond.Wait()
+			continue
+		}
+		g.syncing = true
+		target := g.written
+		g.mu.Unlock()
+		check(fdatasync(g.f))
+		g.calls.Add(1)
+		g.mu.Lock()
+		g.synced = target
+		g.syncing = false
+		g.cond.Broadcast()
+	}
+	g.mu.Unlock()
+}
+
+// groupLatency is the plain baseline that does what the journal does for the
+// fsync callers and nothing else: no record framing, no replay, no watermarks,
+// no deadline, no backpressure. Every writer writes at its own offset of one
+// shared file, then waits for a shared fdatasync.
+func groupLatency(work string) {
+	const per = 16 << 20
+	f := zeroFile(filepath.Join(work, "group"), per*int64(*writers))
+	defer f.Close()
+	g := newGroupSync(f)
+	streams := make([]*os.File, *bulk)
+	for b := range streams {
+		streams[b] = zeroFile(filepath.Join(work, fmt.Sprintf("bulk%d", b)), 256<<20)
+		defer streams[b].Close()
+	}
+	buf := make([]byte, *size)
+	deadline := time.Now().Add(*dur)
+	lats := make([][]time.Duration, *writers)
+	var wg sync.WaitGroup
+	start := time.Now()
+	for w := 0; w < *writers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			base := int64(w) * per
+			var off int64
+			for time.Now().Before(deadline) {
+				t0 := time.Now()
+				_, err := f.WriteAt(buf, base+off)
+				check(err)
+				g.wait()
+				lats[w] = append(lats[w], time.Since(t0))
+				off = (off + int64(len(buf))) % (per - int64(len(buf)))
+			}
+		}(w)
+	}
+	for _, s := range streams {
+		wg.Add(1)
+		go func(f *os.File) {
+			defer wg.Done()
+			stream := make([]byte, 1<<20)
+			var off int64
+			for time.Now().Before(deadline) {
+				_, err := f.WriteAt(stream, off)
+				check(err)
+				off = (off + int64(len(stream))) % (256 << 20)
+			}
+		}(s)
+	}
+	wg.Wait()
+	elapsed := time.Since(start)
+	var all []time.Duration
+	for _, l := range lats {
+		all = append(all, l...)
+	}
+	report("pwrite+group fdatasync", len(all), int64(len(all))*int64(*size), elapsed, all, g.calls.Load(), int64(len(all)), "", "")
 }

@@ -1,6 +1,7 @@
 package journal_test
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math/rand"
@@ -101,7 +102,9 @@ func runModel(t *testing.T, seed int64, steps int) {
 			}
 			log = append(log, fmt.Sprintf("sync %d", seq))
 		case n < 75:
-			seq := m.published + uint64(rng.Intn(int(m.visible-m.published)+1))
+			// Publish takes what is durable, which can be more than the model
+			// knows: a Sync covers everything written, not only what it named.
+			seq := min(m.published+uint64(rng.Intn(int(m.visible-m.published)+1)), j.Marks().Durable)
 			if err := j.Publish(seq); err != nil {
 				fail("Publish(%d): %v", seq, err)
 			}
@@ -210,7 +213,7 @@ func TestConcurrentWriters(t *testing.T) {
 			name = "directory"
 		}
 		t.Run(name, func(t *testing.T) {
-			dir := t.TempDir()
+			dir := scratch(t)
 			opt := journal.Options{Capacity: 8 << 20, Segment: 256 << 10}
 			if !onDisk {
 				opt.Disk = crash.New()
@@ -232,20 +235,28 @@ func TestConcurrentWriters(t *testing.T) {
 			go func() { // publisher, woken by Due
 				defer pub.Done()
 				for {
-					select {
-					case <-j.Due(time.Millisecond):
-						m := j.Marks()
-						if m.Visible > m.Published {
-							if err := j.Publish(m.Published + (m.Visible-m.Published+1)/2); err != nil {
-								t.Error(err)
-								return
+					stopped := func() bool {
+						c, cancel := context.WithCancel(ctx) // another trigger may win: Due is then abandoned
+						defer cancel()
+						select {
+						case <-j.Due(c, time.Millisecond):
+							m := j.Marks()
+							if to := min(m.Published+(m.Visible-m.Published+1)/2, m.Durable); to > m.Published {
+								if err := j.Publish(to); err != nil {
+									t.Error(err)
+									return true
+								}
+								if err := j.Reclaim(); err != nil {
+									t.Error(err)
+									return true
+								}
 							}
-							if err := j.Reclaim(); err != nil {
-								t.Error(err)
-								return
-							}
+							return false
+						case <-stop:
+							return true
 						}
-					case <-stop:
+					}()
+					if stopped {
 						return
 					}
 				}

@@ -9,7 +9,7 @@ import (
 )
 
 func TestAppendSyncReplayReopen(t *testing.T) {
-	dir := t.TempDir()
+	dir := scratch(t)
 	j, err := journal.Open(dir, journal.Options{Capacity: 4 << 20, Segment: 1 << 20})
 	if err != nil {
 		t.Fatal(err)
@@ -61,9 +61,7 @@ func TestRotationReclaimAndNumbering(t *testing.T) {
 			mustSync(t, j, last)
 		}
 	}
-	if err := j.Publish(last - 10); err != nil {
-		t.Fatal(err)
-	}
+	publish(t, j, last-10)
 	if err := j.Reclaim(); err != nil {
 		t.Fatal(err)
 	}

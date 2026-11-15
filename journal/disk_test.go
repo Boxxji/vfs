@@ -12,7 +12,7 @@ import (
 // The operating system's Disk: a created file is whole (every byte written),
 // survives as one file, and can be written, read, synced and removed.
 func TestFilesDisk(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "nested", "journal")
+	dir := filepath.Join(scratch(t), "nested", "journal")
 	d, err := journal.Files(dir)
 	if err != nil {
 		t.Fatal(err)
@@ -70,7 +70,7 @@ func TestFilesDisk(t *testing.T) {
 
 // A leftover from a crash during Create is not a segment, and is removed.
 func TestFilesDiskRemovesLeftovers(t *testing.T) {
-	dir := t.TempDir()
+	dir := scratch(t)
 	if err := os.WriteFile(filepath.Join(dir, "000007.seg.tmp"), make([]byte, 100), 0o644); err != nil {
 		t.Fatal(err)
 	}
