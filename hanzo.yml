@@ -6,7 +6,7 @@
 # minutes, and what makes that possible is what each job has to compile: the SQLite
 # engine is a large build and only the gates that need it (`sqlite`) build it, the
 # race detector doubles a build and runs where there are goroutines, and the server
-# the real-server tests need is built in the two gates that run them.
+# the real-server tests need is built in the three gates that run them.
 #
 #   check            build, vet and gofmt of everything but the SQLite packages
 #   unit             the engine's unit tests (-short)
@@ -16,13 +16,13 @@
 #                    multiply the hashing and sealing they do tenfold
 #   sqlite           the packages that run a real SQLite engine on a Volume
 #   realserver       the engine and its store client against a real Hanzo S3 server
-#   realserver-fence the fence, a Volume on every store, and a writer killed at random
-#                    moments, against the real server
+#   realserver-fence the fence, and a Volume on every store, against the real server
+#   realserver-kill  a writer killed at random moments, against the real server
 #   scale-a/b        the measurements: 100,000 files, a million inodes, sync cost, the
 #                    object budget, a petabyte, amplification (-short skips them)
 #   fuzz             the model run over many more seeds
 #
-# realserver and realserver-fence fail if a test they exist for did not pass: a skip is
+# realserver, realserver-fence and realserver-kill fail if a test they exist for did not pass: a skip is
 # a failure there, never a pass. The real server is built from a pinned commit
 # (tools/ci/s3server.sh); tests find it as `s3` on PATH, and there is no environment
 # switch.
@@ -38,6 +38,44 @@
 # kernel (the commits, the interrupts, the context every read runs on) is tested by
 # calling its handlers, in the `race` gate.
 test:
+  - name: realserver
+    run: |
+      set -euo pipefail
+      bin=$(mktemp -d)
+      tools/ci/s3server.sh "$bin"
+      export PATH="$bin:$PATH"
+      log="$bin/realserver.log"
+      go test -count=1 -v -timeout 4m \
+        -run '^(TestRealServerConforms|TestRealServerRaceStress|TestRealServerMultipartIsConditional|TestPrefixConfinement|TestCommitRateOnRealServer|TestGetPairsBodyWithVersion|TestCancelledS3RequestsAreNotFaults|TestConditionalWriteAtTheSingleRequestBound)$' \
+        . ./pkg/backend/s3 | tee "$log"
+      for t in TestRealServerConforms TestRealServerRaceStress TestRealServerMultipartIsConditional \
+               TestPrefixConfinement TestCommitRateOnRealServer TestGetPairsBodyWithVersion \
+               TestCancelledS3RequestsAreNotFaults TestConditionalWriteAtTheSingleRequestBound; do
+        grep -q -- "--- PASS: $t " "$log" || { echo "did not pass against the real server: $t"; exit 1; }
+      done
+  - name: realserver-fence
+    run: |
+      set -euo pipefail
+      bin=$(mktemp -d)
+      tools/ci/s3server.sh "$bin"
+      export PATH="$bin:$PATH"
+      log="$bin/fence.log"
+      go test -count=1 -v -timeout 4m \
+        -run '^(TestRealServerCAS|TestSameRoundRace|TestFenceRefusesOlderRound|TestAttachNeedsAHigherRound|TestTakeoverLosesNoAcknowledgedCommit|TestRacingClaims|TestVolumeOnEveryStore)$' . | tee "$log"
+      for t in TestRealServerCAS \
+               TestSameRoundRace/hanzo-s3 TestFenceRefusesOlderRound/hanzo-s3 TestAttachNeedsAHigherRound/hanzo-s3 \
+               TestTakeoverLosesNoAcknowledgedCommit/hanzo-s3 TestRacingClaims/hanzo-s3 TestVolumeOnEveryStore/hanzo-s3; do
+        grep -q -- "--- PASS: $t " "$log" || { echo "did not pass against the real server: $t"; exit 1; }
+      done
+  - name: realserver-kill
+    run: |
+      set -euo pipefail
+      bin=$(mktemp -d)
+      tools/ci/s3server.sh "$bin"
+      export PATH="$bin:$PATH"
+      log="$bin/kill.log"
+      go test -count=1 -v -timeout 4m -run '^TestKillOverRealServer$' . | tee "$log"
+      grep -q -- '--- PASS: TestKillOverRealServer ' "$log" || { echo "TestKillOverRealServer did not pass"; exit 1; }
   - name: check
     run: |
       set -euo pipefail
@@ -63,35 +101,6 @@ test:
       go vet ./replica ./internal/sqlitecheck
       go vet -tags fuse ./internal/sqlitecheck
       go test -short -count=1 ./replica ./internal/sqlitecheck
-  - name: realserver
-    run: |
-      set -euo pipefail
-      bin=$(mktemp -d)
-      tools/ci/s3server.sh "$bin"
-      export PATH="$bin:$PATH"
-      log="$bin/realserver.log"
-      go test -count=1 -v -timeout 4m \
-        -run '^(TestRealServerConforms|TestRealServerRaceStress|TestRealServerMultipartIsConditional|TestPrefixConfinement|TestCommitRateOnRealServer|TestGetPairsBodyWithVersion|TestCancelledS3RequestsAreNotFaults|TestConditionalWriteAtTheSingleRequestBound)$' \
-        . ./pkg/backend/s3 | tee "$log"
-      for t in TestRealServerConforms TestRealServerRaceStress TestRealServerMultipartIsConditional \
-               TestPrefixConfinement TestCommitRateOnRealServer TestGetPairsBodyWithVersion \
-               TestCancelledS3RequestsAreNotFaults TestConditionalWriteAtTheSingleRequestBound; do
-        grep -q -- "--- PASS: $t " "$log" || { echo "did not pass against the real server: $t"; exit 1; }
-      done
-  - name: realserver-fence
-    run: |
-      set -euo pipefail
-      bin=$(mktemp -d)
-      tools/ci/s3server.sh "$bin"
-      export PATH="$bin:$PATH"
-      log="$bin/fence.log"
-      go test -count=1 -v -timeout 4m \
-        -run '^(TestRealServerCAS|TestSameRoundRace|TestFenceRefusesOlderRound|TestAttachNeedsAHigherRound|TestTakeoverLosesNoAcknowledgedCommit|TestRacingClaims|TestVolumeOnEveryStore|TestKillOverRealServer)$' . | tee "$log"
-      for t in TestRealServerCAS TestKillOverRealServer \
-               TestSameRoundRace/hanzo-s3 TestFenceRefusesOlderRound/hanzo-s3 TestAttachNeedsAHigherRound/hanzo-s3 \
-               TestTakeoverLosesNoAcknowledgedCommit/hanzo-s3 TestRacingClaims/hanzo-s3 TestVolumeOnEveryStore/hanzo-s3; do
-        grep -q -- "--- PASS: $t " "$log" || { echo "did not pass against the real server: $t"; exit 1; }
-      done
   - name: scale-a
     run: go test -count=1 -timeout 4m -run '^(TestHundredThousandFiles|TestMillionInodes|TestSyncCostDoesNotGrowWithTheTree|TestObjectBudget150GiB|TestMillionEntryDirectory|TestSequentialWriteMemory|TestSparsePetabyte)$' .
   - name: scale-b

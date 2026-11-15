@@ -12,4 +12,8 @@ src=$(mktemp -d)
 git clone --quiet --filter=blob:none https://github.com/hanzoai/s3 "$src"
 git -C "$src" checkout --quiet "$commit"
 mkdir -p "$out"
-(cd "$src" && CGO_ENABLED=0 go build -trimpath -o "$out/s3" ./s3)
+# No optimization and no inlining: a server for tests costs 210 CPU-seconds to build
+# from a cold cache that way and 310 the default way, and those seconds are the
+# minutes of every job that needs it.
+(cd "$src" && CGO_ENABLED=0 go build -trimpath -gcflags=all='-N -l' -ldflags='-s -w' -o "$out/s3" ./s3)
+echo "s3 server built in ${SECONDS}s"

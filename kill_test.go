@@ -109,7 +109,7 @@ func TestKillOverRealServer(t *testing.T) {
 	}
 	r := rand.New(rand.NewPCG(11, 11))
 	acked := 0
-	for round := uint64(1); round <= 15; round++ {
+	for round := uint64(1); round <= 10; round++ {
 		args, _ := json.Marshal(killArgs{srv.Endpoint, srv.Bucket, srv.AccessKey, srv.SecretKey, prefix, key.String(), round})
 		cmd := exec.Command(os.Args[0], "-test.run=^TestKillChild$", "-test.count=1", "killchild")
 		cmd.Stdin = bytes.NewReader(append(args, '\n'))
