@@ -52,7 +52,10 @@ var workflows = map[string]func(Params) (plan, error){
 				{"sleep", "2"},
 				{"git", "-C", w, "update-index", "-q", "--refresh"},
 			},
-			run:   []string{"git", "checkout", "--quiet", p.To},
+			// Git maps a pack in windows of 1 GiB, so a strace sees the whole pack
+			// mapped where a few pages are touched. A 1 MiB window leaves the
+			// pages touched alone and narrows what a mapping can be taken to mean.
+			run:   []string{"git", "-c", "core.packedGitWindowSize=1m", "checkout", "--quiet", p.To},
 			dir:   w,
 			evict: []string{w},
 			roots: map[string]string{"workspace": w, "objects": filepath.Join(p.Project, ".git")},
@@ -87,9 +90,12 @@ var workflows = map[string]func(Params) (plan, error){
 				{"mkdir", "-p", w},
 				{"sh", "-c", `tar -C "$1" --exclude=target --exclude=.git -cf - . | tar -C "$2" -xf -`, "sh", p.Project, w},
 			},
-			run:   []string{"cargo", "check", "--offline", "--locked", "--all-targets"},
-			dir:   w,
-			env:   []string{"CARGO_TARGET_DIR=" + t},
+			run: []string{"cargo", "check", "--offline", "--locked", "--all-targets"},
+			dir: w,
+			// An empty RUSTC_WRAPPER switches off a compile cache named in the
+			// user's cargo configuration: a cache would answer the build from
+			// elsewhere, and its daemon outlives the command being traced.
+			env:   []string{"CARGO_TARGET_DIR=" + t, "RUSTC_WRAPPER="},
 			evict: []string{w, rustRoot()},
 			roots: map[string]string{"workspace": w, "cache": cargoRoot(), "toolchain": rustRoot(), "build": t},
 		}, nil
@@ -110,7 +116,7 @@ var workflows = map[string]func(Params) (plan, error){
 			dir:   w,
 			env:   []string{"UV_CACHE_DIR=" + c, "UV_PYTHON_DOWNLOADS=never", "UV_PYTHON_PREFERENCE=only-managed"},
 			evict: []string{w, c},
-			roots: map[string]string{"workspace": w, "cache": c},
+			roots: map[string]string{"workspace": w, "cache": c, "toolchain": filepath.Join(os.Getenv("HOME"), ".local", "share", "uv", "python")},
 		}, nil
 	},
 	"ripgrep": func(p Params) (plan, error) {
@@ -142,7 +148,7 @@ rm files.list`
 			dir:   w,
 			env:   []string{"GOCACHE=" + g, "GOFLAGS=-mod=readonly", "GOPROXY=off", "GOTMPDIR=" + filepath.Join(p.State, "tmp")},
 			evict: []string{w, goRoot()},
-			roots: map[string]string{"workspace": w, "toolchain": goRoot(), "cache": modRoot(), "build": g},
+			roots: map[string]string{"workspace": w, "objects": filepath.Join(p.Project, ".git"), "toolchain": goRoot(), "cache": modRoot(), "build": g},
 		}, nil
 	},
 }

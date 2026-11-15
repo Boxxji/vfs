@@ -235,11 +235,59 @@ func TestReadEntriesAreNotFetchedAgain(t *testing.T) {
 func TestPrefetchUsesTheSlotThatFreesFirst(t *testing.T) {
 	s := newsim(Config{Cache: 1 << 20, Fetch: 10, Conc: 2}, big)
 	s.slots = []int64{50, 0}
-	s.issue(ext{1, 1}, 0)
+	s.issue(0, ext{1, 1})
 	if n := s.cache.m[1]; n == nil || n.ready != 10 {
 		t.Errorf("%+v", n)
 	}
 	if s.freeAt() != 10 {
 		t.Errorf("free at %d, want 10", s.freeAt())
+	}
+}
+
+func TestLinkCarriesOneTransferAtATime(t *testing.T) {
+	s := newsim(Config{Cache: 1 << 40, Fetch: 10, Conc: 4, Rate: 1e9}, big) // 1 byte per ns
+	s.issue(0, ext{1, 100})
+	s.issue(0, ext{2, 100})
+	s.issue(0, ext{3, 5})
+	// each fetch takes the latency of 10 ns at least; the link carries 100 bytes in 100 ns, one after another
+	if a, b, c := s.cache.m[1].ready, s.cache.m[2].ready, s.cache.m[3].ready; a != 100 || b != 200 || c != 205 {
+		t.Errorf("ready at %d %d %d, want 100 200 205", a, b, c)
+	}
+}
+
+func TestDemandGoesAheadOfPrefetchAndDelaysIt(t *testing.T) {
+	s := newsim(Config{Cache: 1 << 40, Fetch: 10, Conc: 4, Rate: 1e9}, big)
+	s.issue(0, ext{1, 100}) // link busy until 100
+	if got := s.demand(50, 20); got != 50+20 {
+		t.Errorf("demand ready %d, want 70: it does not wait for the queue", got)
+	}
+	s.issue(0, ext{2, 10}) // the demand's 20 bytes pushed the link to 120
+	if got := s.cache.m[2].ready; got != 130 {
+		t.Errorf("prefetch ready %d, want 130", got)
+	}
+}
+
+func TestMergedEntriesShareOneRequest(t *testing.T) {
+	order := []ext{{1, 100}, {2, 100}, {3, 100}, {4, 100}}
+	// one slot, 50 ns per request: unmerged, entry 4 arrives at 200; merged by 200 bytes, at 100
+	one := simulate([]Req{{T: 1e6, Ext: []ext{{4, 100}}}}, big, Config{Cache: 1 << 30, Fetch: 50, Conc: 1, Order: order, Hold: unread})
+	two := simulate([]Req{{T: 1e6, Ext: []ext{{4, 100}}}}, big, Config{Cache: 1 << 30, Fetch: 50, Conc: 1, Order: order, Hold: unread, Merge: 200})
+	if one.Hit != 1 || two.Hit != 1 {
+		t.Fatalf("%+v %+v", one, two)
+	}
+	s1 := newsim(Config{Cache: 1 << 30, Fetch: 50, Conc: 1, Order: order, Hold: unread}, big)
+	s2 := newsim(Config{Cache: 1 << 30, Fetch: 50, Conc: 1, Order: order, Hold: unread, Merge: 200}, big)
+	s1.pump(1e6, 0)
+	s2.pump(1e6, 0)
+	if s1.cache.m[4].ready != 200 || s2.cache.m[4].ready != 100 || s2.cache.m[3].ready != 100 {
+		t.Errorf("ready %d, %d and %d", s1.cache.m[4].ready, s2.cache.m[4].ready, s2.cache.m[3].ready)
+	}
+}
+
+func TestAMissWaitsForItsBytes(t *testing.T) {
+	// 100 MB over a 1 GB/s link: 100 ms, far more than the 10 ms latency
+	r := simulate([]Req{{T: 0, Ext: []ext{{1, 100e6}}}}, big, Config{Cache: 1 << 40, Fetch: 10e6, Rate: 1e9})
+	if r.Stall != 100e6 {
+		t.Errorf("stall %d ns, want 100 ms", r.Stall)
 	}
 }

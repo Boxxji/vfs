@@ -12,6 +12,7 @@ type policy struct {
 	cache int64
 	ahead bool
 	trace string // "", "same" (run 1 of the project) or "other" (run 1 of the other project)
+	merge int64  // trace entries adjacent in the trace go in one request up to this many bytes
 	node  bool   // run 1 ran on the same node just before
 	base  bool   // the base-image warm set is preloaded
 }
@@ -25,6 +26,7 @@ var policies = []policy{
 	{name: "LRU 512 MiB + trace prefetch", cache: 512 << 20, trace: "same"},
 	{name: "LRU 4 GiB + trace prefetch", cache: 4 << 30, trace: "same"},
 	{name: "LRU 4 GiB + read-ahead + trace prefetch", cache: 4 << 30, ahead: true, trace: "same"},
+	{name: "LRU 4 GiB + trace prefetch, merged 4 MiB", cache: 4 << 30, trace: "same", merge: 4 << 20},
 	{name: "LRU 4 GiB + trace of the other project", cache: 4 << 30, trace: "other"},
 	{name: "LRU 4 GiB + base warm set", cache: 4 << 30, base: true},
 	{name: "same node, LRU 64 MiB", cache: 64 << 20, node: true},
@@ -79,9 +81,20 @@ func extents(c cover, r *Run, sh uint, keep func(file int32) bool) []ext {
 	return out
 }
 
+// setting is how a simulation is configured.
+type setting struct {
+	pc   int64 // guest page cache bytes
+	sh   uint  // log2 extent size
+	conc int   // prefetches in flight
+	hold int64 // unread bytes trace prefetch may hold
+	maps bool  // count mapped and executed ranges as reads
+	rate int64 // link bytes per second
+}
+
 // evaluate runs the named policies (all when none are named) for run 2
 // of each project of a workflow.
-func evaluate(d *Dataset, wf string, pc int64, sh uint, conc int, hold int64, only ...string) map[string]*Outcome {
+func evaluate(d *Dataset, wf string, v setting, only ...string) map[string]*Outcome {
+	pc, sh, conc, hold, maps := v.pc, v.sh, v.conc, v.hold, v.maps
 	labels, by := projects(d.Runs[wf])
 	out := map[string]*Outcome{}
 	var run []policy
@@ -96,16 +109,16 @@ func evaluate(d *Dataset, wf string, pc int64, sh uint, conc int, hold int64, on
 			continue
 		}
 		a, b := by[l][0], by[l][1]
-		sa, sb := requests(a, pc, sh, true), requests(b, pc, sh, true)
+		sa, sb := requests(a, pc, sh, maps), requests(b, pc, sh, maps)
 		size := func(f int32) int64 { return b.Sizes[f] }
-		useful := b.coverage(true).align(12).size()
+		useful := b.coverage(maps).align(12).size()
 		same := order(sa)
 		var other []ext
 		var warm []ext
 		if len(labels) > 1 {
 			o := by[labels[(i+1)%len(labels)]][0]
-			other = order(requests(o, pc, sh, true))
-			u := reuse(o, b, true)
+			other = order(requests(o, pc, sh, maps))
+			u := reuse(o, b, maps)
 			warm = extents(u.Shared, b, sh, func(f int32) bool {
 				c := b.Class[f]
 				return c == "toolchain" || c == "system" || c == "cache"
@@ -114,7 +127,7 @@ func evaluate(d *Dataset, wf string, pc int64, sh uint, conc int, hold int64, on
 		for _, p := range run {
 			var rs [len(fetches)]Result
 			for k, c := range fetches {
-				cfg := Config{Cache: p.cache, Fetch: c, Conc: conc, Ahead: p.ahead, Shift: sh, Hold: hold}
+				cfg := Config{Cache: p.cache, Fetch: c, Conc: conc, Ahead: p.ahead, Shift: sh, Hold: hold, Rate: v.rate, Merge: p.merge}
 				switch p.trace {
 				case "same":
 					cfg.Order = same
@@ -140,7 +153,7 @@ func evaluate(d *Dataset, wf string, pc int64, sh uint, conc int, hold int64, on
 func simulations(d *Dataset, wfs []string) map[string]map[string]*Outcome {
 	out := map[string]map[string]*Outcome{}
 	for _, wf := range wfs {
-		out[wf] = evaluate(d, wf, pagecache, shift, conc, unread)
+		out[wf] = evaluate(d, wf, setting{pagecache, shift, conc, unread, true, rate})
 	}
 	return out
 }
@@ -170,18 +183,32 @@ func simTables(w io.Writer, d *Dataset, wfs []string, sims map[string]map[string
 	fmt.Fprintf(w, "### Sensitivity (LRU 4 GiB + trace prefetch, 5 ms fetch)\n\n")
 	rows = nil
 	for _, wf := range wfs {
-		for _, v := range []struct {
-			pc   int64
-			sh   uint
-			conc int
-			hold int64
-		}{{pagecache, 18, conc, unread}, {pagecache, 20, conc, unread}, {pagecache, 22, conc, unread}, {0, 20, conc, unread}, {4 << 30, 20, conc, unread},
-			{pagecache, 20, 16, unread}, {pagecache, 20, 256, unread}, {pagecache, 20, conc, 64 << 20}, {pagecache, 20, conc, 1 << 30}} {
-			o := evaluate(d, wf, v.pc, v.sh, v.conc, v.hold, "LRU 4 GiB + trace prefetch")["LRU 4 GiB + trace prefetch"]
+		for _, v := range []setting{
+			{pagecache, 18, conc, unread, true, rate}, {pagecache, 20, conc, unread, true, rate}, {pagecache, 22, conc, unread, true, rate},
+			{0, 20, conc, unread, true, rate}, {4 << 30, 20, conc, unread, true, rate},
+			{pagecache, 20, 16, unread, true, rate}, {pagecache, 20, 256, unread, true, rate},
+			{pagecache, 20, conc, 64 << 20, true, rate}, {pagecache, 20, conc, 1 << 30, true, rate},
+			{pagecache, 20, conc, unread, false, rate},
+			{pagecache, 20, conc, unread, true, 250e6}, {pagecache, 20, conc, unread, true, 3e9}, {pagecache, 20, conc, unread, true, 0}} {
+			o := evaluate(d, wf, v, "LRU 4 GiB + trace prefetch")["LRU 4 GiB + trace prefetch"]
 			r := o.res[1]
-			rows = append(rows, []string{wf, fmt.Sprintf("%d KiB", 1<<v.sh>>10), fmt.Sprintf("%d MiB", v.pc>>20), fmt.Sprint(v.conc), fmt.Sprintf("%d MiB", v.hold>>20), fmt.Sprint(r.Reqs),
+			rows = append(rows, []string{wf, fmt.Sprintf("%d KiB", 1<<v.sh>>10), fmt.Sprintf("%d MiB", v.pc>>20), fmt.Sprint(v.conc), fmt.Sprintf("%d MiB", v.hold>>20), view(v.maps), rateString(v.rate), fmt.Sprint(r.Reqs),
 				pct(r.Hit, r.Lookups), pct(r.Late, r.Lookups), pct(r.Miss, r.Lookups), mib(r.Fetched), fmt.Sprintf("%.2f", float64(r.Fetched)/float64(max(o.useful, 1))), secs(r.Stall)})
 		}
 	}
-	tabulate(w, []string{"workflow", "extent", "page cache", "prefetches in flight", "unread bytes held", "reads to engine (n)", "hit %", "late %", "miss %", "fetched MiB", "amplification", "stall s"}, rows)
+	tabulate(w, []string{"workflow", "extent", "page cache", "prefetches in flight", "unread bytes held", "ranges", "link", "reads to engine (n)", "hit %", "late %", "miss %", "fetched MiB", "amplification", "stall s"}, rows)
+}
+
+func view(maps bool) string {
+	if maps {
+		return "reads+maps"
+	}
+	return "reads"
+}
+
+func rateString(r int64) string {
+	if r == 0 {
+		return "unlimited"
+	}
+	return fmt.Sprintf("%d MB/s", r/1e6)
 }

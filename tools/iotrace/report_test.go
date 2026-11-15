@@ -46,7 +46,7 @@ func synthetic(t *testing.T) string {
 			}
 			write("events.tsv", func(f *os.File) error { return writeEvents(f, "wf", run, events) })
 			write("sizes.tsv", func(f *os.File) error { return writeSizes(f, "wf", run, sizes) })
-			b, _ := json.Marshal(Manifest{Workflow: "wf", Project: label, Run: run, Wall: 21e9, Plain: 20e9, Warm: 5e9, Events: len(events),
+			b, _ := json.Marshal(Manifest{Workflow: "wf", Project: label, Run: run, Wall: 21e9, Plain: 20e9, Warm: 5e9, Colds: []int64{19e9, 20e9, 22e9}, Warms: []int64{5e9}, Events: len(events),
 				Roots: map[string]string{"workspace": ws, "toolchain": "/tc"}})
 			if err := os.WriteFile(filepath.Join(out, "manifest.json"), b, 0o644); err != nil {
 				t.Fatal(err)
@@ -107,7 +107,7 @@ func TestReportOnASyntheticDataset(t *testing.T) {
 		t.Errorf("base warm set did not hit %v", c)
 	}
 	// time: the disk costs 15 of the 20 cold seconds
-	if c := row("| wf | a | 20 |"); c[7] != "75.0" {
+	if c := row("| wf | a | 20 |"); c[7] != "75.0" || c[4] != "20.00 (19.00-22.00)" || c[5] != "5.00 (5.00-5.00)" {
 		t.Errorf("disk share %v", c)
 	}
 }

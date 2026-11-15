@@ -143,6 +143,8 @@ type Config struct {
 	Ahead bool  // sequential read-ahead
 	Order []ext // ordered extents the previous run touched, for trace prefetch
 	Hold  int64 // trace prefetch stops while this many fetched bytes are unread
+	Rate  int64 // bytes per second the link to the store carries; 0 for unlimited
+	Merge int64 // trace prefetch fetches entries adjacent in the trace as one request up to this many bytes; 0 for one entry per request
 	Warm  []ext // extents present before the run starts
 	Shift uint
 }
@@ -181,6 +183,7 @@ type sim struct {
 	res    Result
 	unused int64 // bytes prefetched and not yet read
 
+	link  int64 // when the link to the store is free
 	order []ext
 	pos   map[uint64]int
 	done  []bool // entries of order the run has read
@@ -210,10 +213,45 @@ func newsim(cfg Config, size func(int32) int64) *sim {
 	return s
 }
 
-// issue starts a prefetch of e on the slot that frees first, no earlier
-// than from. An extent already cached or in flight is left alone.
-func (s *sim) issue(e ext, from int64) {
-	if s.cache.cap == 0 || s.cache.m[e.key] != nil {
+// xfer is the time the link needs to carry n bytes.
+func (s *sim) xfer(n int64) int64 {
+	if s.cfg.Rate == 0 {
+		return 0
+	}
+	return n * 1e9 / s.cfg.Rate
+}
+
+// transfer starts a request at start for n bytes and returns when they
+// have arrived: not before one fetch latency, and not before the link,
+// shared by every request, has carried them.
+func (s *sim) transfer(start, n int64) int64 {
+	s.link = max(s.link, start) + s.xfer(n)
+	return max(start+s.cfg.Fetch, s.link)
+}
+
+// demand fetches n bytes for a read waiting now. It goes ahead of queued
+// prefetches, which it delays by the time it takes on the link.
+func (s *sim) demand(now, n int64) int64 {
+	s.link = max(s.link, now) + s.xfer(n)
+	return now + max(s.cfg.Fetch, s.xfer(n))
+}
+
+// issue starts a prefetch of the extents, as one request, on the slot
+// that frees first, no earlier than from. Extents already cached or in
+// flight are left out.
+func (s *sim) issue(from int64, es ...ext) {
+	if s.cache.cap == 0 {
+		return
+	}
+	var todo []ext
+	var n int64
+	for _, e := range es {
+		if s.cache.m[e.key] == nil {
+			todo = append(todo, e)
+			n += e.bytes
+		}
+	}
+	if len(todo) == 0 {
 		return
 	}
 	i := 0
@@ -222,11 +260,13 @@ func (s *sim) issue(e ext, from int64) {
 			i = j
 		}
 	}
-	start := max(s.slots[i], from)
-	s.slots[i] = start + s.cfg.Fetch
-	s.cache.put(&node{key: e.key, size: e.bytes, ready: s.slots[i], prefetched: true})
-	s.res.Fetched += e.bytes
-	s.unused += e.bytes
+	ready := s.transfer(max(s.slots[i], from), n)
+	s.slots[i] = ready
+	for _, e := range todo {
+		s.cache.put(&node{key: e.key, size: e.bytes, ready: ready, prefetched: true})
+	}
+	s.res.Fetched += n
+	s.unused += n
 }
 
 // freeAt is when the first prefetch slot is free.
@@ -251,11 +291,20 @@ func (s *sim) pump(now, from int64) {
 		if start > now {
 			return
 		}
-		i := s.next
-		s.next++
-		if !s.done[i] {
-			s.issue(s.order[i], from)
+		var batch []ext
+		var n int64
+		for s.next < len(s.order) && (len(batch) == 0 || n+s.order[s.next].bytes <= s.cfg.Merge) {
+			i := s.next
+			s.next++
+			if !s.done[i] {
+				batch = append(batch, s.order[i])
+				n += s.order[i].bytes
+			}
+			if s.cfg.Merge == 0 && len(batch) > 0 {
+				break
+			}
 		}
+		s.issue(from, batch...)
 	}
 }
 
@@ -273,8 +322,9 @@ func (s *sim) run(reqs []Req) Result {
 			case s.cache.cap == 0 || n == nil:
 				s.res.Miss++
 				s.res.Fetched += e.bytes
-				wait = max(wait, s.cfg.Fetch)
-				s.cache.put(&node{key: e.key, size: e.bytes, ready: q.T + s.cfg.Fetch, used: true})
+				ready := s.demand(q.T, e.bytes)
+				wait = max(wait, ready-q.T)
+				s.cache.put(&node{key: e.key, size: e.bytes, ready: ready, used: true})
 			case n.ready <= q.T:
 				s.res.Hit++
 			default:
@@ -348,7 +398,7 @@ func (s *sim) readahead(e ext, now int64) {
 		if fs > 0 && start+n > fs {
 			n = fs - start
 		}
-		s.issue(ext{uint64(file)<<32 | uint64(idx+k), n}, now)
+		s.issue(now, ext{uint64(file)<<32 | uint64(idx+k), n})
 	}
 }
 
@@ -380,6 +430,7 @@ func follow(prior, reqs []Req, size func(int32) int64, cfg Config) Result {
 	s.run(prior)
 	s.res = Result{}
 	s.slots = make([]int64, len(s.slots))
+	s.link = 0
 	for n := s.cache.head; n != nil; n = n.next {
 		n.ready, n.used, n.prefetched = 0, false, false
 	}

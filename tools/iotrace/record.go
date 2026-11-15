@@ -35,6 +35,8 @@ type Manifest struct {
 	Wall     int64             `json:"wall_ns"`  // traced
 	Plain    int64             `json:"plain_ns"` // untraced, cold page cache, 0 if not measured
 	Warm     int64             `json:"warm_ns"`  // untraced, page cache warm from the run before
+	Colds    []int64           `json:"colds_ns"` // every cold timing behind Plain
+	Warms    []int64           `json:"warms_ns"` // every warm timing behind Warm
 	Exit     int               `json:"exit"`
 	Load     [2]string         `json:"load"` // /proc/loadavg before and after
 	Events   int               `json:"events"`

@@ -260,7 +260,11 @@ func (t *tracker) call(c call) {
 			return
 		}
 		if _, ap := fdpath(arg(c, 4)); ap != "" {
-			t.emit(c, opMap, ap, num(arg(c, 5)), num(arg(c, 1)), "")
+			op := opMap
+			if strings.Contains(arg(c, 2), "PROT_WRITE") && strings.Contains(arg(c, 3), "MAP_SHARED") {
+				op = opWrite // the program stores through it: the bytes are its own
+			}
+			t.emit(c, op, ap, num(arg(c, 5)), num(arg(c, 1)), "")
 		}
 	case "execve", "execveat":
 		dirarg, patharg := "AT_FDCWD", arg(c, 0)

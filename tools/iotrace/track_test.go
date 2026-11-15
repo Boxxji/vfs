@@ -172,6 +172,17 @@ func TestMapListAndWrite(t *testing.T) {
 	expect(t, "trunc", summary(ev, opTrunc), []string{"/w/out@0+0"})
 }
 
+func TestSharedWritableMappingIsAWrite(t *testing.T) {
+	ev, _ := fixture(t, "/w",
+		`10 100.000001 openat(AT_FDCWD</w>, "counters", O_RDWR|O_CREAT, 0666) = 3</w/counters> <0.000010>`,
+		`10 100.000002 mmap(NULL, 16384, PROT_READ|PROT_WRITE, MAP_SHARED, 3</w/counters>, 0) = 0xffff0000 <0.000010>`,
+		`10 100.000003 mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_PRIVATE, 3</w/counters>, 0) = 0xffff1000 <0.000010>`,
+		`10 100.000004 mmap(NULL, 4096, PROT_READ, MAP_SHARED, 3</w/counters>, 0) = 0xffff2000 <0.000010>`,
+	)
+	expect(t, "write", summary(ev, opWrite), []string{"/w/counters@0+16384"})
+	expect(t, "map", summary(ev, opMap), []string{"/w/counters@0+4096", "/w/counters@0+4096"})
+}
+
 func TestCopyFileRangeAndSendfile(t *testing.T) {
 	ev, _ := fixture(t, "/w",
 		`10 100.000001 openat(AT_FDCWD</w>, "src", O_RDONLY) = 3</w/src> <0.000010>`,

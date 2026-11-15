@@ -97,7 +97,7 @@ func run(name, label string, p Params, data string, runs, plain int, keep bool) 
 		if err := json.Unmarshal(b, &m); err != nil {
 			return err
 		}
-		m.Plain, m.Warm = median(cold), median(warm)
+		m.Plain, m.Warm, m.Colds, m.Warms = median(cold), median(warm), cold, warm
 		if b, err = json.MarshalIndent(m, "", "  "); err != nil {
 			return err
 		}

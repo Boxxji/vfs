@@ -12,6 +12,7 @@ const (
 	pagecache = 1 << 30 // guest page cache in front of the engine
 	shift     = 20      // 1 MiB extents
 	conc      = 64      // prefetch fetches in flight
+	rate      = 750e6   // bytes per second one client moves to or from the store
 )
 
 var fetches = [...]int64{1e6, 5e6, 20e6} // ns to fetch a cold extent
@@ -106,6 +107,8 @@ func report(w io.Writer, dir string) error {
 		}
 	}
 	tabulate(w, []string{"workflow", "project", "view", "files (n)", "files %", "pages (n)", "pages %", "1 MiB extents (n)", "1 MiB %", "4 MiB extents (n)", "4 MiB %", "run 1 pages used by run 2 %", "paths touched (n)", "paths %"}, rows)
+
+	unseenTable(w, d, wfs)
 
 	fmt.Fprint(w, "### Order: first K distinct 1 MiB extents of run 1 against run 2 (reach % / same-prefix %)\n\n")
 	tabulate(w, []string{"workflow", "project", "K=10", "K=100", "K=1000", "K=10000", "run 2 transitions also in run 1 %", "transitions (n)"}, orders)
@@ -242,20 +245,20 @@ func waitTable(w io.Writer, d *Dataset, wfs []string) {
 		labels, by := projects(d.Runs[wf])
 		for _, l := range labels {
 			r := by[l][len(by[l])-1]
-			rows = append(rows, []string{wf, l, fmt.Sprint(r.Calls), secs(r.M.Wall), secs(r.M.Plain), secs(r.M.Warm),
+			rows = append(rows, []string{wf, l, fmt.Sprint(r.Calls), secs(r.M.Wall), spread(r.M.Colds, r.M.Plain), spread(r.M.Warms, r.M.Warm),
 				secs(r.M.Plain - r.M.Warm), pct(r.M.Plain-r.M.Warm, r.M.Plain), secs(r.ReadWait), secs(r.ReadUnion), secs(r.MetaWait)})
 		}
 	}
-	tabulate(w, []string{"workflow", "project", "read calls (n)", "traced s", "cold s", "warm s", "cold - warm s", "% of cold wall", "strace read wait s (thread-seconds)", "strace any thread reading s", "strace open/stat/list wait s"}, rows)
+	tabulate(w, []string{"workflow", "project", "read calls (n)", "traced s", "cold s median (min-max)", "warm s median (min-max)", "cold - warm s", "% of cold wall", "strace read wait s (thread-seconds)", "strace any thread reading s", "strace open/stat/list wait s"}, rows)
 }
 
 // summaryTable puts the headline of each workflow in one row.
 func summaryTable(w io.Writer, d *Dataset, wfs []string, sims map[string]map[string]*Outcome) {
-	fmt.Fprintf(w, "### Summary (run 2 against run 1; 5 ms per cold 1 MiB extent; stall is the busiest thread's wait, then the sum over threads)\n\n")
+	fmt.Fprintf(w, "### Summary (run 2 against run 1; 5 ms per cold 1 MiB extent; stall is the time reads waited, summed over threads / the busiest thread's own)\n\n")
 	var rows [][]string
 	for _, wf := range wfs {
 		labels, by := projects(d.Runs[wf])
-		var set, pages, shared, plain, warm int64
+		var set, setr, pages, shared, plain, warm, n int64
 		for _, l := range labels {
 			if len(by[l]) < 2 {
 				continue
@@ -263,7 +266,10 @@ func summaryTable(w io.Writer, d *Dataset, wfs []string, sims map[string]map[str
 			p := predict(by[l][0], by[l][1], true)
 			pages += p.PagesB
 			shared += p.PagesShared
-			set += workingset(by[l][1]).Mapped
+			n++
+			ws := workingset(by[l][1])
+			set += ws.Mapped
+			setr += ws.Read
 			plain += by[l][1].M.Plain
 			warm += by[l][1].M.Warm
 		}
@@ -271,11 +277,51 @@ func summaryTable(w io.Writer, d *Dataset, wfs []string, sims map[string]map[str
 		if none == nil || none.res[1].Lookups == 0 {
 			continue
 		}
-		st := func(o *Outcome) string { return secs(o.res[1].StallMax) + " / " + secs(o.res[1].Stall) }
-		rows = append(rows, []string{wf, mib(set), pct(shared, pages), pct(lru.res[1].Hit, lru.res[1].Lookups),
+		st := func(o *Outcome) string { return secs(o.res[1].Stall) + " / " + secs(o.res[1].StallMax) }
+		rows = append(rows, []string{wf, mib(setr/max(n, 1)) + " / " + mib(set/max(n, 1)), pct(shared, pages), pct(lru.res[1].Hit, lru.res[1].Lookups),
 			pct(trace.res[1].Hit, trace.res[1].Lookups), pct(node.res[1].Hit, node.res[1].Lookups),
 			st(none), st(trace), pct(plain-warm, plain)})
 	}
-	tabulate(w, []string{"workflow", "working set MiB", "run 2 pages already read by run 1 %", "cold node LRU hit %", "trace prefetch hit %", "same node 512 MiB hit %",
+	tabulate(w, []string{"workflow", "working set MiB per project, reads / with maps", "run 2 pages already read by run 1 %", "cold node LRU hit %", "trace prefetch hit %", "same node 512 MiB hit %",
 		"stall s, no cache", "stall s, trace prefetch", "disk share of cold wall %"}, rows)
+}
+
+// spread formats a median with the range of the timings behind it.
+func spread(all []int64, med int64) string {
+	if len(all) == 0 {
+		return secs(med)
+	}
+	lo, hi := all[0], all[0]
+	for _, v := range all {
+		lo, hi = min(lo, v), max(hi, v)
+	}
+	return fmt.Sprintf("%s (%s-%s)", secs(med), secs(lo), secs(hi))
+}
+
+// unseenTable says where the pages run 2 read and run 1 did not are.
+func unseenTable(w io.Writer, d *Dataset, wfs []string) {
+	fmt.Fprintf(w, "### What run 2 read that run 1 did not, by class of path (4 KiB pages, with maps)\n\n")
+	var rows [][]string
+	for _, wf := range wfs {
+		labels, by := projects(d.Runs[wf])
+		for _, l := range labels {
+			if len(by[l]) < 2 {
+				continue
+			}
+			u := reuse(by[l][0], by[l][1], true)
+			var classes []string
+			for c := range u.Class {
+				classes = append(classes, c)
+			}
+			sort.Strings(classes)
+			for _, c := range classes {
+				v := u.Class[c]
+				if v[0] == v[1] {
+					continue
+				}
+				rows = append(rows, []string{wf, l, c, mib(v[0]), mib(v[0] - v[1]), pct(v[0]-v[1], v[0])})
+			}
+		}
+	}
+	tabulate(w, []string{"workflow", "project", "class", "MiB run 2 read", "MiB run 1 did not", "%"}, rows)
 }
