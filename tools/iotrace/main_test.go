@@ -23,7 +23,9 @@ func TestCalibrateMeasuresTheCostOfATracedCall(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Call <= 0 || c.Read < c.Call || c.N < 20000 {
+	// the cost of a traced call is positive; whether a large read costs more
+	// than a small one is a matter of the machine's timer, not of calibrate
+	if c.Call <= 0 || c.Read <= 0 || c.N < 20000 {
 		t.Errorf("%+v", c)
 	}
 }

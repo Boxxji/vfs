@@ -9,14 +9,27 @@ import (
 	"testing"
 )
 
-// needTrace skips the test when this machine cannot ptrace.
+// needTrace skips the test when this machine cannot trace a program and
+// read the names of the files it opens: strace missing, ptrace refused, a
+// strace without the flags record uses, or one that cannot read the
+// program's memory.
 func needTrace(t *testing.T) {
 	t.Helper()
 	if _, err := exec.LookPath("strace"); err != nil {
 		t.Skip("strace is not installed")
 	}
-	if err := exec.Command("strace", "-o", os.DevNull, "true").Run(); err != nil {
-		t.Skipf("strace cannot trace here: %v", err)
+	dir := t.TempDir()
+	probe := filepath.Join(dir, "probe")
+	if err := os.WriteFile(probe, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "out")
+	// the flags record uses
+	if b, err := exec.Command("strace", "--seccomp-bpf", "-f", "-y", "-s", "0", "-e", "trace=openat", "-o", out, "cat", probe).CombinedOutput(); err != nil {
+		t.Skipf("strace cannot trace here (%v): %s", err, b)
+	}
+	if b, err := os.ReadFile(out); err != nil || !strings.Contains(string(b), probe) {
+		t.Skipf("strace here does not show the names of the files a program opens (%v): %s", err, b)
 	}
 }
 
@@ -33,8 +46,11 @@ func TestRecordCountsEveryByteTheCommandReads(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if m.Exit != 0 || m.Wall <= 0 || m.Events == 0 || m.Load[0] == "" {
+	if m.Exit != 0 || m.Wall <= 0 || m.Events == 0 {
 		t.Errorf("manifest %+v", m)
+	}
+	if _, err := os.Stat("/proc/loadavg"); err == nil && m.Load[0] == "" {
+		t.Errorf("the load average was not recorded: %+v", m.Load)
 	}
 	if _, err := os.Stat(filepath.Join(out, "raw.strace")); err == nil {
 		t.Error("raw strace output kept without -keep")
