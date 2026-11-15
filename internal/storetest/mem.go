@@ -73,12 +73,15 @@ func (m *Mem) Count() int {
 	return len(m.objs)
 }
 
-func (m *Mem) Get(_ context.Context, key string) ([]byte, backend.Version, error) {
+func (m *Mem) Get(_ context.Context, key string, max int64) ([]byte, backend.Version, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	b, ok := m.objs[key]
 	if !ok {
 		return nil, "", fmt.Errorf("%w: %s", backend.ErrNotFound, key)
+	}
+	if int64(len(b)) > max {
+		return nil, "", fmt.Errorf("%w: %s is larger than %d bytes", backend.ErrTooLarge, key, max)
 	}
 	return append([]byte(nil), b...), etag(b), nil
 }
@@ -181,7 +184,10 @@ func (m *Mem) Dump() map[string][]byte {
 	return out
 }
 
-func (m *Mem) Close() error   { return nil }
-func (m *Mem) String() string { return "mem://" }
+func (m *Mem) Close() error { return nil }
+
+// String names this store, and no other: a Volume's Head is sealed to the
+// location it lives at, so two stores must not share a name.
+func (m *Mem) String() string { return fmt.Sprintf("mem://%p", m) }
 
 var _ backend.Backend = (*Mem)(nil)

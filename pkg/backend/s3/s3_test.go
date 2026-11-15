@@ -2,6 +2,8 @@ package s3
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 
 	"github.com/hanzoai/vfs/internal/storetest"
@@ -47,11 +49,72 @@ func TestGetIsOneRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := srv.Requests()
-	b, v, err := be.Get(ctx, "k")
+	b, v, err := be.Get(ctx, "k", backend.Unbounded)
 	if err != nil || string(b) != "body" || v == "" {
 		t.Fatalf("Get = %q %q %v", b, v, err)
 	}
 	if n := srv.Requests() - before; n != 1 {
 		t.Fatalf("Get made %d requests, want 1", n)
+	}
+}
+
+// TestLargeConditional: a conditional write too large for the single request that can
+// carry its condition is refused, not made unconditionally, and nothing is sent.
+func TestLargeConditional(t *testing.T) {
+	srv := storetest.NewS3(t, "disk")
+	be, err := New(Config{Endpoint: srv.Endpoint(), Insecure: true, Region: "us-east-1", Bucket: "disk", AccessKey: "k", SecretKey: "s"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	big := make([]byte, partSize+1)
+	before := srv.Requests()
+	if _, err := be.PutIfAbsent(ctx, "obj", big); !errors.Is(err, backend.ErrTooLarge) {
+		t.Fatalf("PutIfAbsent over the limit = %v, want ErrTooLarge", err)
+	}
+	if _, err := be.PutIfVersion(ctx, "obj", big, "any"); !errors.Is(err, backend.ErrTooLarge) {
+		t.Fatalf("PutIfVersion over the limit = %v, want ErrTooLarge", err)
+	}
+	if n := srv.Requests() - before; n != 0 {
+		t.Fatalf("a refused conditional write sent %d requests", n)
+	}
+	// At the limit it goes, conditionally.
+	atLimit := make([]byte, partSize)
+	if _, err := be.PutIfAbsent(ctx, "obj", atLimit); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := be.PutIfAbsent(ctx, "obj", atLimit); !errors.Is(err, backend.ErrConflict) {
+		t.Fatalf("PutIfAbsent at the limit over an existing object = %v, want ErrConflict", err)
+	}
+}
+
+func TestURLCredentialRefused(t *testing.T) {
+	_, err := backend.Open(context.Background(), "s3://AKIAEXAMPLE:SuperSecretKey123@bucket/prefix?endpoint=127.0.0.1:1&insecure=1")
+	if err == nil {
+		t.Fatal("a URL with a credential in it was accepted")
+	}
+	if strings.Contains(err.Error(), "SuperSecretKey123") || strings.Contains(err.Error(), "AKIAEXAMPLE") {
+		t.Fatalf("the refusal prints the credential: %v", err)
+	}
+}
+
+func TestURLPrefixValidated(t *testing.T) {
+	for _, path := range []string{"/a/../b", "/a/%2e%2e/b", "/a/%2E%2E/b", "/a//b", "/a/./b", "/a%00b", "/a%0ab"} {
+		if _, err := backend.Open(context.Background(), "s3://bucket"+path+"?endpoint=127.0.0.1:1&insecure=1&region=r"); err == nil {
+			t.Errorf("URL path %q was accepted", path)
+		}
+	}
+	if _, err := backend.Open(context.Background(), "s3://bucket/org/vol/?endpoint=127.0.0.1:1&insecure=1&region=r"); err != nil {
+		t.Errorf("a plain prefix with a trailing slash: %v", err)
+	}
+}
+
+func TestURLStringNamesNoQuery(t *testing.T) {
+	be, err := backend.Open(context.Background(), "s3://bucket/vol/one?endpoint=127.0.0.1:1&insecure=1&region=r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := be.String(); got != "s3://bucket/vol/one" {
+		t.Fatalf("String() = %q, want s3://bucket/vol/one", got)
 	}
 }

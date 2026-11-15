@@ -48,7 +48,7 @@ func cfg(be backend.Backend, c vfs.Cipher, round uint64) vfs.Config {
 func newMem(t testing.TB) (*storetest.Mem, vfs.Cipher, *vfs.Volume) {
 	t.Helper()
 	be := storetest.NewMem()
-	c := vfs.NewAgeCipher(newKey(t))
+	c := vfs.Hybrid(newKey(t))
 	if err := vfs.Create(ctx, cfg(be, c, 0)); err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +126,7 @@ func reopen(t testing.TB, be backend.Backend, c vfs.Cipher) *vfs.Volume {
 
 func newMemStore() *storetest.Mem { return storetest.NewMem() }
 
-func vfsAge(t testing.TB) vfs.Cipher { return vfs.NewAgeCipher(newKey(t)) }
+func vfsAge(t testing.TB) vfs.Cipher { return vfs.Hybrid(newKey(t)) }
 
 // packBytes is the total size of every pack stored.
 func packBytes(be *storetest.Mem) int {

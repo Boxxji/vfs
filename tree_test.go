@@ -4,31 +4,58 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"github.com/hanzoai/vfs/pkg/backend"
 	"math/rand/v2"
 	"sort"
 	"testing"
 
 	"github.com/luxfi/age"
+	"github.com/zeebo/blake3"
 
 	"github.com/hanzoai/vfs/internal/storetest"
 )
 
 // plainCipher seals deterministically, so equal trees have equal bytes and so
-// equal refs. It is a test double for the Cipher seam, not a cipher.
+// equal refs: the plaintext XOR a 32 byte pad derived from its own hash, and a 16
+// byte tag. It is a test double for the Cipher seam, strong enough to pass a
+// Volume's check and fast enough for a million records, not a cipher to use.
 type plainCipher struct{}
 
-func (plainCipher) Seal(p []byte) ([]byte, string, error) { return append([]byte("T"), p...), "t", nil }
-func (plainCipher) Open(s []byte, id string) ([]byte, error) {
-	if id != "t" || len(s) == 0 || s[0] != 'T' {
+func (plainCipher) tag(ct []byte) []byte {
+	h, _ := blake3.NewKeyed(bytes.Repeat([]byte{9}, 32))
+	h.Write(ct)
+	return h.Sum(nil)[:16]
+}
+
+func (c plainCipher) Seal(p []byte) ([]byte, string, error) {
+	nonce := blake3.Sum256(p)
+	pad := blake3.Sum256(nonce[:16])
+	out := make([]byte, 16+len(p), 16+len(p)+16)
+	copy(out, nonce[:16])
+	for i := range p {
+		out[16+i] = p[i] ^ pad[i%32]
+	}
+	return append(out, c.tag(out[16:])...), "t", nil
+}
+
+func (c plainCipher) Open(s []byte, id string) ([]byte, error) {
+	if id != "t" || len(s) < 32 || !bytes.Equal(c.tag(s[16:len(s)-16]), s[len(s)-16:]) {
 		return nil, ErrCorrupt
 	}
-	return s[1:], nil
+	// The pad is the hash of the plaintext, which is what is being recovered: it
+	// is stored as the first 16 bytes and the second 16 are derived from them.
+	pad := blake3.Sum256(s[:16])
+	p := make([]byte, len(s)-32)
+	for i := range p {
+		p[i] = s[16+i] ^ pad[i%32]
+	}
+	return p, nil
 }
 
 // smallTree returns a tree that cuts nodes of about 300 bytes, so a few thousand
 // records stand five or six levels tall.
 func smallTree(be *storetest.Mem) *tree {
-	t := newTree(&shards{be: be, c: plainCipher{}, cache: newLRU[ref, *node](1 << 30)})
+	t := newTree(&shards{be: be, c: plainCipher{}, aad: []byte("test"), cache: newLRU[ref, *node](1 << 30)})
 	t.target, t.max = 300, 3000
 	return t
 }
@@ -234,7 +261,7 @@ func TestTreeDetectsSwappedShard(t *testing.T) {
 	root, _ := tr.build(ctx, 0, m.sorted())
 	keys := be.Keys()
 	a, b := keys[0], keys[1]
-	da, _, _ := be.Get(ctx, a)
+	da, _, _ := be.Get(ctx, a, backend.Unbounded)
 	_ = be.Put(ctx, b, da) // b's name now holds a's (valid) bytes
 	tr.sh.cache = newLRU[ref, *node](1 << 30)
 	err := tr.scan(ctx, root, nil, func(_, _ []byte) bool { return true })

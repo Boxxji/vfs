@@ -163,8 +163,22 @@ func TestCrashChild(t *testing.T) {
 			}
 			return nil
 		}
+	case "packed":
+		hook.After = func(op, key string) error {
+			if strings.HasPrefix(key, "pack/") {
+				stop(op, key)
+			}
+			return nil
+		}
 	case "shard":
 		hook.Before = func(op, key string) error {
+			if strings.HasPrefix(key, "meta/") {
+				stop(op, key)
+			}
+			return nil
+		}
+	case "sharded":
+		hook.After = func(op, key string) error {
 			if strings.HasPrefix(key, "meta/") {
 				stop(op, key)
 			}
@@ -187,7 +201,7 @@ func TestCrashChild(t *testing.T) {
 	default:
 		t.Fatalf("unknown stage %q", stage)
 	}
-	v, err := vfs.Attach(ctx, cfg(hook, vfs.NewAgeCipher(key), 2))
+	v, err := vfs.Attach(ctx, cfg(hook, vfs.Hybrid(key), 2))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -208,12 +222,12 @@ func TestSigkill(t *testing.T) {
 		stage string
 		want  map[string]string
 	}{
-		{"pack", one}, {"shard", one}, {"head", one}, {"landed", two},
+		{"pack", one}, {"packed", one}, {"shard", one}, {"sharded", one}, {"head", one}, {"landed", two},
 	} {
 		t.Run(tc.stage, func(t *testing.T) {
 			dir := t.TempDir()
 			key := newKey(t)
-			c := vfs.NewAgeCipher(key)
+			c := vfs.Hybrid(key)
 			be, err := backend.Open(ctx, "file://"+dir)
 			if err != nil {
 				t.Fatal(err)

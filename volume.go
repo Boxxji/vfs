@@ -1,55 +1,13 @@
-// Package vfs is a filesystem on an object store: a Volume.
-//
-// # Format (version 2)
-//
-// A Volume is a prefix of a bucket holding three kinds of object, all sealed by
-// the Volume's Cipher:
-//
-//	head                    the one mutable object: names the root shard
-//	meta/<2 hex>/<hash>     metadata shards, immutable, named by the hash of their bytes
-//	pack/<2 hex>/<id>       packs of file chunks, immutable, named by a random id
-//
-// File bytes are cut into content-defined chunks of 64 KiB to 4 MiB (chunk.go).
-// Each chunk is sealed on its own, and sealed chunks are packed together into
-// objects of about 16 MiB, so a tree of 150 GiB is a few thousand PUTs rather
-// than one per chunk. Files of at most 16 KiB are not chunked at all: their bytes
-// are a record in the metadata shard, beside their inode.
-//
-// All metadata (inodes, directory entries, chunk references, the table saying
-// where each chunk lives) is records in one ordered Merkle tree (tree.go), cut
-// into shards. The Head holds the tree's root ref and the next inode number.
-//
-// # Commit
-//
-// Flush settles every written file into chunks, uploads the open pack, writes
-// the shards the changes touched (and no others), and then replaces the Head with
-// one conditional write. Until that write lands the Head names the previous
-// tree, which was not touched: a crash anywhere before it leaves the Volume
-// exactly as the last Flush left it. Chunks, packs and shards a crashed or
-// failed Flush uploaded are unreferenced garbage, never corruption.
-//
-// # Flush and Fsync
-//
-// Flush returns only after the Head naming everything written so far has
-// advanced in the store. Fsync is Flush: there is no node-local journal yet, so
-// no cheaper durable point exists. Neither runs on a timer here: a bound on how
-// stale the store may be is a deadline timer owned by the caller of Volume,
-// which calls Flush when it fires.
-//
-// # Fence
-//
-// Attach claims the Volume at a Round, a number that only grows. The claim is a
-// conditional write of the Head that also carries forward the previous owner's
-// last committed Head, so no acknowledged commit is lost, and from then on a
-// commit by any older Round is refused with ErrStaleRound.
 package vfs
 
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io/fs"
+	"math"
 	"sync"
 	"time"
 
@@ -58,9 +16,14 @@ import (
 )
 
 var (
-	// ErrStaleRound is returned when a newer Round holds the Volume: this
-	// writer was fenced and its changes were not, and will never be, committed.
+	// ErrStaleRound is returned when a newer Round holds the Volume: this writer
+	// was fenced. Changes it had not committed will never land. A commit whose
+	// acknowledgement was lost may nevertheless be in the successor's tree; see the
+	// package documentation.
 	ErrStaleRound = fence.ErrStaleRound
+
+	// ErrTooBig is returned for a file larger than MaxSize.
+	ErrTooBig = errors.New("vfs: file too large")
 
 	// ErrReadOnly is returned by a write on a Volume that was Opened, not Attached.
 	ErrReadOnly = errors.New("vfs: volume is read-only")
@@ -77,7 +40,7 @@ type Config struct {
 	Round   uint64          // Attach: the Round to claim; must exceed the recorded one, and be above 0
 
 	Cache   int64 // bytes of shards and chunks kept decoded; default 256 MiB
-	Dirty   int64 // bytes of unsettled writes before they are chunked and uploaded; default 64 MiB
+	Dirty   int64 // bytes of unsettled writes (each separate write counts a fixed overhead too) before they are chunked and uploaded; default 64 MiB
 	Overlay int   // metadata changes held before they are written into shards; default 262144
 }
 
@@ -94,8 +57,15 @@ func (c Config) valid() (Config, error) {
 	if c.Overlay <= 0 {
 		c.Overlay = 1 << 18
 	}
+	if err := check(c.Cipher); err != nil {
+		return c, err
+	}
 	return c, nil
 }
+
+// maxHead bounds what a read accepts for the Head: it is a few hundred bytes
+// sealed under a post-quantum key.
+const maxHead = 64 << 10
 
 // Volume is a mounted filesystem. All methods are safe for concurrent use.
 // A Volume that was Attached may write; one that was Opened may only read.
@@ -108,13 +78,16 @@ type Volume struct {
 	t     *tree
 
 	chunks *lru[chunkID, []byte]
+	id     volumeID
+	gear   *gear
 
 	// mu guards everything below. Flush holds it throughout: writers wait for a
 	// commit, readers too. The upload pipeline that relaxes this comes with the
 	// node cache.
 	mu     sync.RWMutex
-	head   Head // the committed Head
-	root   ref  // the tree with every applied change, committed or not
+	head   Head   // the committed Head
+	seq    uint64 // the last Seq this Volume wrote or read, landed or not
+	root   ref    // the tree with every applied change, committed or not
 	over   *overlay
 	next   InodeID
 	files  map[InodeID]*fileState
@@ -128,13 +101,22 @@ func newVolume(cfg Config) *Volume {
 	return &Volume{
 		be:     cfg.Backend,
 		c:      cfg.Cipher,
-		fence:  fence.New(cfg.Backend),
+		fence:  fence.New(cfg.Backend, maxHead),
 		cfg:    cfg,
 		t:      newTree(sh),
 		chunks: newLRU[chunkID, []byte](cfg.Cache / 2),
 		over:   newOverlay(),
 		files:  map[InodeID]*fileState{},
 	}
+}
+
+// adopt makes h the state of the Volume: what the Head names, and the identity
+// everything else is sealed to.
+func (v *Volume) adopt(h Head) {
+	v.head, v.seq = h, h.Seq
+	v.root, v.next = h.Root, InodeID(h.Next)
+	v.id, v.gear = h.ID, newGear(h.Seed)
+	v.t.sh.aad = shardAAD(h.ID)
 }
 
 // Create makes an empty Volume at the Backend's prefix: a tree holding the root
@@ -146,13 +128,19 @@ func Create(ctx context.Context, cfg Config) error {
 		return err
 	}
 	v := newVolume(cfg)
+	h := Head{Next: uint64(RootInode) + 1}
+	for _, b := range [][]byte{h.ID[:], h.Seed[:]} {
+		if _, err := rand.Read(b); err != nil {
+			return err
+		}
+	}
+	v.adopt(h)
 	now := time.Now()
 	root := Inode{ID: RootInode, Mode: fs.ModeDir | 0o755, Mtime: now, Atime: now, Ctime: now}
-	r, err := v.t.apply(ctx, none, []mut{{key: keyInode(RootInode), val: encodeInode(root)}})
-	if err != nil {
+	if h.Root, err = v.t.apply(ctx, none, []mut{{key: keyInode(RootInode), val: encodeInode(root)}}); err != nil {
 		return err
 	}
-	sealed, err := seal(v.c, Head{Root: r, Next: uint64(RootInode) + 1}.marshal())
+	sealed, err := seal(v.c, headAAD(cfg.Backend.String()), h.marshal())
 	if err != nil {
 		return err
 	}
@@ -180,10 +168,11 @@ func Open(ctx context.Context, cfg Config) (*Volume, error) {
 		}
 		return nil, err
 	}
-	if v.head, err = v.readHead(payload); err != nil {
+	h, err := v.readHead(payload)
+	if err != nil {
 		return nil, err
 	}
-	v.root, v.next = v.head.Root, InodeID(v.head.Next)
+	v.adopt(h)
 	return v, nil
 }
 
@@ -197,11 +186,12 @@ func Attach(ctx context.Context, cfg Config) (*Volume, error) {
 	if err != nil {
 		return nil, err
 	}
-	if cfg.Round == 0 {
-		return nil, errors.New("vfs: Attach needs a Round above 0")
+	if cfg.Round == 0 || cfg.Round == math.MaxUint64 {
+		return nil, fmt.Errorf("%w: Attach needs a Round above 0 and below 2^64-1, since no Round can follow the last", fs.ErrInvalid)
 	}
 	v := newVolume(cfg)
-	err = v.fence.CarryForward(ctx, headKey, cfg.Round, func(payload []byte, recorded uint64) error {
+	var h Head
+	err = v.fence.Claim(ctx, headKey, cfg.Round, func(payload []byte, recorded uint64) error {
 		if payload == nil {
 			return fmt.Errorf("vfs: no volume at %s: %w", cfg.Backend, fs.ErrNotExist)
 		}
@@ -209,13 +199,14 @@ func Attach(ctx context.Context, cfg Config) (*Volume, error) {
 			return fmt.Errorf("%w: round %d does not exceed the recorded %d", ErrStaleRound, cfg.Round, recorded)
 		}
 		var err error
-		v.head, err = v.readHead(payload)
+		h, err = v.readHead(payload)
 		return err
 	})
 	if err != nil {
 		return nil, err
 	}
-	v.round, v.root, v.next = cfg.Round, v.head.Root, InodeID(v.head.Next)
+	v.adopt(h)
+	v.round = cfg.Round
 	return v, nil
 }
 
@@ -257,16 +248,19 @@ func (v *Volume) writable() error {
 }
 
 // Flush makes everything written so far durable: it returns only after the Head
-// naming it has advanced in the store. If it returns an error the Volume is
-// unchanged in the store, and the changes are kept in memory for the next Flush;
-// ErrStaleRound means they never will land.
+// naming it has advanced in the store. If it returns an error the outcome of that
+// attempt is unknown to the caller (a reply can be lost after the write landed),
+// the changes stay in memory for the next Flush, and the Volume is unchanged
+// otherwise. ErrStaleRound means this Volume was fenced and can never commit
+// again; see the package documentation for what that does and does not say about
+// earlier attempts.
 func (v *Volume) Flush(ctx context.Context) error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	if err := v.writable(); err != nil {
 		return err
 	}
-	if err := v.settleAll(ctx); err != nil {
+	if err := v.sweep(ctx); err != nil {
 		return err
 	}
 	if v.over.n == 0 && v.pack.empty() && v.root == v.head.Root {
@@ -278,15 +272,33 @@ func (v *Volume) Flush(ctx context.Context) error {
 	if err := v.spill(ctx); err != nil {
 		return err
 	}
-	h := Head{Seq: v.head.Seq + 1, Root: v.root, Next: uint64(v.next)}
+	v.seq++
+	h := v.head
+	h.Seq, h.Root, h.Next = v.seq, v.root, uint64(v.next)
 	if err := v.writeHead(ctx, h); err != nil {
 		if errors.Is(err, ErrStaleRound) {
 			v.fenced = true
+			// An earlier attempt of ours may have landed with its reply lost, and a
+			// successor carried it forward: then the store holds exactly this tree.
+			if cur, ok := v.landed(ctx); ok {
+				v.head = cur
+				return nil
+			}
 		}
 		return fmt.Errorf("vfs: commit: %w", err)
 	}
 	v.head = h
 	return nil
+}
+
+// landed reports the Head in the store if it names exactly this Volume's tree.
+func (v *Volume) landed(ctx context.Context) (Head, bool) {
+	payload, _, err := v.fence.Get(ctx, headKey)
+	if err != nil {
+		return Head{}, false
+	}
+	cur, err := v.readHead(payload)
+	return cur, err == nil && cur.ID == v.id && cur.Root == v.root
 }
 
 // spill writes the pending metadata changes into shards, advancing the working
@@ -308,7 +320,7 @@ func (v *Volume) spill(ctx context.Context) error {
 // bytes, and writes pending metadata into shards, once either passes its limit.
 func (v *Volume) relieve(ctx context.Context) error {
 	if v.dirty >= v.cfg.Dirty {
-		if err := v.settleAll(ctx); err != nil {
+		if err := v.sweep(ctx); err != nil {
 			return err
 		}
 	}
@@ -350,4 +362,24 @@ func (v *Volume) scan(ctx context.Context, prefix []byte) ([]entry, error) {
 		}
 	}
 	return append(out, base[i:]...), nil
+}
+
+// has reports whether any record whose key starts with prefix exists, reading no
+// more than it takes to find one: a directory is checked for emptiness without
+// listing it.
+func (v *Volume) has(ctx context.Context, prefix []byte) (bool, error) {
+	for n := v.over.seek(prefix); n != nil && bytes.HasPrefix(n.key, prefix); n = n.next[0] {
+		if !n.del {
+			return true, nil
+		}
+	}
+	found := false
+	err := v.t.scan(ctx, v.root, prefix, func(k, _ []byte) bool {
+		if n, ok := v.over.get(k); ok && n.del {
+			return true // removed by a pending change
+		}
+		found = true
+		return false
+	})
+	return found, err
 }

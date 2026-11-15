@@ -108,6 +108,11 @@ func (s *server) GetInodeAttributes(ctx context.Context, op *fuseops.GetInodeAtt
 }
 
 func (s *server) SetInodeAttributes(ctx context.Context, op *fuseops.SetInodeAttributesOp) error {
+	ctx = context.WithoutCancel(ctx) // not answered EINTR: see errno.go
+	// Only the size can be set; the rest would succeed without changing anything.
+	if op.Mode != nil || op.Atime != nil || op.Mtime != nil {
+		return unsupported
+	}
 	if op.Size != nil {
 		if err := s.vol.Truncate(ctx, vfs.InodeID(op.Inode), *op.Size); err != nil {
 			return errno(err)
@@ -123,6 +128,7 @@ func (s *server) SetInodeAttributes(ctx context.Context, op *fuseops.SetInodeAtt
 }
 
 func (s *server) MkDir(ctx context.Context, op *fuseops.MkDirOp) error {
+	ctx = context.WithoutCancel(ctx) // not answered EINTR: see errno.go
 	in, err := s.vol.Mkdir(ctx, vfs.InodeID(op.Parent), op.Name, op.Mode.Perm())
 	if err != nil {
 		return errno(err)
@@ -132,6 +138,7 @@ func (s *server) MkDir(ctx context.Context, op *fuseops.MkDirOp) error {
 }
 
 func (s *server) CreateFile(ctx context.Context, op *fuseops.CreateFileOp) error {
+	ctx = context.WithoutCancel(ctx) // not answered EINTR: see errno.go
 	in, err := s.vol.Create(ctx, vfs.InodeID(op.Parent), op.Name, op.Mode.Perm())
 	if err != nil {
 		return errno(err)
@@ -146,11 +153,37 @@ func (s *server) CreateFile(ctx context.Context, op *fuseops.CreateFileOp) error
 }
 
 func (s *server) Unlink(ctx context.Context, op *fuseops.UnlinkOp) error {
+	ctx = context.WithoutCancel(ctx) // not answered EINTR: see errno.go
+	if err := kind(ctx, s.vol, vfs.InodeID(op.Parent), op.Name, false); err != nil {
+		return errno(err)
+	}
 	return errno(s.vol.Remove(ctx, vfs.InodeID(op.Parent), op.Name))
 }
 
 func (s *server) RmDir(ctx context.Context, op *fuseops.RmDirOp) error {
+	ctx = context.WithoutCancel(ctx) // not answered EINTR: see errno.go
+	if err := kind(ctx, s.vol, vfs.InodeID(op.Parent), op.Name, true); err != nil {
+		return errno(err)
+	}
 	return errno(s.vol.Remove(ctx, vfs.InodeID(op.Parent), op.Name))
+}
+
+// kind checks that name in dir is the kind of thing the caller is removing:
+// unlink removes a file and refuses a directory, rmdir the reverse. (The Linux
+// kernel makes this check itself before it asks the file system; an NFS-backed
+// mount does not.)
+func kind(ctx context.Context, vol *vfs.Volume, dir vfs.InodeID, name string, wantDir bool) error {
+	in, err := vol.Lookup(ctx, dir, name)
+	if err != nil {
+		return err
+	}
+	switch {
+	case wantDir && !in.IsDir():
+		return vfs.ErrNotDir
+	case !wantDir && in.IsDir():
+		return vfs.ErrIsDir
+	}
+	return nil
 }
 
 // ─── directories ────────────────────────────────────────────────────────────
@@ -192,6 +225,7 @@ func (s *server) ReleaseDirHandle(_ context.Context, op *fuseops.ReleaseDirHandl
 // ─── files ──────────────────────────────────────────────────────────────────
 
 func (s *server) OpenFile(ctx context.Context, op *fuseops.OpenFileOp) error {
+	ctx = context.WithoutCancel(ctx) // not answered EINTR: see errno.go
 	f, err := s.vol.Open(ctx, vfs.InodeID(op.Inode))
 	if err != nil {
 		return errno(err)
@@ -202,6 +236,7 @@ func (s *server) OpenFile(ctx context.Context, op *fuseops.OpenFileOp) error {
 }
 
 func (s *server) ReadFile(ctx context.Context, op *fuseops.ReadFileOp) error {
+	ctx = context.WithoutCancel(ctx) // not answered EINTR: see errno.go
 	f := s.file(op.Handle)
 	if f == nil {
 		return syscall.EBADF
@@ -215,6 +250,7 @@ func (s *server) ReadFile(ctx context.Context, op *fuseops.ReadFileOp) error {
 }
 
 func (s *server) WriteFile(ctx context.Context, op *fuseops.WriteFileOp) error {
+	ctx = context.WithoutCancel(ctx) // not answered EINTR: see errno.go
 	f := s.file(op.Handle)
 	if f == nil {
 		return syscall.EBADF
@@ -223,12 +259,14 @@ func (s *server) WriteFile(ctx context.Context, op *fuseops.WriteFileOp) error {
 	return errno(err)
 }
 
+// A commit is not abandoned halfway because the kernel interrupted the call: it is
+// repeatable and safe to finish, so it runs to its end.
 func (s *server) SyncFile(ctx context.Context, _ *fuseops.SyncFileOp) error {
-	return errno(s.vol.Flush(ctx))
+	return errno(commit(ctx, s.vol))
 }
 
 func (s *server) FlushFile(ctx context.Context, _ *fuseops.FlushFileOp) error {
-	return errno(s.vol.Flush(ctx))
+	return errno(commit(context.WithoutCancel(ctx), s.vol)) // close(2) is not restarted: wait for the commit
 }
 
 func (s *server) ReleaseFileHandle(_ context.Context, op *fuseops.ReleaseFileHandleOp) error {

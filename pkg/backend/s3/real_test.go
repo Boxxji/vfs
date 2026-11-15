@@ -64,7 +64,7 @@ func TestRealServerRaceStress(t *testing.T) {
 		t.Fatal(err)
 	}
 	for round := range 150 {
-		_, v, err := clients[0].Get(ctx, "head")
+		_, v, err := clients[0].Get(ctx, "head", backend.Unbounded)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -90,7 +90,7 @@ func TestRealServerRaceStress(t *testing.T) {
 		if wins.Load() != 1 {
 			t.Fatalf("round %d: %d of %d writers on version %s won, want exactly 1", round, wins.Load(), racers, v)
 		}
-		got, _, _ := clients[0].Get(ctx, "head")
+		got, _, _ := clients[0].Get(ctx, "head", backend.Unbounded)
 		if !strings.HasPrefix(string(got), fmt.Sprintf("round %d writer ", round)) {
 			t.Fatalf("round %d: the object holds %q, not a write of this round", round, got)
 		}
@@ -118,7 +118,7 @@ func TestRealServerRaceStress(t *testing.T) {
 		if wins.Load() != 1 {
 			t.Fatalf("key %s: %d of %d creators won, want exactly 1", key, wins.Load(), racers)
 		}
-		got, _, _ := clients[0].Get(ctx, key)
+		got, _, _ := clients[0].Get(ctx, key, backend.Unbounded)
 		if len(got) != 1 {
 			t.Fatalf("key %s holds %d bytes", key, len(got))
 		}

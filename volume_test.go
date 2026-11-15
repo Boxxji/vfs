@@ -1,6 +1,8 @@
 package vfs_test
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -9,6 +11,8 @@ import (
 	"testing"
 
 	"github.com/hanzoai/vfs"
+	"github.com/hanzoai/vfs/internal/storetest"
+	"github.com/hanzoai/vfs/pkg/backend"
 )
 
 func TestNamespace(t *testing.T) {
@@ -401,4 +405,180 @@ func TestReadAfterSettleBeforeFlush(t *testing.T) {
 		t.Fatalf("%d bytes unsettled", st.Dirty)
 	}
 	mustEqual(t, "settled, not flushed", readAll(t, v, in.ID), data)
+}
+
+// TestRecutHonoursItsContext: re-cutting a file's bytes stops when the caller's
+// context ends. Nothing about the file is lost: a Flush with a live context then
+// commits it.
+func TestRecutHonoursItsContext(t *testing.T) {
+	be, c, v := newMem(t)
+	in := write(t, v, vfs.RootInode, "f", content(61, 6<<20))
+	gone, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := v.Flush(gone); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Flush with a cancelled context = %v, want context.Canceled", err)
+	}
+	if st := v.Stats(); st.Dirty == 0 {
+		t.Fatal("the cancelled Flush discarded the writes")
+	}
+	flush(t, v)
+	mustEqual(t, "after the cancelled Flush", readAll(t, reopen(t, be, c), in.ID), content(61, 6<<20))
+}
+
+// putBig stores an object of the given size at key, whatever it was.
+func putBig(t *testing.T, be *storetest.Mem, key string, n int) {
+	t.Helper()
+	if err := be.Put(ctx, key, bytes.Repeat([]byte("x"), n)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestHeadBound: a store that answers a read of the Head with a huge body is not
+// believed, and not buffered.
+func TestHeadBound(t *testing.T) {
+	be, c, _ := newMem(t)
+	putBig(t, be, "head", 8<<20)
+	if _, err := vfs.Open(ctx, cfg(be, c, 0)); !errors.Is(err, backend.ErrTooLarge) {
+		t.Fatalf("Open with an 8 MiB Head = %v, want ErrTooLarge", err)
+	}
+	if _, err := vfs.Attach(ctx, cfg(be, c, 9)); !errors.Is(err, backend.ErrTooLarge) {
+		t.Fatalf("Attach with an 8 MiB Head = %v, want ErrTooLarge", err)
+	}
+}
+
+// TestShardBound: the same for a metadata shard.
+func TestShardBound(t *testing.T) {
+	be, c, v := newMem(t)
+	write(t, v, vfs.RootInode, "f", []byte("x"))
+	flush(t, v)
+	for k := range be.Dump() {
+		if strings.HasPrefix(k, "meta/") {
+			putBig(t, be, k, 8<<20)
+		}
+	}
+	ro, err := vfs.Open(ctx, cfg(be, c, 0))
+	if err == nil {
+		_, err = ro.ReadDir(ctx, vfs.RootInode)
+	}
+	if !errors.Is(err, backend.ErrTooLarge) {
+		t.Fatalf("reading through an 8 MiB shard = %v, want ErrTooLarge", err)
+	}
+}
+
+// getCount counts the reads of whole objects.
+type getCount struct {
+	backend.Backend
+	gets int
+}
+
+func (g *getCount) Get(c context.Context, k string, max int64) ([]byte, backend.Version, error) {
+	g.gets++
+	return g.Backend.Get(c, k, max)
+}
+
+// TestRemoveChecksEmptinessWithoutListing: rmdir learns that a directory has an
+// entry from the first one it finds. It does not list the directory, however large.
+func TestRemoveChecksEmptinessWithoutListing(t *testing.T) {
+	mem, c, v := newMem(t)
+	dir := mkdir(t, v, vfs.RootInode, "big")
+	for i := range sized(30_000, 100_000) {
+		if _, err := v.Create(ctx, dir, fmt.Sprintf("entry-%08d", i), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	flush(t, v)
+	gc := &getCount{Backend: mem}
+	cold, err := vfs.Attach(ctx, cfg(gc, c, 2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	gc.gets = 0
+	if err := cold.Remove(ctx, vfs.RootInode, "big"); !errors.Is(err, vfs.ErrNotEmpty) {
+		t.Fatalf("rmdir of a non-empty directory = %v", err)
+	}
+	if gc.gets > 6 {
+		t.Fatalf("rmdir read %d shards to learn one entry exists", gc.gets)
+	}
+}
+
+// TestCacheIsBounded: whatever is read and written, the decoded shards and chunks
+// held in memory stay near Config.Cache, however much data passes through.
+func TestCacheIsBounded(t *testing.T) {
+	be := newMemStore()
+	c := vfsAge(t)
+	if err := vfs.Create(ctx, cfg(be, c, 0)); err != nil {
+		t.Fatal(err)
+	}
+	conf := cfg(be, c, 1)
+	conf.Cache = 4 << 20
+	v, err := vfs.Attach(ctx, conf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	total := sized(24, 60)
+	var inodes []vfs.InodeID
+	for i := range total {
+		inodes = append(inodes, write(t, v, vfs.RootInode, fmt.Sprint("f", i), content(uint64(500+i), 1<<20)).ID)
+		flush(t, v)
+	}
+	for _, ino := range inodes {
+		readAll(t, v, ino)
+	}
+	st := v.Stats()
+	if st.CacheBytes > st.CacheMax+(5<<20) {
+		t.Fatalf("%d MiB passed through; the caches hold %d bytes against a bound of %d", total, st.CacheBytes, st.CacheMax)
+	}
+}
+
+// TestListingSeesAChangeOnceAndARemovalNever: a name that was committed, then removed
+// and made again, or rewritten, and not yet committed again, lists once, with its
+// new inode, and a name that was removed does not list. The listing merges the
+// committed tree with the pending changes, and the two must not both be shown.
+func TestListingSeesAChangeOnceAndARemovalNever(t *testing.T) {
+	_, _, v := newMem(t)
+	dir := mkdir(t, v, vfs.RootInode, "d")
+	var ids = map[string]vfs.InodeID{}
+	for _, n := range []string{"a", "b", "c", "d", "e"} {
+		ids[n] = write(t, v, dir, n, []byte("old "+n)).ID
+	}
+	flush(t, v)
+
+	if err := v.Remove(ctx, dir, "b"); err != nil { // removed
+		t.Fatal(err)
+	}
+	if err := v.Remove(ctx, dir, "c"); err != nil { // removed and made again
+		t.Fatal(err)
+	}
+	again := write(t, v, dir, "c", []byte("new c")).ID
+	if again == ids["c"] {
+		t.Fatal("a name made again reused its inode")
+	}
+	if err := v.Remove(ctx, dir, "e"); err != nil { // removed, made again, removed
+		t.Fatal(err)
+	}
+	write(t, v, dir, "e", []byte("new e"))
+	if err := v.Remove(ctx, dir, "e"); err != nil {
+		t.Fatal(err)
+	}
+	write(t, v, dir, "f", []byte("new f")) // added
+
+	check := func(when string) {
+		ents, err := v.ReadDir(ctx, dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got []string
+		for _, e := range ents {
+			got = append(got, e.Name)
+			if e.Name == "c" && e.ID != again {
+				t.Fatalf("%s: c lists the inode it had before it was made again", when)
+			}
+		}
+		if want := "a c d f"; strings.Join(got, " ") != want {
+			t.Fatalf("%s: listing = %v, want %s", when, got, want)
+		}
+	}
+	check("pending")
+	flush(t, v)
+	check("committed")
 }

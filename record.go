@@ -2,6 +2,7 @@ package vfs
 
 import (
 	"encoding/binary"
+	"fmt"
 	"io/fs"
 	"time"
 )
@@ -42,6 +43,10 @@ type Inode struct {
 	Mtime time.Time
 	Atime time.Time
 	Ctime time.Time
+
+	// later holds the fields of the stored record this library does not know
+	// (a newer library wrote them), so a rewrite carries them on.
+	later []byte
 }
 
 // IsDir reports whether the inode is a directory.
@@ -75,23 +80,78 @@ func keyChunk(id chunkID) []byte { return append([]byte{tChunk}, id[:]...) }
 // offsetOf reads the file offset out of an extent key.
 func offsetOf(k []byte) uint64 { return binary.BigEndian.Uint64(k[prefixLen:]) }
 
+// The inode record is a sequence of fields, each [tag][length][value], tags
+// strictly ascending. A reader checks every field it knows and carries the ones it
+// does not, so a later library adds an attribute (owner, link count, device,
+// symlink target) as a new tag, and an older library that
+// rewrites the inode does not lose it. The first five are always present.
+const (
+	fieldMode  = 1
+	fieldSize  = 2
+	fieldMtime = 3
+	fieldAtime = 4
+	fieldCtime = 5
+)
+
 func encodeInode(in Inode) []byte {
 	var w writer
-	w.uvarint(uint64(in.Mode))
-	w.uvarint(in.Size)
-	w.varint(in.Mtime.UnixNano())
-	w.varint(in.Atime.UnixNano())
-	w.varint(in.Ctime.UnixNano())
+	field := func(tag uint64, value func(*writer)) {
+		var v writer
+		value(&v)
+		w.uvarint(tag)
+		w.bytes(v.b)
+	}
+	field(fieldMode, func(v *writer) { v.uvarint(uint64(in.Mode)) })
+	field(fieldSize, func(v *writer) { v.uvarint(in.Size) })
+	field(fieldMtime, func(v *writer) { v.varint(in.Mtime.UnixNano()) })
+	field(fieldAtime, func(v *writer) { v.varint(in.Atime.UnixNano()) })
+	field(fieldCtime, func(v *writer) { v.varint(in.Ctime.UnixNano()) })
+	w.raw(in.later)
 	return w.b
 }
 
 func decodeInode(id InodeID, b []byte) (Inode, error) {
+	in := Inode{ID: id}
 	r := reader{b: b}
-	in := Inode{ID: id, Mode: fs.FileMode(r.uvarint()), Size: r.uvarint()}
-	in.Mtime = time.Unix(0, r.varint())
-	in.Atime = time.Unix(0, r.varint())
-	in.Ctime = time.Unix(0, r.varint())
-	return in, r.done()
+	var seen, last uint64
+	for len(r.b) > 0 && r.err == nil {
+		start := r.b
+		tag, value := r.uvarint(), r.bytes()
+		if r.err != nil {
+			break
+		}
+		if tag <= last {
+			return in, fmt.Errorf("%w: inode field %d after %d", ErrCorrupt, tag, last)
+		}
+		last = tag
+		v := reader{b: value}
+		switch tag {
+		case fieldMode:
+			in.Mode = fs.FileMode(v.uvarint())
+		case fieldSize:
+			in.Size = v.uvarint()
+		case fieldMtime:
+			in.Mtime = time.Unix(0, v.varint())
+		case fieldAtime:
+			in.Atime = time.Unix(0, v.varint())
+		case fieldCtime:
+			in.Ctime = time.Unix(0, v.varint())
+		default:
+			in.later = append(in.later, start[:len(start)-len(r.b)]...)
+			continue
+		}
+		if err := v.done(); err != nil {
+			return in, fmt.Errorf("inode field %d: %w", tag, err)
+		}
+		seen |= 1 << tag
+	}
+	if err := r.done(); err != nil {
+		return in, err
+	}
+	if seen != 1<<fieldMode|1<<fieldSize|1<<fieldMtime|1<<fieldAtime|1<<fieldCtime {
+		return in, fmt.Errorf("%w: inode record lacks a required field", ErrCorrupt)
+	}
+	return in, nil
 }
 
 func encodeEntry(child InodeID, mode fs.FileMode) []byte {

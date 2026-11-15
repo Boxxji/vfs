@@ -20,8 +20,8 @@ import (
 // skips the first minChunk bytes unhashed, so it is also several times cheaper
 // than a plain rolling hash.
 //
-// The gear table below and the masks are part of the on-disk format: changing
-// either changes every cut and so every chunk id.
+// The gear derivation below and the masks are part of the on-disk layout:
+// changing either changes every cut and so every chunk id.
 const (
 	minChunk = 64 << 10
 	avgChunk = 512 << 10
@@ -35,25 +35,31 @@ const (
 	maskL   = (1<<(avgBits-2) - 1) << (64 - (avgBits - 2))
 )
 
-// gear maps a byte to 64 random bits, drawn from blake3's extendable output
-// over a fixed domain string so the table is reproducible without a literal.
-var gear [256]uint64
+// gear maps a byte to 64 random bits. Each Volume has its own table, drawn from
+// blake3's extendable output over its seed (stored in the Head, so it is as secret
+// as the Volume), which makes every cut point of a Volume unpredictable from
+// outside: the lengths of a file's chunks cannot be matched against the chunks of
+// a known file in another Volume. The derivation is part of the on-disk layout.
+type gear [256]uint64
 
-func init() {
+func newGear(seed [32]byte) *gear {
 	h := blake3.New()
-	_, _ = h.WriteString("hanzoai/vfs chunker gear table, format 2")
-	var seed [256 * 8]byte
-	_, _ = h.Digest().Read(seed[:])
-	for i := range gear {
-		gear[i] = binary.LittleEndian.Uint64(seed[i*8:])
+	_, _ = h.WriteString("hanzoai/vfs chunker gear table")
+	_, _ = h.Write(seed[:])
+	var raw [256 * 8]byte
+	_, _ = h.Digest().Read(raw[:])
+	var g gear
+	for i := range g {
+		g[i] = binary.LittleEndian.Uint64(raw[i*8:])
 	}
+	return &g
 }
 
 // cut returns the length of the first chunk of b. b is the next min(maxChunk,
 // remaining) bytes of the file, so a result shorter than len(b) is a content
 // cut and a result equal to len(b) is the window's end (the file's end, or
 // maxChunk). The result depends only on b[:result].
-func cut(b []byte) int {
+func cut(g *gear, b []byte) int {
 	n := len(b)
 	if n <= minChunk {
 		return n
@@ -62,13 +68,13 @@ func cut(b []byte) int {
 	var fp uint64
 	i := minChunk
 	for ; i < mid; i++ {
-		fp = fp<<1 + gear[b[i]]
+		fp = fp<<1 + g[b[i]]
 		if fp&maskS == 0 {
 			return i + 1
 		}
 	}
 	for ; i < n; i++ {
-		fp = fp<<1 + gear[b[i]]
+		fp = fp<<1 + g[b[i]]
 		if fp&maskL == 0 {
 			return i + 1
 		}

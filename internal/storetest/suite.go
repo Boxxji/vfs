@@ -20,17 +20,17 @@ func Run(t *testing.T, open func(t *testing.T) backend.Backend) {
 
 	t.Run("get put range delete", func(t *testing.T) {
 		be := open(t)
-		if _, _, err := be.Get(ctx, "a/b"); !errors.Is(err, backend.ErrNotFound) {
+		if _, _, err := be.Get(ctx, "a/b", backend.Unbounded); !errors.Is(err, backend.ErrNotFound) {
 			t.Fatalf("Get absent: %v, want ErrNotFound", err)
 		}
 		if err := be.Put(ctx, "a/b", []byte("0123456789")); err != nil {
 			t.Fatal(err)
 		}
-		got, v, err := be.Get(ctx, "a/b")
+		got, v, err := be.Get(ctx, "a/b", backend.Unbounded)
 		if err != nil || string(got) != "0123456789" || v == "" {
 			t.Fatalf("Get: %q %q %v", got, v, err)
 		}
-		if _, v2, _ := be.Get(ctx, "a/b"); v2 != v {
+		if _, v2, _ := be.Get(ctx, "a/b", backend.Unbounded); v2 != v {
 			t.Fatalf("version of unchanged key moved: %q then %q", v, v2)
 		}
 		r, err := be.GetRange(ctx, "a/b", 3, 4)
@@ -52,7 +52,7 @@ func Run(t *testing.T, open func(t *testing.T) backend.Backend) {
 		if err := be.Delete(ctx, "a/b"); err != nil {
 			t.Fatalf("Delete absent: %v", err)
 		}
-		if _, _, err := be.Get(ctx, "a/b"); !errors.Is(err, backend.ErrNotFound) {
+		if _, _, err := be.Get(ctx, "a/b", backend.Unbounded); !errors.Is(err, backend.ErrNotFound) {
 			t.Fatalf("Get after Delete: %v", err)
 		}
 	})
@@ -66,7 +66,7 @@ func Run(t *testing.T, open func(t *testing.T) backend.Backend) {
 		if _, err := be.PutIfAbsent(ctx, "head", []byte("two")); !errors.Is(err, backend.ErrConflict) {
 			t.Fatalf("second PutIfAbsent: %v, want ErrConflict", err)
 		}
-		got, v, _ := be.Get(ctx, "head")
+		got, v, _ := be.Get(ctx, "head", backend.Unbounded)
 		if string(got) != "one" || v != v1 {
 			t.Fatalf("a refused PutIfAbsent changed the object: %q %q (want one %q)", got, v, v1)
 		}
@@ -77,7 +77,7 @@ func Run(t *testing.T, open func(t *testing.T) backend.Backend) {
 		if _, err := be.PutIfVersion(ctx, "head", []byte("x"), "nothing"); !errors.Is(err, backend.ErrConflict) {
 			t.Fatalf("PutIfVersion on absent: %v, want ErrConflict", err)
 		}
-		if _, _, err := be.Get(ctx, "head"); err == nil {
+		if _, _, err := be.Get(ctx, "head", backend.Unbounded); err == nil {
 			t.Fatal("PutIfVersion on an absent key created it")
 		}
 		v1, _ := be.PutIfAbsent(ctx, "head", []byte("one"))
@@ -88,7 +88,7 @@ func Run(t *testing.T, open func(t *testing.T) backend.Backend) {
 		if _, err := be.PutIfVersion(ctx, "head", []byte("three"), v1); !errors.Is(err, backend.ErrConflict) {
 			t.Fatalf("PutIfVersion at a stale version: %v, want ErrConflict", err)
 		}
-		got, v, _ := be.Get(ctx, "head")
+		got, v, _ := be.Get(ctx, "head", backend.Unbounded)
 		if string(got) != "two" || v != v2 {
 			t.Fatalf("object after a refused write: %q %q, want two %q", got, v, v2)
 		}
@@ -101,7 +101,7 @@ func Run(t *testing.T, open func(t *testing.T) backend.Backend) {
 		be := open(t)
 		v0, _ := be.PutIfAbsent(ctx, "head", []byte("base"))
 		for round := range 20 {
-			_, v, _ := be.Get(ctx, "head")
+			_, v, _ := be.Get(ctx, "head", backend.Unbounded)
 			const racers = 8
 			var wins atomic.Int32
 			var wg sync.WaitGroup
@@ -171,13 +171,26 @@ func Run(t *testing.T, open func(t *testing.T) backend.Backend) {
 		}
 	})
 
+	t.Run("get is bounded", func(t *testing.T) {
+		be := open(t)
+		if err := be.Put(ctx, "k", []byte("0123456789")); err != nil {
+			t.Fatal(err)
+		}
+		if b, _, err := be.Get(ctx, "k", 10); err != nil || len(b) != 10 {
+			t.Fatalf("Get at exactly max: %d bytes, %v", len(b), err)
+		}
+		if b, _, err := be.Get(ctx, "k", 9); !errors.Is(err, backend.ErrTooLarge) || len(b) != 0 {
+			t.Fatalf("Get over max = %d bytes, %v; want ErrTooLarge and nothing", len(b), err)
+		}
+	})
+
 	t.Run("large object", func(t *testing.T) {
 		be := open(t)
 		big := bytes.Repeat([]byte("0123456789abcdef"), 1<<18) // 4 MiB
 		if err := be.Put(ctx, "pack/aa/big", big); err != nil {
 			t.Fatal(err)
 		}
-		got, _, err := be.Get(ctx, "pack/aa/big")
+		got, _, err := be.Get(ctx, "pack/aa/big", backend.Unbounded)
 		if err != nil || !bytes.Equal(got, big) {
 			t.Fatalf("large object round trip failed: %v", err)
 		}

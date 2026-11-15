@@ -39,7 +39,7 @@ func TestWrongKeyFailsClosed(t *testing.T) {
 }
 
 func roundOf(be backend.Backend) (uint64, error) {
-	b, _, err := be.Get(ctx, "head")
+	b, _, err := be.Get(ctx, "head", backend.Unbounded)
 	if err != nil {
 		return 0, err
 	}
@@ -98,7 +98,7 @@ func TestSwappedChunkIsRefused(t *testing.T) {
 			key = k
 		}
 	}
-	pack, _, _ := be.Get(ctx, key)
+	pack, _, _ := be.Get(ctx, key, backend.Unbounded)
 	half := len(pack) / 2
 	swapped := append(append([]byte(nil), pack[half:]...), pack[:half]...)
 	if err := be.Put(ctx, key, swapped); err != nil {
@@ -117,7 +117,7 @@ func TestSwappedChunkIsRefused(t *testing.T) {
 func TestRotation(t *testing.T) {
 	be := storetest.NewMem()
 	oldKey, newKey_ := newKey(t), newKey(t)
-	oldC := vfs.NewAgeCipher(oldKey)
+	oldC := vfs.Hybrid(oldKey)
 	if err := vfs.Create(ctx, cfg(be, oldC, 0)); err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +128,7 @@ func TestRotation(t *testing.T) {
 	old := write(t, v, vfs.RootInode, "old", content(80, 100_000)).ID
 	flush(t, v)
 
-	both := vfs.NewAgeCipher(newKey_, oldKey)
+	both := vfs.Hybrid(newKey_, oldKey)
 	v2, err := vfs.Attach(ctx, cfg(be, both, 2))
 	if err != nil {
 		t.Fatalf("attach under the rotating cipher: %v", err)
@@ -144,7 +144,7 @@ func TestRotation(t *testing.T) {
 	}
 	// The new key alone opens the Head and what was rewritten since, but not what
 	// only the old key sealed: nothing was bulk re-encrypted, and nothing was weakened.
-	only := reopen(t, be, vfs.NewAgeCipher(newKey_))
+	only := reopen(t, be, vfs.Hybrid(newKey_))
 	f, _ := only.Open(ctx, fresh)
 	if _, err := f.ReadAt(ctx, make([]byte, 100_000), 0); err != nil && !errors.Is(err, vfs.ErrUnknownKey) {
 		t.Fatalf("fresh chunk under the new key alone: %v", err)
@@ -165,7 +165,7 @@ func TestNothingKeyShapedOnDisk(t *testing.T) {
 	dir := t.TempDir()
 	be := reopenBackend(t, dir)
 	key := newKey(t)
-	c := vfs.NewAgeCipher(key)
+	c := vfs.Hybrid(key)
 	if err := vfs.Create(ctx, cfg(be, c, 0)); err != nil {
 		t.Fatal(err)
 	}

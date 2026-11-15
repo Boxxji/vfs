@@ -9,18 +9,64 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net/url"
+	"strings"
 )
 
 var (
 	// ErrNotFound is returned by Get when the requested key is absent.
 	ErrNotFound = errors.New("backend: key not found")
 
+	// ErrTooLarge is returned by Get when an object is larger than the bound the
+	// caller named, and by PutIfAbsent and PutIfVersion when the data is larger
+	// than the backend can write atomically. Nothing is written or returned.
+	ErrTooLarge = errors.New("backend: object too large")
+
 	// ErrConflict is returned by PutIfAbsent and PutIfVersion when the
 	// precondition failed: the key exists (PutIfAbsent), or its stored version
 	// is not the expected one, or it is absent (PutIfVersion). Nothing was written.
 	ErrConflict = errors.New("backend: conditional write lost")
 )
+
+// Unbounded is the max argument of Get for a caller that accepts any size.
+const Unbounded int64 = math.MaxInt64
+
+// Past returns max+1, the number of bytes to read to learn that an object is longer
+// than max, without overflowing when max is Unbounded.
+func Past(max int64) int64 {
+	if max == Unbounded {
+		return Unbounded
+	}
+	return max + 1
+}
+
+// ValidPrefix reports whether p can name a Volume's place in a bucket: slash
+// separated segments, none empty, none "." or "..", no NUL or other control
+// character, short enough to leave room for a key. A prefix is joined to keys by
+// a plain slash, and a store is free to treat "a//b" or "a/./b" as another spelling
+// of "a/b", so a spelling that could reach beyond the prefix is refused rather
+// than cleaned.
+func ValidPrefix(p string) error {
+	if len(p) > 512 {
+		return fmt.Errorf("backend: prefix of %d bytes, at most 512", len(p))
+	}
+	if p == "" {
+		return nil
+	}
+	for _, seg := range strings.Split(p, "/") {
+		switch seg {
+		case "", ".", "..":
+			return fmt.Errorf("backend: prefix %q has an empty, \".\" or \"..\" segment", p)
+		}
+		for _, r := range seg {
+			if r < 0x20 || r == 0x7f {
+				return fmt.Errorf("backend: prefix %q has a control character", p)
+			}
+		}
+	}
+	return nil
+}
 
 // Version is an opaque token naming one stored state of one key: the S3 ETag,
 // or for the file backend a digest of the content. Two Gets of an unchanged key
@@ -39,8 +85,10 @@ type Version string
 type Backend interface {
 	// Get returns the bytes stored at key and the Version naming exactly
 	// those bytes. If the key does not exist, the returned error wraps
-	// ErrNotFound (errors.Is(err, ErrNotFound)).
-	Get(ctx context.Context, key string) ([]byte, Version, error)
+	// ErrNotFound (errors.Is(err, ErrNotFound)). An object larger than max bytes
+	// is not read: the error wraps ErrTooLarge. A caller knows how large the
+	// object it asks for can be, so a store that answers with more is wrong.
+	Get(ctx context.Context, key string, max int64) ([]byte, Version, error)
 
 	// GetRange returns n bytes of key starting at off. A range that runs
 	// past the end of the object is an error, never a short read.
@@ -54,6 +102,8 @@ type Backend interface {
 	// PutIfAbsent writes data at key only if key does not exist (S3
 	// If-None-Match: *), atomically with the check, and returns the new
 	// Version. If key exists the error wraps ErrConflict and nothing is written.
+	// Data too large to write atomically is refused with ErrTooLarge, never
+	// written unconditionally.
 	PutIfAbsent(ctx context.Context, key string, data []byte) (Version, error)
 
 	// PutIfVersion writes data at key only if key exists and its current

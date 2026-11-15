@@ -69,7 +69,7 @@ func (v *Volume) putChunk(ctx context.Context, plain []byte) (chunkID, error) {
 	if err != nil || ok {
 		return id, err
 	}
-	frame, err := seal(v.c, plain)
+	frame, err := seal(v.c, chunkAAD(v.id, id), plain)
 	if err != nil {
 		return id, err
 	}
@@ -110,7 +110,7 @@ func (v *Volume) getChunk(ctx context.Context, id chunkID) ([]byte, error) {
 		}
 		return nil, fmt.Errorf("vfs: read chunk %x: %w", id[:6], err)
 	}
-	plain, err := unseal(v.c, frame)
+	plain, err := unseal(v.c, chunkAAD(v.id, id), frame)
 	if err != nil {
 		return nil, fmt.Errorf("vfs: open chunk %x: %w", id[:6], err)
 	}

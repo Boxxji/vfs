@@ -8,6 +8,9 @@ import (
 	"testing"
 )
 
+// testGear is the chunking table of a Volume whose seed is zero.
+var testGear = newGear([32]byte{})
+
 func randBytes(seed uint64, n int) []byte {
 	r := rand.New(rand.NewPCG(seed, seed^0x5eed))
 	b := make([]byte, n)
@@ -22,7 +25,7 @@ func chunks(data []byte) []int {
 	var out []int
 	for len(data) > 0 {
 		w := data[:min(len(data), maxChunk)]
-		n := cut(w)
+		n := cut(testGear, w)
 		out = append(out, n)
 		data = data[n:]
 	}
@@ -67,7 +70,7 @@ func TestCutBounds(t *testing.T) {
 // file is none.
 func TestCutOfShortInput(t *testing.T) {
 	for _, n := range []int{1, minChunk - 1, minChunk} {
-		if got := cut(randBytes(2, n)); got != n {
+		if got := cut(testGear, randBytes(2, n)); got != n {
 			t.Fatalf("cut of %d bytes = %d, want one chunk", n, got)
 		}
 	}
@@ -78,9 +81,9 @@ func TestCutOfShortInput(t *testing.T) {
 func TestCutDependsOnlyOnItsChunk(t *testing.T) {
 	data := randBytes(3, 8<<20)
 	for off := 0; off < len(data)-maxChunk; {
-		n := cut(data[off : off+maxChunk])
+		n := cut(testGear, data[off:off+maxChunk])
 		if n < maxChunk {
-			if got := cut(data[off : off+n+1000]); got != n {
+			if got := cut(testGear, data[off:off+n+1000]); got != n {
 				t.Fatalf("cut changed from %d to %d when 1000 bytes followed", n, got)
 			}
 		}
@@ -135,16 +138,36 @@ func slicesInsert(data []byte, at int, p []byte) []byte {
 	return append(out, data[at:]...)
 }
 
-// TestGearTableIsFixed pins the table: it is part of the format, and a change
+// TestGearTableIsFixed pins the derivation: it is part of the on-disk layout, and a change
 // would re-cut every file.
 func TestGearTableIsFixed(t *testing.T) {
 	var b []byte
-	for _, g := range gear {
+	for _, g := range testGear {
 		b = binary.LittleEndian.AppendUint64(b, g)
 	}
 	sum := sumChunk(b)
-	if got := fmt.Sprintf("%x", sum[:8]); got != "1e6df16f6f092cc7" {
+	if got := fmt.Sprintf("%x", sum[:8]); got != "3cb6406096c0f78d" {
 		t.Fatalf("gear table digest %s: the chunker changed, and with it every chunk id", got)
+	}
+}
+
+// TestGearDiffersPerVolume: two seeds give two tables, so the same file is cut at
+// different places in two Volumes and chunk lengths do not identify a known file.
+func TestGearDiffersPerVolume(t *testing.T) {
+	data := randBytes(21, 8<<20)
+	other := newGear([32]byte{1})
+	a, b := 0, 0
+	same := 0
+	for off := 0; off < len(data)-maxChunk; {
+		n, m := cut(testGear, data[off:off+maxChunk]), cut(other, data[off:off+maxChunk])
+		if n == m {
+			same++
+		}
+		a, b = a+1, b+1
+		off += n
+	}
+	if same == a {
+		t.Fatalf("two seeds cut %d chunks at the same places", a)
 	}
 }
 

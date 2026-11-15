@@ -13,6 +13,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -65,17 +66,25 @@ func version(data []byte) backend.Version {
 	return backend.Version(hex.EncodeToString(sum[:]))
 }
 
-func (f *fileBackend) Get(_ context.Context, key string) ([]byte, backend.Version, error) {
+func (f *fileBackend) Get(_ context.Context, key string, max int64) ([]byte, backend.Version, error) {
 	p := f.keyPath(key)
 	if p == "" {
 		return nil, "", fmt.Errorf("file backend: invalid key %q", key)
 	}
-	b, err := os.ReadFile(p)
+	fd, err := os.Open(p)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, "", fmt.Errorf("%w: %s", backend.ErrNotFound, key)
 		}
 		return nil, "", err
+	}
+	defer fd.Close()
+	b, err := io.ReadAll(io.LimitReader(fd, backend.Past(max)))
+	if err != nil {
+		return nil, "", err
+	}
+	if int64(len(b)) > max {
+		return nil, "", fmt.Errorf("%w: %s is larger than %d bytes", backend.ErrTooLarge, key, max)
 	}
 	return b, version(b), nil
 }

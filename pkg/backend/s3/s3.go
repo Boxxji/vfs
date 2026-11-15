@@ -56,8 +56,8 @@ type Config struct {
 	Bucket   string
 	Prefix   string // key prefix of the Volume inside the bucket
 
-	// Credentials are handed in by the caller (the agent reads them from Hanzo
-	// KMS). The backend never looks for a credential anywhere else.
+	// Credentials are handed in by the caller, from wherever it keeps them. The
+	// backend never looks for a credential anywhere else.
 	AccessKey string
 	SecretKey string
 }
@@ -66,6 +66,10 @@ type Config struct {
 func New(c Config) (backend.Backend, error) {
 	if c.Endpoint == "" || c.Bucket == "" {
 		return nil, fmt.Errorf("s3 backend: endpoint and bucket are required")
+	}
+	prefix := strings.Trim(c.Prefix, "/")
+	if err := backend.ValidPrefix(prefix); err != nil {
+		return nil, fmt.Errorf("s3 backend: %w", err)
 	}
 	cli, err := hs3.New(c.Endpoint, &hs3.Options{
 		Creds:  credentials.NewStaticV4(c.AccessKey, c.SecretKey, ""),
@@ -78,16 +82,28 @@ func New(c Config) (backend.Backend, error) {
 	return &s3Backend{
 		client: cli,
 		bucket: c.Bucket,
-		prefix: strings.Trim(c.Prefix, "/"),
-		desc:   "s3://" + c.Bucket + "/" + strings.Trim(c.Prefix, "/"),
+		prefix: prefix,
+		desc:   "s3://" + c.Bucket + "/" + prefix,
 	}, nil
 }
 
-// openS3 serves s3://bucket/prefix?endpoint=host:port[&insecure=1][&region=r]. The SDK
-// resolves the credential from its standard chain (the S3 access key and secret
-// environment variables, then an instance role); a service that holds its
-// credential elsewhere calls New instead.
+// openS3 serves s3://bucket/prefix?endpoint=host:port[&insecure=1][&region=r]. A
+// URL carries no credential: one in the userinfo would be copied into every log
+// line and error that names the backend, so it is refused. The SDK resolves the
+// credential from its standard chain (the S3 access key and secret environment
+// variables, then an instance role); a service that holds its credential elsewhere
+// calls New instead.
 func openS3(_ context.Context, u *url.URL) (backend.Backend, error) {
+	if u.User != nil {
+		return nil, fmt.Errorf("s3 backend: a credential in the URL is refused; use the environment or s3.New")
+	}
+	if u.Host == "" {
+		return nil, fmt.Errorf("s3 backend: missing bucket")
+	}
+	prefix := strings.Trim(u.Path, "/")
+	if err := backend.ValidPrefix(prefix); err != nil {
+		return nil, fmt.Errorf("s3 backend: %w", err)
+	}
 	q := u.Query()
 	cli, err := hs3.New(q.Get("endpoint"), &hs3.Options{
 		Creds:  credentials.NewChainCredentials([]credentials.Provider{&credentials.EnvAWS{}, &credentials.EnvMinio{}, &credentials.IAM{}}),
@@ -97,14 +113,11 @@ func openS3(_ context.Context, u *url.URL) (backend.Backend, error) {
 	if err != nil {
 		return nil, fmt.Errorf("s3 backend: %w", err)
 	}
-	if u.Host == "" {
-		return nil, fmt.Errorf("s3 backend: missing bucket in %q", u.String())
-	}
 	return &s3Backend{
 		client: cli,
 		bucket: u.Host,
-		prefix: strings.Trim(u.Path, "/"),
-		desc:   u.String(),
+		prefix: prefix,
+		desc:   "s3://" + u.Host + "/" + prefix,
 	}, nil
 }
 
@@ -135,7 +148,7 @@ func conflict(err error, key string) error {
 	return err
 }
 
-func (s *s3Backend) Get(ctx context.Context, key string) ([]byte, backend.Version, error) {
+func (s *s3Backend) Get(ctx context.Context, key string, max int64) ([]byte, backend.Version, error) {
 	obj, err := s.client.GetObject(ctx, s.bucket, s.k(key), hs3.GetObjectOptions{})
 	if err != nil {
 		return nil, "", notFound(err, key)
@@ -145,10 +158,14 @@ func (s *s3Backend) Get(ctx context.Context, key string) ([]byte, backend.Versio
 	// surfaces there. Read before Stat: a Stat first is its own HEAD, and the Read
 	// after it a second GET conditioned on that ETag, which fails with 412 if the
 	// object changed in between. Read first, the one GET carries the body and Stat
-	// reports the ETag of that same response without another request.
-	b, err := io.ReadAll(obj)
+	// reports the ETag of that same response without another request. One byte past
+	// max is read so a body that is too long is seen to be, and no further.
+	b, err := io.ReadAll(io.LimitReader(obj, backend.Past(max)))
 	if err != nil {
 		return nil, "", notFound(err, key)
+	}
+	if int64(len(b)) > max {
+		return nil, "", fmt.Errorf("%w: %s is larger than %d bytes", backend.ErrTooLarge, key, max)
 	}
 	info, err := obj.Stat()
 	if err != nil {
@@ -183,7 +200,17 @@ func (s *s3Backend) Put(ctx context.Context, key string, data []byte) error {
 	return err
 }
 
+// tooLarge refuses a conditional write the single-request path cannot carry. The
+// condition travels with the one PUT; a larger object goes in parts, and the parts
+// ignore it, so such a write would silently be unconditional.
+func tooLarge(key string, n int) error {
+	return fmt.Errorf("%w: a conditional write of %d bytes to %s exceeds the %d bytes one request carries", backend.ErrTooLarge, n, key, partSize)
+}
+
 func (s *s3Backend) PutIfAbsent(ctx context.Context, key string, data []byte) (backend.Version, error) {
+	if len(data) > partSize {
+		return "", tooLarge(key, len(data))
+	}
 	opts := hs3.PutObjectOptions{PartSize: partSize}
 	opts.SetMatchETagExcept("*")
 	info, err := s.client.PutObject(ctx, s.bucket, s.k(key), bytes.NewReader(data), int64(len(data)), opts)
@@ -194,6 +221,9 @@ func (s *s3Backend) PutIfAbsent(ctx context.Context, key string, data []byte) (b
 }
 
 func (s *s3Backend) PutIfVersion(ctx context.Context, key string, data []byte, v backend.Version) (backend.Version, error) {
+	if len(data) > partSize {
+		return "", tooLarge(key, len(data))
+	}
 	opts := hs3.PutObjectOptions{PartSize: partSize}
 	opts.SetMatchETag(string(v))
 	info, err := s.client.PutObject(ctx, s.bucket, s.k(key), bytes.NewReader(data), int64(len(data)), opts)

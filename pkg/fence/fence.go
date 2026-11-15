@@ -26,8 +26,8 @@
 // overwrites by the current owner MUST be admitted; only a LOWER round, the
 // signature of a writer whose lease was taken over and whose successor already
 // advanced the recorded round, is refused. A new owner seals the object to its
-// higher round exactly once (CarryForward); from that instant every lower-round
-// ship by the old owner is fenced forever.
+// higher round exactly once (Claim); from that instant every lower-round ship by
+// the old owner is fenced forever.
 //
 // # No admit/write window
 //
@@ -41,7 +41,9 @@
 package fence
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -72,37 +74,52 @@ const maxCASAttempts = 8
 // then Put" is NOT a valid implementation, since that gap is the exact race this
 // fence exists to close.
 type Backend interface {
-	Get(ctx context.Context, key string) ([]byte, backend.Version, error)
+	Get(ctx context.Context, key string, max int64) ([]byte, backend.Version, error)
 	PutIfAbsent(ctx context.Context, key string, data []byte) (backend.Version, error)
 	PutIfVersion(ctx context.Context, key string, data []byte, v backend.Version) (backend.Version, error)
 }
 
 // Store is a round-fenced writer over a Backend: one object per key, a monotone
-// round admitted only when at least the recorded one.
-type Store struct{ be Backend }
+// round admitted only when at least the recorded one. Every write it makes is
+// stamped with a token no other Store shares, so a Store that finds its own write
+// already in place (its first attempt landed and the reply was lost) knows it
+// succeeded rather than lost.
+type Store struct {
+	be    Backend
+	max   int64
+	token [tokenLen]byte
+}
 
-// New builds a Store over a conditional-write backend.
-func New(be Backend) *Store { return &Store{be: be} }
+const tokenLen = 16
+
+// New builds a Store over a conditional-write backend. max bounds the size of the
+// objects it will read (header and payload).
+func New(be Backend, max int64) *Store {
+	s := &Store{be: be, max: max}
+	if _, err := rand.Read(s.token[:]); err != nil {
+		panic("fence: no randomness: " + err.Error())
+	}
+	return s
+}
 
 // magic prefixes every record so a foreign object at the same key is detected
 // (errCorrupt) rather than silently misparsed as an absurd round.
-const magic = "rfnc1\x00"
+const magic = "fence\x00"
 
-func encode(round uint64, payload []byte) []byte {
-	buf := make([]byte, 0, len(magic)+8+len(payload))
+func (s *Store) encode(round uint64, payload []byte) []byte {
+	buf := make([]byte, 0, len(magic)+8+tokenLen+len(payload))
 	buf = append(buf, magic...)
-	var r [8]byte
-	binary.BigEndian.PutUint64(r[:], round)
-	buf = append(buf, r[:]...)
+	buf = binary.BigEndian.AppendUint64(buf, round)
+	buf = append(buf, s.token[:]...)
 	return append(buf, payload...)
 }
 
 func decode(b []byte) (round uint64, payload []byte, err error) {
 	m := len(magic)
-	if len(b) < m+8 || string(b[:m]) != magic {
+	if len(b) < m+8+tokenLen || string(b[:m]) != magic {
 		return 0, nil, errCorrupt
 	}
-	return binary.BigEndian.Uint64(b[m : m+8]), b[m+8:], nil
+	return binary.BigEndian.Uint64(b[m : m+8]), b[m+8+tokenLen:], nil
 }
 
 // write conditions a write on the version just read: create-only when the key was
@@ -117,11 +134,20 @@ func (s *Store) write(ctx context.Context, key string, data []byte, v backend.Ve
 	return err
 }
 
+// read returns the object's bytes and version, or nil and "" if it is absent.
+func (s *Store) read(ctx context.Context, key string) ([]byte, backend.Version, error) {
+	data, version, err := s.be.Get(ctx, key, s.max)
+	if errors.Is(err, backend.ErrNotFound) {
+		return nil, "", nil
+	}
+	return data, version, err
+}
+
 // Create writes payload at key at round 0, only if key does not exist. It is how
 // an object is born: Put would admit round 0 over an existing round-0 object.
 // If key exists the error wraps backend.ErrConflict.
 func (s *Store) Create(ctx context.Context, key string, payload []byte) error {
-	if _, err := s.be.PutIfAbsent(ctx, key, encode(0, payload)); err != nil {
+	if _, err := s.be.PutIfAbsent(ctx, key, s.encode(0, payload)); err != nil {
 		return fmt.Errorf("fence: create %s: %w", key, err)
 	}
 	return nil
@@ -134,22 +160,34 @@ func (s *Store) Create(ctx context.Context, key string, payload []byte) error {
 // cached one). If a concurrent writer's write lands first, our CAS fails and we
 // retry: re-read the now-authoritative round, re-run the check (a lower-round
 // racer now loses as ErrStaleRound; an equal-or-higher one retries the CAS
-// against the new version). The store is the sole arbiter of which round owns the
-// key. An absent key is recorded round 0, so any round admits a first write.
+// against the new version). If the re-read finds exactly the bytes we wrote, an
+// earlier attempt of ours landed and Put reports success. The store is the sole
+// arbiter of which round owns the key. An absent key is recorded round 0, so any
+// round admits a first write.
 func (s *Store) Put(ctx context.Context, key string, payload []byte, round uint64) error {
 	if s == nil || s.be == nil {
 		return fmt.Errorf("fence: nil store")
 	}
+	want := s.encode(round, payload)
 	var lastErr error
 	for range maxCASAttempts {
-		recorded, version, err := s.current(ctx, key)
+		data, version, err := s.read(ctx, key)
 		if err != nil {
-			return err
+			return fmt.Errorf("fence: read %s: %w", key, err)
+		}
+		if bytes.Equal(data, want) {
+			return nil
+		}
+		var recorded uint64
+		if data != nil {
+			if recorded, _, err = decode(data); err != nil {
+				return err
+			}
 		}
 		if round < recorded {
 			return fmt.Errorf("%w: key=%s round=%d recorded=%d", ErrStaleRound, key, round, recorded)
 		}
-		if err := s.write(ctx, key, encode(round, payload), version); err != nil {
+		if err := s.write(ctx, key, want, version); err != nil {
 			if errors.Is(err, backend.ErrConflict) {
 				lastErr = err
 				continue // re-read the winner's state and retry.
@@ -161,34 +199,38 @@ func (s *Store) Put(ctx context.Context, key string, payload []byte, round uint6
 	return fmt.Errorf("%w: exhausted %d attempts fencing %s at round %d", lastErr, maxCASAttempts, key, round)
 }
 
-// CarryForward is the safe TAKEOVER seal: it reads the latest durably-stored
-// payload for key and re-seals it UNCHANGED at round, invoking hydrate on that
-// payload first. It exists because a successor must never seal a payload it read
-// BEFORE a predecessor's last landed write, or that acknowledged write would be
-// clobbered. The read and the seal are one compare-and-set on the same version:
-// if a predecessor write lands in between, the CAS conflicts and CarryForward
-// retries, re-reading the newer payload, re-hydrating, and re-sealing IT. After
-// CarryForward returns, every predecessor write at a round below `round` is fenced.
+// Claim is the safe TAKEOVER seal: it reads the latest durably-stored payload for
+// key and re-seals it UNCHANGED at round, invoking hydrate on that payload first.
+// It exists because a successor must never seal a payload it read BEFORE a
+// predecessor's last landed write, or that acknowledged write would be clobbered.
+// The read and the seal are one compare-and-set on the same version: if a
+// predecessor write lands in between, the CAS conflicts and Claim retries,
+// re-reading the newer payload, re-hydrating, and re-sealing IT. After Claim
+// returns, every predecessor write at a round below `round` is fenced. If a retry
+// finds exactly the record it wrote, its first attempt landed and the reply was
+// lost: that is success, not a lost race.
 //
 // hydrate receives the payload and the round recorded with it, and may refuse the
-// takeover by returning an error (CarryForward returns it and writes nothing). It
-// may run more than once across retries, so it must be idempotent. An absent key is
+// takeover by returning an error (Claim returns it and writes nothing). It may run
+// more than once across retries, so it must be idempotent. An absent key is
 // recorded round 0 with a nil payload.
-func (s *Store) CarryForward(ctx context.Context, key string, round uint64, hydrate func(payload []byte, recorded uint64) error) error {
+func (s *Store) Claim(ctx context.Context, key string, round uint64, hydrate func(payload []byte, recorded uint64) error) error {
 	if s == nil || s.be == nil {
 		return fmt.Errorf("fence: nil store")
 	}
 	var lastErr error
+	var last []byte
 	for range maxCASAttempts {
-		data, version, err := s.be.Get(ctx, key)
+		data, version, err := s.read(ctx, key)
+		if err != nil {
+			return fmt.Errorf("fence: claim read %s: %w", key, err)
+		}
+		if last != nil && bytes.Equal(data, last) {
+			return nil
+		}
 		var recorded uint64
 		var payload []byte
-		switch {
-		case errors.Is(err, backend.ErrNotFound):
-			version = ""
-		case err != nil:
-			return fmt.Errorf("fence: carry-forward read %s: %w", key, err)
-		default:
+		if data != nil {
 			if recorded, payload, err = decode(data); err != nil {
 				return err
 			}
@@ -198,25 +240,26 @@ func (s *Store) CarryForward(ctx context.Context, key string, round uint64, hydr
 		}
 		if hydrate != nil {
 			if err := hydrate(payload, recorded); err != nil {
-				return fmt.Errorf("fence: carry-forward hydrate %s: %w", key, err)
+				return fmt.Errorf("fence: claim hydrate %s: %w", key, err)
 			}
 		}
-		if err := s.write(ctx, key, encode(round, payload), version); err != nil {
+		last = s.encode(round, payload)
+		if err := s.write(ctx, key, last, version); err != nil {
 			if errors.Is(err, backend.ErrConflict) {
 				lastErr = err
 				continue // a predecessor's write landed; re-read it and carry it forward.
 			}
-			return fmt.Errorf("fence: carry-forward seal %s: %w", key, err)
+			return fmt.Errorf("fence: claim seal %s: %w", key, err)
 		}
 		return nil
 	}
-	return fmt.Errorf("%w: exhausted %d attempts carrying forward %s at round %d", lastErr, maxCASAttempts, key, round)
+	return fmt.Errorf("%w: exhausted %d attempts claiming %s at round %d", lastErr, maxCASAttempts, key, round)
 }
 
 // Get returns the fenced payload and the round it was written at, or an error
 // wrapping backend.ErrNotFound when key is absent.
 func (s *Store) Get(ctx context.Context, key string) ([]byte, uint64, error) {
-	data, _, err := s.be.Get(ctx, key)
+	data, _, err := s.be.Get(ctx, key, s.max)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -230,23 +273,10 @@ func (s *Store) Get(ctx context.Context, key string) ([]byte, uint64, error) {
 // Round returns the round currently recorded for key, or 0 if the object is
 // absent: the value a new owner exceeds to claim the writer role.
 func (s *Store) Round(ctx context.Context, key string) (uint64, error) {
-	round, _, err := s.current(ctx, key)
+	data, _, err := s.read(ctx, key)
+	if err != nil || data == nil {
+		return 0, err
+	}
+	round, _, err := decode(data)
 	return round, err
-}
-
-// current returns the recorded round (0 if absent) and the version token to
-// condition the next write on ("" if absent).
-func (s *Store) current(ctx context.Context, key string) (round uint64, version backend.Version, err error) {
-	data, version, err := s.be.Get(ctx, key)
-	switch {
-	case errors.Is(err, backend.ErrNotFound):
-		return 0, "", nil
-	case err != nil:
-		return 0, "", fmt.Errorf("fence: read %s: %w", key, err)
-	}
-	round, _, err = decode(data)
-	if err != nil {
-		return 0, "", err
-	}
-	return round, version, nil
 }

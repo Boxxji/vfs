@@ -67,14 +67,19 @@ func decodeNode(b []byte) (*node, error) {
 type shards struct {
 	be    backend.Backend
 	c     Cipher
+	aad   []byte // what every shard is sealed to: the Volume
 	cache *lru[ref, *node]
 }
+
+// maxShard bounds what a read will accept for a shard: a node ends at nodeMax, by
+// at most one record more.
+const maxShard = 2 * nodeMax
 
 func (s *shards) load(ctx context.Context, r ref) (*node, error) {
 	if n, ok := s.cache.get(r); ok {
 		return n, nil
 	}
-	sealed, _, err := s.be.Get(ctx, shardKey(r))
+	sealed, _, err := s.be.Get(ctx, shardKey(r), maxShard)
 	if err != nil {
 		if errors.Is(err, backend.ErrNotFound) {
 			return nil, fmt.Errorf("%w: shard %x is missing", ErrCorrupt, r[:6])
@@ -84,7 +89,7 @@ func (s *shards) load(ctx context.Context, r ref) (*node, error) {
 	if blake3.Sum256(sealed) != r {
 		return nil, fmt.Errorf("%w: shard %x does not hash to its name", ErrCorrupt, r[:6])
 	}
-	plain, err := unseal(s.c, sealed)
+	plain, err := unseal(s.c, s.aad, sealed)
 	if err != nil {
 		return nil, fmt.Errorf("vfs: open shard %x: %w", r[:6], err)
 	}
@@ -101,7 +106,7 @@ func (s *shards) load(ctx context.Context, r ref) (*node, error) {
 func (s *shards) store(ctx context.Context, n *node) (ref, error) {
 	plain := n.encode()
 	n.size = int64(len(plain))
-	sealed, err := seal(s.c, plain)
+	sealed, err := seal(s.c, s.aad, plain)
 	if err != nil {
 		return none, err
 	}

@@ -91,7 +91,7 @@ func TestMountChild(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg := vfs.Config{Backend: be, Cipher: vfs.NewAgeCipher(key), Round: round}
+	cfg := vfs.Config{Backend: be, Cipher: vfs.Hybrid(key), Round: round}
 	if round == 1 {
 		if err := vfs.Create(context.Background(), cfg); err != nil {
 			t.Fatal(err)
@@ -198,7 +198,7 @@ func TestFUSEPOSIX(t *testing.T) {
 		t.Fatal(err)
 	}
 	be, _ := backend.Open(context.Background(), "file://"+store)
-	ro, err := vfs.Open(context.Background(), vfs.Config{Backend: be, Cipher: vfs.NewAgeCipher(key)})
+	ro, err := vfs.Open(context.Background(), vfs.Config{Backend: be, Cipher: vfs.Hybrid(key)})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -45,7 +45,7 @@ func (s *BackendStore) Put(ctx context.Context, key string, data []byte) error {
 // Get returns the snapshot bytes and their authoritative content version (recomputed
 // from the bytes, so it always matches what a writer stored).
 func (s *BackendStore) Get(ctx context.Context, key string) ([]byte, string, error) {
-	data, _, err := s.be.Get(ctx, key)
+	data, _, err := s.be.Get(ctx, key, backend.Unbounded)
 	if err != nil {
 		return nil, "", err
 	}
@@ -55,7 +55,7 @@ func (s *BackendStore) Get(ctx context.Context, key string) ([]byte, string, err
 // Version returns the cheap sidecar version, or "" when absent (a first-ever key or
 // a legacy object with no sidecar — the reader then pulls once).
 func (s *BackendStore) Version(ctx context.Context, key string) (string, error) {
-	v, _, err := s.be.Get(ctx, verKey(key))
+	v, _, err := s.be.Get(ctx, verKey(key), 1<<10)
 	if errors.Is(err, backend.ErrNotFound) {
 		return "", nil
 	}

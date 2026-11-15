@@ -1,6 +1,7 @@
 package vfs
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"io"
@@ -10,10 +11,22 @@ import (
 	"time"
 )
 
-// inlineMax is the largest file stored whole in a metadata record. Larger files
-// are chunked. A file's form is a function of its size alone, so a given
-// content has exactly one representation.
-const inlineMax = 16 << 10
+// small is the largest file stored whole in a metadata record. Larger files are
+// chunked. A file's form is a function of its size alone, so a given content has
+// exactly one representation.
+const small = 16 << 10
+
+// MaxSize is the largest a file can be: 4 EiB, far past anything a store holds,
+// chosen so offsets and lengths never overflow a signed 64-bit integer. A file
+// may be declared much larger than the bytes written to it. What it costs follows
+// the runs of bytes written, not its size: a hole has no chunks, no records and no
+// memory.
+const MaxSize = 1 << 62
+
+// spanCost is what each separate unsettled write is charged beyond its bytes: the
+// slice header, the list slot and the allocation it occupies. Without it a million
+// one-byte writes would be accounted as a megabyte and cost a hundred.
+const spanCost = 64
 
 // fileState is one file's content as the Volume holds it: the settled bytes
 // (inline, or a list of chunks) plus the writes made since, which are chunked,
@@ -24,8 +37,8 @@ type fileState struct {
 	refs int  // open handles
 	gone bool // removed; handles fail
 
-	// The settled content: inline bytes, or chunks sorted by offset and
-	// covering [0, base) without gaps.
+	// The settled content: inline bytes, or chunks sorted by offset. Chunks need
+	// not touch: where none covers a byte, the byte is a hole and reads as zero.
 	inline []byte
 	ext    []extent
 	base   uint64
@@ -33,13 +46,13 @@ type fileState struct {
 	// Writes since. size is the file's length now. limit is how much of the
 	// settled content still counts: truncating below it voids the rest, so a
 	// later extension reads zeros, not the old bytes. Bytes in [limit, size)
-	// that no write covers are zeros.
+	// that no write covers are a hole too.
 	size    uint64
 	limit   uint64
 	mtime   time.Time
 	changed bool
 	dirty   []span // sorted, disjoint, never touching
-	dirtyN  int64
+	dirtyN  int64  // bytes plus spanCost per span
 }
 
 // span is a run of bytes written at an offset.
@@ -152,16 +165,27 @@ func (v *Volume) read(ctx context.Context, f *fileState, p []byte, off uint64) (
 	return int(n), nil
 }
 
-// readBase copies settled bytes [off, off+len(p)) into p.
+// readBase copies settled bytes [off, off+len(p)) into p; a byte no chunk covers
+// is a hole and reads as zero.
 func (v *Volume) readBase(ctx context.Context, f *fileState, p []byte, off uint64) error {
 	if f.ext == nil {
-		copy(p, f.inline[off:])
+		n := 0
+		if off < uint64(len(f.inline)) {
+			n = copy(p, f.inline[off:])
+		}
+		clear(p[n:])
 		return nil
 	}
 	i := sort.Search(len(f.ext), func(i int) bool { return f.ext[i].end() > off })
 	for len(p) > 0 {
-		if i == len(f.ext) {
-			return fmt.Errorf("%w: file %d has no chunk at %d", ErrCorrupt, f.ino, off)
+		if i == len(f.ext) || f.ext[i].off > off {
+			hole := uint64(len(p))
+			if i < len(f.ext) {
+				hole = min(hole, f.ext[i].off-off)
+			}
+			clear(p[:hole])
+			p, off = p[hole:], off+hole
+			continue
 		}
 		e := f.ext[i]
 		plain, err := v.getChunk(ctx, e.id)
@@ -182,6 +206,9 @@ func (h *File) WriteAt(ctx context.Context, p []byte, off int64) (int, error) {
 	}
 	if len(p) == 0 {
 		return 0, nil
+	}
+	if uint64(off)+uint64(len(p)) > MaxSize {
+		return 0, fmt.Errorf("%w: a write to %d", ErrTooBig, uint64(off)+uint64(len(p)))
 	}
 	v := h.v
 	v.mu.Lock()
@@ -227,9 +254,9 @@ func (v *Volume) write(f *fileState, p []byte, off uint64) {
 		copy(buf[off-lo:], p)
 		merged = span{lo, buf}
 	}
-	grown := int64(len(merged.data))
+	grown := int64(len(merged.data)) + spanCost
 	for _, s := range d[i:j] {
-		grown -= int64(len(s.data))
+		grown -= int64(len(s.data)) + spanCost
 	}
 	f.dirty = slices.Replace(d, i, j, merged)
 	f.dirtyN += grown
@@ -239,6 +266,9 @@ func (v *Volume) write(f *fileState, p []byte, off uint64) {
 // Truncate sets the file's length. Shrinking discards the bytes past it for
 // good; growing adds zeros.
 func (h *File) Truncate(ctx context.Context, size uint64) error {
+	if size > MaxSize {
+		return fmt.Errorf("%w: %d bytes", ErrTooBig, size)
+	}
 	h.v.mu.Lock()
 	defer h.v.mu.Unlock()
 	if err := h.v.writable(); err != nil {
@@ -253,6 +283,9 @@ func (h *File) Truncate(ctx context.Context, size uint64) error {
 
 // Truncate sets the length of the file with inode ino, as File.Truncate does.
 func (v *Volume) Truncate(ctx context.Context, ino InodeID, size uint64) error {
+	if size > MaxSize {
+		return fmt.Errorf("%w: %d bytes", ErrTooBig, size)
+	}
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	if err := v.writable(); err != nil {
@@ -279,7 +312,7 @@ func (v *Volume) truncate(f *fileState, size uint64) {
 				s.data = s.data[:size-s.off]
 			}
 			kept = append(kept, s)
-			n += int64(len(s.data))
+			n += int64(len(s.data)) + spanCost
 		}
 		v.dirty += n - f.dirtyN
 		f.dirty, f.dirtyN = kept, n
@@ -298,8 +331,8 @@ func (h *File) Close() error {
 	return nil
 }
 
-// settleAll settles every changed file, then forgets files nobody holds.
-func (v *Volume) settleAll(ctx context.Context) error {
+// sweep settles every changed file, then forgets files nobody holds.
+func (v *Volume) sweep(ctx context.Context) error {
 	for ino, f := range v.files {
 		if f.changed {
 			if err := v.settle(ctx, f); err != nil {
@@ -329,14 +362,12 @@ func (f *fileState) touched(a, b uint64) bool {
 // unchanged and begins where the new cutting stands is exactly a chunk the new
 // cutting would produce again: it is kept, and cutting resumes after it. The
 // result is the chunk list a cut of the whole file would give, found by reading
-// and sealing only the chunks around the edit. The chunk that ended the old file
-// is kept only if the file still ends there, since it was cut by the end of the
-// file, not by its bytes.
+// and sealing only the chunks around the edit.
 func (v *Volume) settle(ctx context.Context, f *fileState) error {
 	var inline []byte
 	var out []extent
 
-	if f.size <= inlineMax {
+	if f.size <= small {
 		inline = make([]byte, f.size)
 		if _, err := v.read(ctx, f, inline, 0); err != nil && err != io.EOF {
 			return err
@@ -354,7 +385,7 @@ func (v *Volume) settle(ctx context.Context, f *fileState) error {
 	}
 
 	// Diff against the settled records and queue only what differs.
-	if f.size <= inlineMax {
+	if f.size <= small {
 		if f.size > 0 {
 			v.over.put(keyInline(f.ino), inline)
 		} else {
@@ -385,7 +416,7 @@ func (v *Volume) settle(ctx context.Context, f *fileState) error {
 	f.inline, f.ext, f.base, f.limit = inline, out, f.size, f.size
 	v.dirty -= f.dirtyN
 	f.dirty, f.dirtyN, f.changed = nil, 0, false
-	if f.size <= inlineMax {
+	if f.size <= small {
 		f.ext = nil
 	} else {
 		f.inline = nil
@@ -393,35 +424,94 @@ func (v *Volume) settle(ctx context.Context, f *fileState) error {
 	return nil
 }
 
-// recut returns the chunk list of the file's content now, uploading new chunks.
-func (v *Volume) recut(ctx context.Context, f *fileState) ([]extent, error) {
-	clean := func(e extent) bool {
-		return e.end() <= min(f.size, f.limit) && !f.touched(e.off, e.end()) && (e.end() < f.base || e.end() == f.size)
+// run is a stretch of a file that holds written bytes: [a, b).
+type run struct{ a, b uint64 }
+
+// runs returns, in order, the stretches of the file that hold written bytes now:
+// the settled chunks and inline bytes that still count, and the unsettled writes.
+// Everything between them is a hole.
+func (f *fileState) runs() []run {
+	var rs []run
+	lim := min(f.size, f.limit)
+	add := func(a, b uint64) {
+		if b = min(b, f.size); a < b {
+			rs = append(rs, run{a, b})
+		}
 	}
-	var out []extent
-	window := make([]byte, min(f.size, maxChunk))
-	var pos uint64
+	for _, e := range f.ext {
+		if e.off >= lim {
+			break
+		}
+		add(e.off, min(e.end(), lim))
+	}
+	if f.ext == nil {
+		add(0, min(uint64(len(f.inline)), lim))
+	}
+	for _, s := range f.dirty {
+		add(s.off, s.end())
+	}
+	slices.SortFunc(rs, func(x, y run) int { return cmp.Compare(x.a, y.a) })
+	merged := rs[:0]
+	for _, r := range rs {
+		if n := len(merged); n > 0 && r.a <= merged[n-1].b {
+			merged[n-1].b = max(merged[n-1].b, r.b)
+		} else {
+			merged = append(merged, r)
+		}
+	}
+	return merged
+}
+
+// recut returns the chunk list of the file's content now, uploading new chunks.
+// It cuts each run of written bytes on its own, from the run's first byte, so
+// chunks never span a hole and a hole costs nothing however long it is.
+func (v *Volume) recut(ctx context.Context, f *fileState) ([]extent, error) {
+	runs := f.runs()
+	var widest uint64
+	for _, r := range runs {
+		widest = max(widest, r.b-r.a)
+	}
+	window := make([]byte, min(widest, maxChunk))
 	old := f.ext
-	for pos < f.size {
-		for len(old) > 0 && old[0].off < pos {
-			old = old[1:]
+	var out []extent
+	for _, r := range runs {
+		// A settled chunk is kept if its bytes are unchanged and the cut that ended
+		// it would still end it. A content cut does not depend on what follows. A
+		// chunk that ended a run was cut by the run's end, so it is kept only if the
+		// run still ends there.
+		clean := func() bool {
+			e := old[0]
+			if e.end() > min(f.size, f.limit) || f.touched(e.off, e.end()) {
+				return false
+			}
+			endsRun := len(old) == 1 || old[1].off != e.end()
+			return !endsRun || e.end() == r.b
 		}
-		if len(old) > 0 && old[0].off == pos && clean(old[0]) {
-			out = append(out, old[0])
-			pos = old[0].end()
-			continue
+		for pos := r.a; pos < r.b; {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			for len(old) > 0 && old[0].off < pos {
+				old = old[1:]
+			}
+			if len(old) > 0 && old[0].off == pos && clean() {
+				out = append(out, old[0])
+				pos = old[0].end()
+				old = old[1:]
+				continue
+			}
+			w := window[:min(uint64(len(window)), r.b-pos)]
+			if _, err := v.read(ctx, f, w, pos); err != nil && err != io.EOF {
+				return nil, err
+			}
+			piece := w[:cut(v.gear, w)]
+			id, err := v.putChunk(ctx, piece)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, extent{off: pos, n: uint32(len(piece)), id: id})
+			pos += uint64(len(piece))
 		}
-		w := window[:min(uint64(len(window)), f.size-pos)]
-		if _, err := v.read(ctx, f, w, pos); err != nil && err != io.EOF {
-			return nil, err
-		}
-		piece := w[:cut(w)]
-		id, err := v.putChunk(ctx, piece)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, extent{off: pos, n: uint32(len(piece)), id: id})
-		pos += uint64(len(piece))
 	}
 	return out, nil
 }

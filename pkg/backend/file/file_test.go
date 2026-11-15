@@ -29,7 +29,7 @@ func TestFilePutGetDelete(t *testing.T) {
 	if err := be.Put(ctx, "blocks/aa/abc.zap.age", []byte("hello")); err != nil {
 		t.Fatalf("put: %v", err)
 	}
-	got, _, err := be.Get(ctx, "blocks/aa/abc.zap.age")
+	got, _, err := be.Get(ctx, "blocks/aa/abc.zap.age", backend.Unbounded)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
@@ -48,7 +48,7 @@ func TestFilePutGetDelete(t *testing.T) {
 	if err := be.Delete(ctx, "blocks/aa/abc.zap.age"); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
-	if _, _, err := be.Get(ctx, "blocks/aa/abc.zap.age"); !errors.Is(err, backend.ErrNotFound) {
+	if _, _, err := be.Get(ctx, "blocks/aa/abc.zap.age", backend.Unbounded); !errors.Is(err, backend.ErrNotFound) {
 		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
 

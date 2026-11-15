@@ -134,7 +134,7 @@ func startReal(bin string) (*Real, error) {
 	r.cmd = exec.Command(bin, "server", "-dir="+data, "-ip=127.0.0.1", "-ip.bind=127.0.0.1",
 		fmt.Sprintf("-master.port=%d", ports[0]), fmt.Sprintf("-volume.port=%d", ports[1]), fmt.Sprintf("-filer.port=%d", ports[2]),
 		"-s3", fmt.Sprintf("-s3.port=%d", ports[3]), "-s3.config="+confPath,
-		"-master.volumeSizeLimitMB=64", "-volume.max=16", "-s3.allowDeleteBucketNotEmpty")
+		"-master.volumeSizeLimitMB=64", "-volume.max=128", "-s3.allowDeleteBucketNotEmpty")
 	r.cmd.Dir = dir
 	r.cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + dir}
 	if err := r.cmd.Start(); err != nil {

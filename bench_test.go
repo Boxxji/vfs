@@ -12,7 +12,7 @@ import (
 // fileVolume attaches a new Volume on the file backend under the test's temp dir.
 func fileVolume(tb testing.TB) (dir string, c vfs.Cipher, v *vfs.Volume) {
 	dir = tb.TempDir()
-	c = vfs.NewAgeCipher(newKey(tb))
+	c = vfs.Hybrid(newKey(tb))
 	if err := vfs.Create(ctx, cfg(reopenBackendTB(tb, dir), c, 0)); err != nil {
 		tb.Fatal(err)
 	}
@@ -101,7 +101,7 @@ func TestFlushLatency(t *testing.T) {
 		percentile(ds, 0.5).Round(time.Millisecond), percentile(ds, 0.9).Round(time.Millisecond), percentile(ds, 0.98).Round(time.Millisecond), percentile(ds, 1).Round(time.Millisecond), 1/percentile(ds, 0.5).Seconds())
 }
 
-// TestSustainedWriteWithFsync is the workload the format 1 notes measured: 64 KiB
+// TestSustainedWriteWithFsync is the workload the previous engine's notes measured: 64 KiB
 // writes round-robin over 16 files, a Flush after every write, for 10 seconds.
 func TestSustainedWriteWithFsync(t *testing.T) {
 	if testing.Short() {
@@ -135,6 +135,9 @@ func TestSustainedWriteWithFsync(t *testing.T) {
 
 // TestObjectsPerThousandSmallFiles counts the objects 1,000 small files cost.
 func TestObjectsPerThousandSmallFiles(t *testing.T) {
+	if testing.Short() {
+		t.Skip("a measurement: the scale step runs it without the race detector")
+	}
 	be, _, v := newMem(t)
 	dir := mkdir(t, v, vfs.RootInode, "d")
 	be.Reset()

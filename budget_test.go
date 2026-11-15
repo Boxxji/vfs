@@ -18,7 +18,7 @@ import (
 // chunk size is measured here on random bytes, and the packs follow from the byte
 // count and the per-chunk sealing overhead measured on a real sealed chunk. The
 // total must stay at or under the ~40,000 objects a 4 MiB-per-object layout
-// would cost, where the 4 KiB-block layout of format 1 cost 39,321,600.
+// would cost.
 func TestObjectBudget150GiB(t *testing.T) {
 	if testing.Short() {
 		t.Skip("scale test")
@@ -50,15 +50,15 @@ func TestObjectBudget150GiB(t *testing.T) {
 		{"mixed", rest([]class{{70000, 4 << 10}, {25000, 100 << 10}, {4900, 2 << 20}}, 100)},
 		// The worst shape for the object count: every small file as large as an
 		// inline file can be, so the most bytes go into metadata shards.
-		{"all-inline", rest([]class{{99000, inlineMax}}, 1000)},
+		{"all-inline", rest([]class{{99000, small}}, 1000)},
 	} {
 		t.Run(dist.name, func(t *testing.T) {
 			be := &discard{}
-			tr := newTree(&shards{be: be, c: plainCipher{}, cache: newLRU[ref, *node](64 << 20)})
+			tr := newTree(&shards{be: be, c: plainCipher{}, aad: []byte("test"), cache: newLRU[ref, *node](64 << 20)})
 			var ino, nChunks, files int
 			var bytesTotal float64
 			var pending []entry
-			zeros := make([]byte, inlineMax)
+			zeros := make([]byte, small)
 			put := func(k, v []byte) { pending = append(pending, entry{k, v}) }
 			nextPack := 0
 			for _, k := range dist.classes {
@@ -68,7 +68,7 @@ func TestObjectBudget150GiB(t *testing.T) {
 					bytesTotal += float64(k.size)
 					put(keyInode(InodeID(ino)), encodeInode(Inode{Mode: 0o644, Size: uint64(k.size)}))
 					put(keyEntry(InodeID(1+ino%1000), fmt.Sprintf("file%06d", ino)), encodeEntry(InodeID(ino), 0))
-					if k.size <= inlineMax {
+					if k.size <= small {
 						put(keyInline(InodeID(ino)), zeros[:k.size])
 						continue
 					}
@@ -129,7 +129,7 @@ func TestAgeFrameOverhead(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, n := range []int{minChunk, 1 << 20, maxChunk} {
-		frame, err := seal(NewAgeCipher(k), make([]byte, n))
+		frame, err := seal(Hybrid(k), nil, make([]byte, n))
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -1,12 +1,11 @@
 // Command vfs creates, fills, reads and mounts a Volume.
 //
 // The Volume key is read from standard input, never from a file or the
-// environment: `hanzo kms secrets get <path> | vfs get /etc/hosts --backend ...`.
-// One way, and the one that cannot leave a key on disk, in argv or in the process
-// environment, that composes with any secret store that can print to a pipe, and
-// that is the same shape the cloud agent has (it is handed a Cipher by KMS). The
-// input is one hybrid post-quantum identity per line; the first seals new
-// objects, the others are retired keys that still open old ones.
+// environment: `secret-tool print ... | vfs get /etc/hosts --backend ...`. One way,
+// and the one that cannot leave a key in a file, in argv or in the process
+// environment; it composes with any secret store that can print to a pipe. The
+// input is one hybrid post-quantum identity per line; the first seals new objects,
+// the others are retired keys that still open old ones.
 package main
 
 import (
@@ -68,7 +67,7 @@ func (s stdinKeys) Cipher(context.Context) (vfs.Cipher, error) {
 	if len(ids) == 0 {
 		return nil, errors.New("no key on standard input: pipe in the Volume key (see `vfs keygen`)")
 	}
-	return vfs.NewAgeCipher(ids[0], ids[1:]...), nil
+	return vfs.Hybrid(ids[0], ids[1:]...), nil
 }
 
 func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer) error {

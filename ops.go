@@ -156,11 +156,11 @@ func (v *Volume) Remove(ctx context.Context, dir InodeID, name string) error {
 		return err
 	}
 	if in.IsDir() {
-		kids, err := v.scan(ctx, key(tEntry, uint64(id)))
+		kids, err := v.has(ctx, key(tEntry, uint64(id)))
 		if err != nil {
 			return err
 		}
-		if len(kids) > 0 {
+		if kids {
 			return fmt.Errorf("%w: %q", ErrNotEmpty, name)
 		}
 	} else {

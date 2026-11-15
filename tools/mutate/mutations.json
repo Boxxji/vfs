@@ -1,0 +1,772 @@
+[
+ {
+  "name": "tree: last node not flushed",
+  "file": "tree.go",
+  "old": "\t\tcase bound == nil:\n\t\t\treturn b.out, replaced, b.flush(ctx)",
+  "new": "\t\tcase bound == nil:\n\t\t\treturn b.out, replaced, nil",
+  "pkg": ".",
+  "run": "TestTree"
+ },
+ {
+  "name": "tree: do not absorb the next node",
+  "file": "tree.go",
+  "old": "\t\t\tif _, err = c.next(ctx); err != nil {\n\t\t\t\treturn nil, nil, err\n\t\t\t}",
+  "new": "\t\t\treturn b.out, replaced, b.flush(ctx)",
+  "pkg": ".",
+  "run": "TestTree"
+ },
+ {
+  "name": "tree: delete beats put on equal key",
+  "file": "tree.go",
+  "old": "\t\t\tms = append(ms, mut{key: out[j].key, val: out[j].val})\n\t\t\ti, j = i+1, j+1",
+  "new": "\t\t\tms = append(ms, mut{key: replaced[i], del: true})\n\t\t\ti, j = i+1, j+1",
+  "pkg": ".",
+  "run": "TestTree"
+ },
+ {
+  "name": "tree: no collapse of single-entry roots",
+  "file": "tree.go",
+  "old": "\t\tif n.level == 0 || len(n.keys) != 1 {",
+  "new": "\t\tif true {",
+  "pkg": ".",
+  "run": "TestTree"
+ },
+ {
+  "name": "tree: cut by position, not by content",
+  "file": "tree.go",
+  "old": "return uint64(binary.LittleEndian.Uint32(h[:4]))*t.target < size<<32",
+  "new": "return uint64(binary.LittleEndian.Uint32(h[:4]))*t.target < size<<32 && false",
+  "pkg": ".",
+  "run": "TestTreeWrites"
+ },
+ {
+  "name": "tree: scan stops early on prefix miss",
+  "file": "tree.go",
+  "old": "\t\tif i > first && !bytes.HasPrefix(n.keys[i], prefix) {\n\t\t\treturn false, nil",
+  "new": "\t\tif i > first {\n\t\t\treturn false, nil",
+  "pkg": ".",
+  "run": "TestTree|TestNamespace|TestHundred"
+ },
+ {
+  "name": "tree: forced cut ignored",
+  "file": "tree.go",
+  "old": "if b.t.ends(b.level, e) || b.size >= b.t.max {",
+  "new": "if b.t.ends(b.level, e) {",
+  "pkg": ".",
+  "run": "TestTreeForcedCuts"
+ },
+ {
+  "name": "chunk: no minimum skip",
+  "file": "chunk.go",
+  "old": "\ti := minChunk\n",
+  "new": "\ti := 0\n",
+  "pkg": ".",
+  "run": "TestCut"
+ },
+ {
+  "name": "chunk: gear derivation changed",
+  "file": "chunk.go",
+  "old": "\tg[i] = binary.LittleEndian.Uint64(raw[i*8:])",
+  "new": "\tg[i] = binary.LittleEndian.Uint64(raw[i*8:]) ^ 1",
+  "pkg": ".",
+  "run": "TestGear"
+ },
+ {
+  "name": "chunk: gear ignores the volume seed",
+  "file": "chunk.go",
+  "old": "\t_, _ = h.Write(seed[:])\n",
+  "new": "",
+  "pkg": ".",
+  "run": "TestGearDiffers|TestChunkingIsPer"
+ },
+ {
+  "name": "file: reuse chunks a write touched",
+  "file": "file.go",
+  "old": "e.end() > min(f.size, f.limit) || f.touched(e.off, e.end())",
+  "new": "e.end() > min(f.size, f.limit)",
+  "pkg": ".",
+  "run": "TestPartial|TestSmallEdit|TestFilesOfEvery|TestTruncate|TestChunkList|TestSparse|TestModel"
+ },
+ {
+  "name": "file: reuse the chunk that ended a run",
+  "file": "file.go",
+  "old": "\t\t\treturn !endsRun || e.end() == r.b",
+  "new": "\t\t\treturn !endsRun || true",
+  "pkg": ".",
+  "run": "TestChunkList|TestSparse|TestModel"
+ },
+ {
+  "name": "file: truncate keeps old bytes",
+  "file": "file.go",
+  "old": "\t\tf.limit = min(f.limit, size)\n",
+  "new": "",
+  "pkg": ".",
+  "run": "TestTruncate|TestSparse|TestModel"
+ },
+ {
+  "name": "file: read leaves bytes past the limit",
+  "file": "file.go",
+  "old": "\t\tclear(p[lim-off : n])\n",
+  "new": "",
+  "pkg": ".",
+  "run": "TestTruncate|TestPartial|TestSparse"
+ },
+ {
+  "name": "file: read ignores unflushed writes",
+  "file": "file.go",
+  "old": "\tfor i := sort.Search(len(f.dirty), func(i int) bool { return f.dirty[i].end() > off }); i < len(f.dirty) && f.dirty[i].off < end; i++ {",
+  "new": "\tfor i := 0; i < 0; i++ {",
+  "pkg": ".",
+  "run": "TestPartial|TestHandles|TestFilesOfEvery|TestSparse"
+ },
+ {
+  "name": "file: a hole reads as its neighbour",
+  "file": "file.go",
+  "old": "\t\t\tclear(p[:hole])\n",
+  "new": "",
+  "pkg": ".",
+  "run": "TestSparse"
+ },
+ {
+  "name": "file: holes are chunked as zeros",
+  "file": "file.go",
+  "old": "\tfor _, e := range f.ext {\n\t\tif e.off >= lim {\n\t\t\tbreak\n\t\t}\n\t\tadd(e.off, min(e.end(), lim))\n\t}",
+  "new": "\tadd(0, f.size)\n\tfor _, e := range f.ext {\n\t\tif e.off >= lim {\n\t\t\tbreak\n\t\t}\n\t\tadd(e.off, min(e.end(), lim))\n\t}",
+  "pkg": ".",
+  "run": "TestSparseTruncate|TestSparsePetabyte|TestChunkList"
+ },
+ {
+  "name": "file: recut ignores its context",
+  "file": "file.go",
+  "old": "\t\t\tif err := ctx.Err(); err != nil {\n\t\t\t\treturn nil, err\n\t\t\t}\n",
+  "new": "",
+  "pkg": ".",
+  "run": "TestRecutHonoursItsContext"
+ },
+ {
+  "name": "file: inode record not written at settle",
+  "file": "file.go",
+  "old": "\tv.over.put(keyInode(f.ino), encodeInode(in))\n\n\tf.inline",
+  "new": "\n\tf.inline",
+  "pkg": ".",
+  "run": "TestFilesOfEvery|TestPartial"
+ },
+ {
+  "name": "file: stale extents kept on shrink",
+  "file": "file.go",
+  "old": "\t\tfor off := range old {\n\t\t\tv.over.del(keyExtent(f.ino, off))\n\t\t}\n",
+  "new": "",
+  "pkg": ".",
+  "run": "TestRecordsFollow"
+ },
+ {
+  "name": "file: inline record kept when chunked",
+  "file": "file.go",
+  "old": "\t\tv.over.del(keyInline(f.ino))\n\t\told :=",
+  "new": "\t\told :=",
+  "pkg": ".",
+  "run": "TestRecordsFollow"
+ },
+ {
+  "name": "file: write spans cost nothing",
+  "file": "file.go",
+  "old": "\tgrown := int64(len(merged.data)) + spanCost\n\tfor _, s := range d[i:j] {\n\t\tgrown -= int64(len(s.data)) + spanCost\n\t}",
+  "new": "\tgrown := int64(len(merged.data))\n\tfor _, s := range d[i:j] {\n\t\tgrown -= int64(len(s.data))\n\t}",
+  "pkg": ".",
+  "run": "TestSmallWritesAmplify",
+  "full": true
+ },
+ {
+  "name": "file: no size limit on truncate",
+  "file": "file.go",
+  "old": "func (v *Volume) Truncate(ctx context.Context, ino InodeID, size uint64) error {\n\tif size > MaxSize {\n\t\treturn fmt.Errorf(\"%w: %d bytes\", ErrTooBig, size)\n\t}",
+  "new": "func (v *Volume) Truncate(ctx context.Context, ino InodeID, size uint64) error {",
+  "pkg": ".",
+  "run": "TestFileSizeLimit"
+ },
+ {
+  "name": "file: no size limit on write",
+  "file": "file.go",
+  "old": "\tif uint64(off)+uint64(len(p)) > MaxSize {\n\t\treturn 0, fmt.Errorf(\"%w: a write to %d\", ErrTooBig, uint64(off)+uint64(len(p)))\n\t}\n",
+  "new": "",
+  "pkg": ".",
+  "run": "TestFileSizeLimit"
+ },
+ {
+  "name": "volume: head written before the pack",
+  "file": "volume.go",
+  "old": "\tif err := v.pack.upload(ctx, v.be); err != nil {\n\t\treturn err\n\t}\n\tif err := v.spill(ctx); err != nil {\n\t\treturn err\n\t}\n\tv.seq++",
+  "new": "\tif err := v.spill(ctx); err != nil {\n\t\treturn err\n\t}\n\tdefer v.pack.upload(ctx, v.be)\n\tv.seq++",
+  "pkg": ".",
+  "run": "TestFailureAtEveryWrite|TestSigkill|TestReadAfter"
+ },
+ {
+  "name": "volume: head written before the shards",
+  "file": "volume.go",
+  "old": "\tif err := v.spill(ctx); err != nil {\n\t\treturn err\n\t}\n\tv.seq++",
+  "new": "\tdefer v.spill(ctx)\n\tv.seq++",
+  "pkg": ".",
+  "run": "TestFailureAtEveryWrite|TestSigkill|TestVolumeOnEvery"
+ },
+ {
+  "name": "volume: Attach admits an equal round",
+  "file": "volume.go",
+  "old": "if cfg.Round <= recorded {",
+  "new": "if cfg.Round < recorded {",
+  "pkg": ".",
+  "run": "TestAttachNeeds|TestRacing|TestSameRound"
+ },
+ {
+  "name": "volume: Attach admits the last round",
+  "file": "volume.go",
+  "old": "if cfg.Round == 0 || cfg.Round == math.MaxUint64 {",
+  "new": "if cfg.Round == 0 || (false && cfg.Round == math.MaxUint64) {",
+  "pkg": ".",
+  "run": "TestRoundMax"
+ },
+ {
+  "name": "volume: a fenced Volume keeps writing",
+  "file": "volume.go",
+  "old": "\t\t\tv.fenced = true\n\t\t\t// An earlier",
+  "new": "\t\t\t// An earlier",
+  "pkg": ".",
+  "run": "TestFence"
+ },
+ {
+  "name": "volume: a landed commit is called lost",
+  "file": "volume.go",
+  "old": "\t\t\tif cur, ok := v.landed(ctx); ok {\n\t\t\t\tv.head = cur\n\t\t\t\treturn nil\n\t\t\t}\n",
+  "new": "",
+  "pkg": ".",
+  "run": "TestLostAckThenTakeover"
+ },
+ {
+  "name": "volume: any tree with the same root counts as landed",
+  "file": "volume.go",
+  "old": "return cur, err == nil && cur.ID == v.id && cur.Root == v.root",
+  "new": "return cur, err == nil",
+  "pkg": ".",
+  "run": "TestFenceRefusesOlderRound|TestDeposedWriter"
+ },
+ {
+  "name": "volume: commit attempts reuse a Seq",
+  "file": "volume.go",
+  "old": "\tv.seq++\n\th := v.head\n\th.Seq, h.Root, h.Next = v.seq, v.root, uint64(v.next)",
+  "new": "\th := v.head\n\th.Seq, h.Root, h.Next = v.seq+1, v.root, uint64(v.next)",
+  "pkg": ".",
+  "run": "TestHeadSeqNeverRepeats"
+ },
+ {
+  "name": "volume: Flush skips a spilled root",
+  "file": "volume.go",
+  "old": "if v.over.n == 0 && v.pack.empty() && v.root == v.head.Root {",
+  "new": "if v.over.n == 0 && v.pack.empty() {",
+  "pkg": ".",
+  "run": "TestSpill"
+ },
+ {
+  "name": "volume: dirty bytes are not bounded",
+  "file": "volume.go",
+  "old": "\tif v.dirty >= v.cfg.Dirty {\n\t\tif err := v.sweep(ctx); err != nil {\n\t\t\treturn err\n\t\t}\n\t}\n",
+  "new": "",
+  "pkg": ".",
+  "run": "TestSettleBounds|TestReadAfter|TestSequentialWrite|TestModel"
+ },
+ {
+  "name": "volume: pending records are not bounded",
+  "file": "volume.go",
+  "old": "\tif v.over.n >= v.cfg.Overlay {\n\t\treturn v.spill(ctx)\n\t}\n",
+  "new": "",
+  "pkg": ".",
+  "run": "TestSpill|TestModel"
+ },
+ {
+  "name": "volume: next inode not persisted",
+  "file": "volume.go",
+  "old": "h.Seq, h.Root, h.Next = v.seq, v.root, uint64(v.next)",
+  "new": "h.Seq, h.Root, h.Next = v.seq, v.root, v.head.Next",
+  "pkg": ".",
+  "run": "TestInodeNumbers"
+ },
+ {
+  "name": "volume: cipher not checked",
+  "file": "volume.go",
+  "old": "\tif err := check(c.Cipher); err != nil {\n\t\treturn c, err\n\t}\n",
+  "new": "",
+  "pkg": ".",
+  "run": "TestIdentityCipher"
+ },
+ {
+  "name": "volume: head read without a bound",
+  "file": "volume.go",
+  "old": "fence:  fence.New(cfg.Backend, maxHead),",
+  "new": "fence:  fence.New(cfg.Backend, backend.Unbounded),",
+  "pkg": ".",
+  "run": "TestHeadBound"
+ },
+ {
+  "name": "volume: emptiness check lists the directory",
+  "file": "volume.go",
+  "old": "\tfound := false\n\terr := v.t.scan(ctx, v.root, prefix, func(k, _ []byte) bool {\n\t\tif n, ok := v.over.get(k); ok && n.del {\n\t\t\treturn true // removed by a pending change\n\t\t}\n\t\tfound = true\n\t\treturn false\n\t})",
+  "new": "\tfound := false\n\terr := v.t.scan(ctx, v.root, prefix, func(k, _ []byte) bool {\n\t\tif n, ok := v.over.get(k); ok && n.del {\n\t\t\treturn true // removed by a pending change\n\t\t}\n\t\tfound = true\n\t\treturn true\n\t})",
+  "pkg": ".",
+  "run": "TestRemoveChecksEmptiness"
+ },
+ {
+  "name": "volume: scan keeps a replaced record twice",
+  "file": "volume.go",
+  "old": "\t\tif i < len(base) && bytes.Equal(base[i].key, n.key) {\n\t\t\ti++\n\t\t}\n",
+  "new": "",
+  "pkg": ".",
+  "run": "TestListingSeesAChangeOnceAndARemovalNever|TestModelFuzz|TestRecordsFollow|TestSparseRandom"
+ },
+ {
+  "name": "volume: head not sealed to its place",
+  "file": "head.go",
+  "old": "func headAAD(place string) []byte { return []byte(\"vfs head \" + place) }",
+  "new": "func headAAD(place string) []byte { return []byte(\"vfs head \") }",
+  "pkg": ".",
+  "run": "TestSealedToItsContext|TestHostileBackend"
+ },
+ {
+  "name": "volume: shards not sealed to their volume",
+  "file": "head.go",
+  "old": "func shardAAD(id volumeID) []byte { return append([]byte(\"vfs shard \"), id[:]...) }",
+  "new": "func shardAAD(id volumeID) []byte { return []byte(\"vfs shard \") }",
+  "pkg": ".",
+  "run": "TestSealedToItsContext|TestHostileBackend"
+ },
+ {
+  "name": "volume: chunks not sealed to their id",
+  "file": "head.go",
+  "old": "\treturn append(append([]byte(\"vfs chunk \"), id[:]...), c[:]...)",
+  "new": "\treturn append([]byte(\"vfs chunk \"), id[:]...)",
+  "pkg": ".",
+  "run": "TestSealedToItsContext"
+ },
+ {
+  "name": "head: trailing bytes accepted",
+  "file": "head.go",
+  "old": "\treturn h, r.done()\n}\n\n// What each kind",
+  "new": "\treturn h, r.err\n}\n\n// What each kind",
+  "pkg": ".",
+  "run": "TestHeadRejectsGarbage"
+ },
+ {
+  "name": "record: unknown inode fields dropped",
+  "file": "record.go",
+  "old": "\tw.raw(in.later)\n",
+  "new": "",
+  "pkg": ".",
+  "run": "TestInodeRecord"
+ },
+ {
+  "name": "record: inode fields out of order accepted",
+  "file": "record.go",
+  "old": "\t\tif tag <= last {",
+  "new": "\t\tif tag == last {",
+  "pkg": ".",
+  "run": "TestInodeRecord"
+ },
+ {
+  "name": "record: a missing inode field accepted",
+  "file": "record.go",
+  "old": "\tif seen != 1<<fieldMode|1<<fieldSize|1<<fieldMtime|1<<fieldAtime|1<<fieldCtime {",
+  "new": "\tif seen == 0 {",
+  "pkg": ".",
+  "run": "TestInodeRecord"
+ },
+ {
+  "name": "pack: chunk hash not checked",
+  "file": "pack.go",
+  "old": "\tif sumChunk(plain) != id {",
+  "new": "\tif false {",
+  "pkg": ".",
+  "run": "TestChunkHashIsChecked"
+ },
+ {
+  "name": "pack: no dedupe",
+  "file": "pack.go",
+  "old": "\tif err != nil || ok {\n\t\treturn id, err\n\t}",
+  "new": "\tif err != nil || (ok && false) {\n\t\treturn id, err\n\t}",
+  "pkg": ".",
+  "run": "TestDedupe"
+ },
+ {
+  "name": "pack: open pack not readable",
+  "file": "pack.go",
+  "old": "if w.pack == v.pack.id && w.off+w.n <= uint64(len(v.pack.buf)) {",
+  "new": "if false {",
+  "pkg": ".",
+  "run": "TestReadAfter|TestSettleBounds"
+ },
+ {
+  "name": "shard: hash not checked",
+  "file": "shard.go",
+  "old": "\tif blake3.Sum256(sealed) != r {",
+  "new": "\tif false {",
+  "pkg": ".",
+  "run": "TestTreeDetects|TestTamper"
+ },
+ {
+  "name": "shard: read without a bound",
+  "file": "shard.go",
+  "old": "sealed, _, err := s.be.Get(ctx, shardKey(r), maxShard)",
+  "new": "sealed, _, err := s.be.Get(ctx, shardKey(r), backend.Unbounded)",
+  "pkg": ".",
+  "run": "TestShardBound"
+ },
+ {
+  "name": "cache: never evicts",
+  "file": "lru.go",
+  "old": "\tfor c.used > c.max && c.ll.Len() > 1 {",
+  "new": "\tfor false {",
+  "pkg": ".",
+  "run": "TestCacheIsBounded"
+ },
+ {
+  "name": "ops: Create over an existing name",
+  "file": "ops.go",
+  "old": "if _, ok, err := v.get(ctx, keyEntry(dir, name)); err != nil || ok {",
+  "new": "if _, _, err := v.get(ctx, keyEntry(dir, name)); err != nil {",
+  "pkg": ".",
+  "run": "TestNamespace"
+ },
+ {
+  "name": "ops: rmdir of a non-empty directory",
+  "file": "ops.go",
+  "old": "\t\tif kids {",
+  "new": "\t\tif kids && false {",
+  "pkg": ".",
+  "run": "TestNamespace"
+ },
+ {
+  "name": "ops: removed file keeps its data records",
+  "file": "ops.go",
+  "old": "\t\tfor _, r := range data {\n\t\t\tv.over.del(r.key)",
+  "new": "\t\tfor _, r := range data[:0] {\n\t\t\tv.over.del(r.key)",
+  "pkg": ".",
+  "run": "TestRecordsFollow"
+ },
+ {
+  "name": "ops: removed file stays openable",
+  "file": "ops.go",
+  "old": "\t\t\tf.gone = true\n",
+  "new": "",
+  "pkg": ".",
+  "run": "TestRemoved"
+ },
+ {
+  "name": "cipher: key id not honoured on open",
+  "file": "cipher.go",
+  "old": "\tid, ok := c.ids[keyID]\n\tif !ok {",
+  "new": "\tid, ok := c.ids[c.curID]\n\tif !ok {",
+  "pkg": ".",
+  "run": "TestRotation"
+ },
+ {
+  "name": "cipher: retired keys dropped",
+  "file": "cipher.go",
+  "old": "\tfor _, k := range append([]*age.HybridIdentity{current}, retired...) {",
+  "new": "\tfor _, k := range []*age.HybridIdentity{current} {",
+  "pkg": ".",
+  "run": "TestRotation"
+ },
+ {
+  "name": "cipher: context not checked",
+  "file": "cipher.go",
+  "old": "\tif !bytes.HasPrefix(plain, aad) {",
+  "new": "\tif false {",
+  "pkg": ".",
+  "run": "TestSealedToItsContext|TestHostileBackend"
+ },
+ {
+  "name": "cipher: plaintext in the output allowed",
+  "file": "cipher.go",
+  "old": "\tif bytes.Contains(sealed, probe) || bytes.Contains(sealed, probe[:16]) {",
+  "new": "\tif false {",
+  "pkg": ".",
+  "run": "TestIdentityCipher"
+ },
+ {
+  "name": "cipher: unauthenticated cipher allowed",
+  "file": "cipher.go",
+  "old": "\tif _, err := c.Open(altered, id); err == nil {",
+  "new": "\tif false {",
+  "pkg": ".",
+  "run": "TestIdentityCipher"
+ },
+ {
+  "name": "fence: older round admitted",
+  "file": "pkg/fence/fence.go",
+  "old": "\t\tif round < recorded {\n\t\t\treturn fmt.Errorf(\"%w: key=%s round=%d recorded=%d\", ErrStaleRound, key, round, recorded)\n\t\t}\n\t\tif err := s.write(ctx, key, want, version); err != nil {",
+  "new": "\t\t_ = recorded\n\t\tif err := s.write(ctx, key, want, version); err != nil {",
+  "pkg": "./...",
+  "run": "Fence|Stale|Attach|Takeover|Racing"
+ },
+ {
+  "name": "fence: Put does not retry a lost race",
+  "file": "pkg/fence/fence.go",
+  "old": "\t\t\tif errors.Is(err, backend.ErrConflict) {\n\t\t\t\tlastErr = err\n\t\t\t\tcontinue // re-read the winner's state and retry.\n\t\t\t}\n",
+  "new": "",
+  "pkg": "./pkg/fence",
+  "run": "Put"
+ },
+ {
+  "name": "fence: Claim does not retry a lost race",
+  "file": "pkg/fence/fence.go",
+  "old": "\t\t\tif errors.Is(err, backend.ErrConflict) {\n\t\t\t\tlastErr = err\n\t\t\t\tcontinue // a predecessor's write landed; re-read it and carry it forward.\n\t\t\t}\n",
+  "new": "",
+  "pkg": "./pkg/fence",
+  "run": "Claim"
+ },
+ {
+  "name": "fence: a landed claim is called lost",
+  "file": "pkg/fence/fence.go",
+  "old": "\t\tif last != nil && bytes.Equal(data, last) {\n\t\t\treturn nil\n\t\t}\n",
+  "new": "",
+  "pkg": "./pkg/fence",
+  "run": "Landed"
+ },
+ {
+  "name": "fence: a landed commit is called lost",
+  "file": "pkg/fence/fence.go",
+  "old": "\t\tif bytes.Equal(data, want) {\n\t\t\treturn nil\n\t\t}\n",
+  "new": "",
+  "pkg": "./pkg/fence",
+  "run": "Landed"
+ },
+ {
+  "name": "fence: claims carry no token",
+  "file": "pkg/fence/fence.go",
+  "old": "\tbuf = append(buf, s.token[:]...)\n",
+  "new": "\tbuf = append(buf, make([]byte, tokenLen)...)\n",
+  "pkg": "./...",
+  "run": "Landed|SameRound"
+ },
+ {
+  "name": "fence: read without a bound",
+  "file": "pkg/fence/fence.go",
+  "old": "\tdata, version, err := s.be.Get(ctx, key, s.max)\n\tif errors.Is(err, backend.ErrNotFound) {",
+  "new": "\tdata, version, err := s.be.Get(ctx, key, backend.Unbounded)\n\tif errors.Is(err, backend.ErrNotFound) {",
+  "pkg": "./pkg/fence",
+  "run": "TestReadIsBounded"
+ },
+ {
+  "name": "file backend: PutIfVersion ignores the version",
+  "file": "pkg/backend/file/file.go",
+  "old": "if have := version(cur); have != v {",
+  "new": "if have := version(cur); false && have != v {",
+  "pkg": "./pkg/backend/file",
+  "run": "Conforms"
+ },
+ {
+  "name": "file backend: PutIfAbsent overwrites",
+  "file": "pkg/backend/file/file.go",
+  "old": "\tif _, err := os.Stat(p); err == nil {\n\t\treturn \"\", fmt.Errorf(\"%w: %s exists\", backend.ErrConflict, key)\n\t} else if !errors.Is(err, os.ErrNotExist) {\n\t\treturn \"\", err\n\t}",
+  "new": "",
+  "pkg": "./pkg/backend/file",
+  "run": "Conforms"
+ },
+ {
+  "name": "file backend: no lock around the check",
+  "file": "pkg/backend/file/file.go",
+  "old": "\tunlock, err := f.lock()\n\tif err != nil {\n\t\treturn \"\", err\n\t}\n\tdefer unlock()\n\tcur, err := os.ReadFile(p)",
+  "new": "\tcur, err := os.ReadFile(p)",
+  "pkg": "./pkg/backend/file",
+  "run": "Conforms"
+ },
+ {
+  "name": "file backend: Get ignores its bound",
+  "file": "pkg/backend/file/file.go",
+  "old": "\tif int64(len(b)) > max {",
+  "new": "\tif false {",
+  "pkg": "./pkg/backend/file",
+  "run": "Conforms"
+ },
+ {
+  "name": "s3 backend: PutIfVersion unconditional",
+  "file": "pkg/backend/s3/s3.go",
+  "old": "\topts.SetMatchETag(string(v))\n",
+  "new": "",
+  "pkg": "./pkg/backend/s3",
+  "run": "Conforms"
+ },
+ {
+  "name": "s3 backend: PutIfAbsent unconditional",
+  "file": "pkg/backend/s3/s3.go",
+  "old": "\topts.SetMatchETagExcept(\"*\")\n",
+  "new": "",
+  "pkg": "./pkg/backend/s3",
+  "run": "Conforms"
+ },
+ {
+  "name": "s3 backend: 412 is not a conflict",
+  "file": "pkg/backend/s3/s3.go",
+  "old": "r.StatusCode == http.StatusPreconditionFailed || r.StatusCode == http.StatusConflict || r.Code == \"PreconditionFailed\"",
+  "new": "false && (r.StatusCode == http.StatusPreconditionFailed || r.StatusCode == http.StatusConflict || r.Code == \"PreconditionFailed\")",
+  "pkg": "./pkg/backend/s3",
+  "run": "Conforms"
+ },
+ {
+  "name": "s3 backend: range ignores offset",
+  "file": "pkg/backend/s3/s3.go",
+  "old": "opts.SetRange(off, off+n-1)",
+  "new": "opts.SetRange(0, n-1)",
+  "pkg": "./pkg/backend/s3",
+  "run": "Conforms"
+ },
+ {
+  "name": "s3 backend: Get asks for the version before the body",
+  "file": "pkg/backend/s3/s3.go",
+  "old": "\tb, err := io.ReadAll(io.LimitReader(obj, backend.Past(max)))\n\tif err != nil {\n\t\treturn nil, \"\", notFound(err, key)\n\t}\n\tif int64(len(b)) > max {\n\t\treturn nil, \"\", fmt.Errorf(\"%w: %s is larger than %d bytes\", backend.ErrTooLarge, key, max)\n\t}\n\tinfo, err := obj.Stat()\n\tif err != nil {\n\t\treturn nil, \"\", notFound(err, key)\n\t}",
+  "new": "\tinfo, err := obj.Stat()\n\tif err != nil {\n\t\treturn nil, \"\", notFound(err, key)\n\t}\n\tb, err := io.ReadAll(io.LimitReader(obj, backend.Past(max)))\n\tif err != nil {\n\t\treturn nil, \"\", notFound(err, key)\n\t}\n\tif int64(len(b)) > max {\n\t\treturn nil, \"\", fmt.Errorf(\"%w: %s is larger than %d bytes\", backend.ErrTooLarge, key, max)\n\t}",
+  "pkg": "./pkg/backend/s3",
+  "run": "TestGetIsOne"
+ },
+ {
+  "name": "s3 backend: Get reads the whole body",
+  "file": "pkg/backend/s3/s3.go",
+  "old": "io.LimitReader(obj, backend.Past(max))",
+  "new": "obj",
+  "pkg": ".",
+  "run": "TestBackendBodyIsBounded"
+ },
+ {
+  "name": "s3 backend: a large conditional write goes unconditionally",
+  "file": "pkg/backend/s3/s3.go",
+  "old": "\tif len(data) > partSize {\n\t\treturn \"\", tooLarge(key, len(data))\n\t}\n\topts := hs3.PutObjectOptions{PartSize: partSize}\n\topts.SetMatchETagExcept(\"*\")",
+  "new": "\topts := hs3.PutObjectOptions{PartSize: partSize}\n\topts.SetMatchETagExcept(\"*\")",
+  "pkg": "./pkg/backend/s3",
+  "run": "TestLargeConditional"
+ },
+ {
+  "name": "s3 backend: credentials in a URL accepted",
+  "file": "pkg/backend/s3/s3.go",
+  "old": "\tif u.User != nil {",
+  "new": "\tif false {",
+  "pkg": "./pkg/backend/s3",
+  "run": "TestURL"
+ },
+ {
+  "name": "s3 backend: URL prefix not validated",
+  "file": "pkg/backend/s3/s3.go",
+  "old": "\tprefix := strings.Trim(u.Path, \"/\")\n\tif err := backend.ValidPrefix(prefix); err != nil {",
+  "new": "\tprefix := strings.Trim(u.Path, \"/\")\n\tif err := backend.ValidPrefix(prefix); false && err != nil {",
+  "pkg": "./pkg/backend/s3",
+  "run": "TestURL"
+ },
+ {
+  "name": "s3 backend: String names the query",
+  "file": "pkg/backend/s3/s3.go",
+  "old": "\t\tdesc:   \"s3://\" + u.Host + \"/\" + prefix,",
+  "new": "\t\tdesc:   u.String(),",
+  "pkg": "./pkg/backend/s3",
+  "run": "TestURL"
+ },
+ {
+  "name": "backend: prefix with an empty segment accepted",
+  "file": "pkg/backend/backend.go",
+  "old": "\t\tcase \"\", \".\", \"..\":",
+  "new": "\t\tcase \".\", \"..\":",
+  "pkg": "./pkg/backend",
+  "run": "TestValidPrefix"
+ },
+ {
+  "name": "backend: prefix with a control character accepted",
+  "file": "pkg/backend/backend.go",
+  "old": "\t\t\tif r < 0x20 || r == 0x7f {",
+  "new": "\t\t\tif (r < 0x20 || r == 0x7f) && false {",
+  "pkg": "./pkg/backend",
+  "run": "TestValidPrefix"
+ },
+ {
+  "name": "backend: Unbounded overflows",
+  "file": "pkg/backend/backend.go",
+  "old": "\tif max == Unbounded {\n\t\treturn Unbounded\n\t}\n\treturn max + 1",
+  "new": "\treturn max + 1",
+  "pkg": "./pkg/backend/file",
+  "run": "Conforms"
+ },
+ {
+  "name": "mount: chmod and utimens succeed silently",
+  "file": "pkg/mount/fuse_unix.go",
+  "old": "\tif req.Valid.Mode() || req.Valid.Uid() || req.Valid.Gid() || req.Valid.Atime() || req.Valid.Mtime() {\n\t\treturn unsupported\n\t}\n",
+  "new": "",
+  "pkg": "./pkg/mount",
+  "run": "TestFUSEUnsupported",
+  "tags": "fuse"
+ },
+ {
+  "name": "mount: no dot entries",
+  "file": "pkg/mount/fuse_unix.go",
+  "old": "\tout = append(out,\n\t\tfuse.Dirent{Inode: uint64(n.ino), Name: \".\", Type: fuse.DT_Dir},\n\t\tfuse.Dirent{Inode: uint64(n.parent), Name: \"..\", Type: fuse.DT_Dir})\n",
+  "new": "",
+  "pkg": "./pkg/mount",
+  "run": "TestFUSEUnlinkVersus",
+  "tags": "fuse"
+ },
+ {
+  "name": "mount: too-big files are EIO",
+  "file": "pkg/mount/errno.go",
+  "old": "\tcase errors.Is(err, vfs.ErrTooBig):\n\t\treturn syscall.EFBIG\n",
+  "new": "",
+  "pkg": "./pkg/mount",
+  "run": "TestFUSEFileTooBig",
+  "tags": "fuse"
+ },
+ {
+  "name": "mount: a commit runs on its request's context",
+  "file": "pkg/mount/errno.go",
+  "old": "_, err := own(req, context.Background(), func(c context.Context) (struct{}, error) {",
+  "new": "_, err := own(req, req, func(c context.Context) (struct{}, error) {",
+  "pkg": "./pkg/mount",
+  "run": "TestCommitSurvivesItsCaller",
+  "tags": "fuse"
+ },
+ {
+  "name": "mount: a read runs on its request's context",
+  "file": "pkg/mount/fuse_unix.go",
+  "old": "data, err := own(context.WithoutCancel(ctx), h.base, func(c context.Context) ([]byte, error) {",
+  "new": "data, err := own(context.WithoutCancel(ctx), ctx, func(c context.Context) ([]byte, error) {",
+  "pkg": "./pkg/mount",
+  "run": "TestReadWaitsForItsData",
+  "tags": "fuse"
+ },
+ {
+  "name": "mount: an interrupt is EIO",
+  "file": "pkg/mount/errno.go",
+  "old": "\tcase errors.Is(err, context.Canceled):",
+  "new": "\tcase false && errors.Is(err, context.Canceled):",
+  "pkg": "./pkg/mount",
+  "run": "TestInterruptIsEINTR",
+  "tags": "fuse"
+ },
+ {
+  "name": "mount: an interrupt is EIO under signals",
+  "file": "pkg/mount/errno.go",
+  "old": "\tcase errors.Is(err, context.Canceled):",
+  "new": "\tcase false && errors.Is(err, context.Canceled):",
+  "pkg": "./pkg/mount",
+  "run": "TestFUSEInterruptsAreNotErrors",
+  "tags": "fuse"
+ },
+ {
+  "name": "mount: a read gives up when interrupted",
+  "file": "pkg/mount/fuse_unix.go",
+  "old": "data, err := own(context.WithoutCancel(ctx), h.base, func(c context.Context) ([]byte, error) {",
+  "new": "data, err := own(ctx, h.base, func(c context.Context) ([]byte, error) {",
+  "pkg": "./pkg/mount",
+  "run": "TestReadWaitsForItsData",
+  "tags": "fuse"
+ },
+ {
+  "name": "mount: a close gives up when interrupted",
+  "file": "pkg/mount/fuse_unix.go",
+  "old": "return errno(commit(context.WithoutCancel(ctx), h.vol))",
+  "new": "return errno(commit(ctx, h.vol))",
+  "pkg": "./pkg/mount",
+  "run": "TestCloseWaitsForItsCommit",
+  "tags": "fuse"
+ }
+]
