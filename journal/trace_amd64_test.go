@@ -4,6 +4,8 @@ import "syscall"
 
 type regs = syscall.PtraceRegs
 
+const renameat2 = 316
+
 func sysnum(r *regs) uintptr { return uintptr(r.Orig_rax) }
 
 func sysarg(r *regs, i int) uintptr {

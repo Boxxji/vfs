@@ -65,7 +65,7 @@ var names = map[uintptr]string{
 	syscall.SYS_FDATASYNC: "fdatasync",
 	syscall.SYS_FSYNC:     "fsync",
 	syscall.SYS_RENAMEAT:  "rename",
-	syscall.SYS_RENAMEAT2: "rename",
+	renameat2:             "rename", // not in the frozen syscall package: the number is per architecture
 	syscall.SYS_UNLINKAT:  "unlink",
 	syscall.SYS_OPENAT:    "open",
 	syscall.SYS_FLOCK:     "flock",
