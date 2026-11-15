@@ -26,12 +26,10 @@ jobs:
           - 'model'
           - 'sqlite'
           - 'realserver'
-          - 'realserver-kill'
-          - 'mount'
-          - 'mount-load'
+          - 'realserver-fence'
           - 'scale-a'
           - 'scale-b'
-          - '!check,unit,race,model,sqlite,realserver,realserver-kill,mount,mount-load,scale-a,scale-b'
+          - '!check,unit,race,model,sqlite,realserver,realserver-fence,scale-a,scale-b'
     uses: hanzoai/ci/.github/workflows/build.yml@v2
     with:
       gates: ${{ matrix.gates }}

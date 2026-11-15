@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 
 	"bazil.org/fuse"
@@ -162,6 +163,18 @@ func (n *node) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (bzfs.Node, er
 func (n *node) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.CreateResponse) (bzfs.Node, bzfs.Handle, error) {
 	ctx = context.WithoutCancel(ctx) // not answered EINTR: see errno.go
 	in, err := n.s.vol.Create(ctx, n.ino, req.Name, req.Mode.Perm())
+	if errors.Is(err, fs.ErrExist) && req.Flags&fuse.OpenFlags(os.O_EXCL) == 0 {
+		// open(O_CREAT) of a file that exists opens it. A kernel that does not look the
+		// name up first (a sandbox's, or a lookup that was interrupted and not repeated)
+		// asks for the creation anyway, and only O_EXCL makes that an error.
+		in, err = n.s.vol.Lookup(ctx, n.ino, req.Name)
+		if err == nil && in.IsDir() {
+			err = vfs.ErrIsDir
+		}
+		if err == nil && req.Flags&fuse.OpenFlags(os.O_TRUNC) != 0 {
+			err = n.s.vol.Truncate(ctx, in.ID, 0)
+		}
+	}
 	if err != nil {
 		return nil, nil, errno(err)
 	}

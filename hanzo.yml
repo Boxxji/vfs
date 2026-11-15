@@ -14,21 +14,29 @@
 #   model            the tests that run random operations against a plain model, in
 #                    -short size: no goroutines, so no race detector, which would
 #                    multiply the hashing and sealing they do tenfold
-#   sqlite           the packages that run a real SQLite engine on a Volume, and on a mount
-#   realserver       the engine against a real Hanzo S3 server: every test that needs one
-#   realserver-kill  a writer killed at random moments over the real server, and a
-#                    mount over it
-#   mount            the FUSE front on a kernel mount
-#   mount-load       a 5,000-file checkout and signals sent at callers waiting on the mount
+#   sqlite           the packages that run a real SQLite engine on a Volume
+#   realserver       the engine and its store client against a real Hanzo S3 server
+#   realserver-fence the fence, a Volume on every store, and a writer killed at random
+#                    moments, against the real server
 #   scale-a/b        the measurements: 100,000 files, a million inodes, sync cost, the
 #                    object budget, a petabyte, amplification (-short skips them)
 #   fuzz             the model run over many more seeds
 #
-# realserver, realserver-kill and the mount gates fail if a test they exist for did not
-# pass: a skip is a failure there, never a pass. The real server is built from a pinned
-# commit (tools/ci/s3server.sh). The mount gates run in a user namespace with a stand-in
-# for the setuid helper (tools/ci/mount.sh), since the runner ignores setuid bits.
-# Tests find the server as `s3` on PATH; there is no environment switch.
+# realserver and realserver-fence fail if a test they exist for did not pass: a skip is
+# a failure there, never a pass. The real server is built from a pinned commit
+# (tools/ci/s3server.sh); tests find it as `s3` on PATH, and there is no environment
+# switch.
+#
+# The tests on a kernel mount are not gates here. The runner's kernel is a sandbox
+# (gVisor) whose FUSE is not Linux's: its user can mount only inside a user namespace,
+# where tools/fusemount stands in for the setuid helper (tools/ci/mount.sh), and
+# there the mount works but answers differently (truncate is refused, chmod is EPERM
+# and not ENOSYS, close is interrupted by the kernel, and an unmount does not end
+# the server), so a test of what Linux does would test the sandbox. They run on a
+# Linux kernel: `go test -tags fuse ./pkg/mount ./internal/sqlitecheck`, or
+# tools/ci/mount.sh where there is no fusermount3. What the mount does that needs no
+# kernel (the commits, the interrupts, the context every read runs on) is tested by
+# calling its handlers, in the `race` gate.
 test:
   - name: check
     run: |
@@ -46,7 +54,7 @@ test:
       set -euo pipefail
       go test -race -short -count=1 ./pkg/...
       go test -race -short -count=1 -run '^Test(ConcurrentWorkers|NoGoroutineLeak|SameRoundRace|RacingClaims|TakeoverLosesNoAcknowledgedCommit|FenceRefusesOlderRound|AttachNeedsAHigherRound|AttachLostAckIsNotStale|StalledCommitHonoursItsDeadline|DeposedWriterIsToldAtItsNextCommit|LostAckNoLostUpdateNoDuplicate|LostAckThenTakeoverIsNotReportedLost|VolumeOnEveryStore)$' .
-      go test -race -tags fuse -short -count=1 -run '^Test(InterruptIsEINTR|CommitSurvivesItsCaller|CloseWaitsForItsCommit|ReadWaitsForItsData|InterruptedFsyncRetriesDoNotPileUp|SessionRefusesANilContext|LookedUpFileReadsOnTheMountContext)$' ./pkg/mount
+      go test -race -tags fuse -short -count=1 -run '^Test(InterruptIsEINTR|CommitSurvivesItsCaller|CloseWaitsForItsCommit|ReadWaitsForItsData|InterruptedFsyncRetriesDoNotPileUp|SessionRefusesANilContext|LookedUpFileReadsOnTheMountContext|CreateOfAnExistingFileOpensIt)$' ./pkg/mount
   - name: model
     run: go test -short -count=1 -run '^Test(Sparse|Model|TreeForced)' .
   - name: sqlite
@@ -55,7 +63,6 @@ test:
       go vet ./replica ./internal/sqlitecheck
       go vet -tags fuse ./internal/sqlitecheck
       go test -short -count=1 ./replica ./internal/sqlitecheck
-      tools/ci/mount.sh ./internal/sqlitecheck run '^TestFUSESQLite$' TestFUSESQLite
   - name: realserver
     run: |
       set -euo pipefail
@@ -64,35 +71,27 @@ test:
       export PATH="$bin:$PATH"
       log="$bin/realserver.log"
       go test -count=1 -v -timeout 4m \
-        -run '^(TestRealServerConforms|TestRealServerRaceStress|TestRealServerCAS|TestRealServerMultipartIsConditional|TestPrefixConfinement|TestCommitRateOnRealServer|TestGetPairsBodyWithVersion|TestCancelledS3RequestsAreNotFaults|TestConditionalWriteAtTheSingleRequestBound|TestSameRoundRace|TestFenceRefusesOlderRound|TestAttachNeedsAHigherRound|TestTakeoverLosesNoAcknowledgedCommit|TestRacingClaims|TestVolumeOnEveryStore)$' \
+        -run '^(TestRealServerConforms|TestRealServerRaceStress|TestRealServerMultipartIsConditional|TestPrefixConfinement|TestCommitRateOnRealServer|TestGetPairsBodyWithVersion|TestCancelledS3RequestsAreNotFaults|TestConditionalWriteAtTheSingleRequestBound)$' \
         . ./pkg/backend/s3 | tee "$log"
-      for t in TestRealServerConforms TestRealServerRaceStress TestRealServerCAS TestRealServerMultipartIsConditional \
+      for t in TestRealServerConforms TestRealServerRaceStress TestRealServerMultipartIsConditional \
                TestPrefixConfinement TestCommitRateOnRealServer TestGetPairsBodyWithVersion \
-               TestCancelledS3RequestsAreNotFaults TestConditionalWriteAtTheSingleRequestBound \
-               TestSameRoundRace/hanzo-s3 TestFenceRefusesOlderRound/hanzo-s3 TestAttachNeedsAHigherRound/hanzo-s3 \
-               TestTakeoverLosesNoAcknowledgedCommit/hanzo-s3 TestRacingClaims/hanzo-s3 TestVolumeOnEveryStore/hanzo-s3; do
+               TestCancelledS3RequestsAreNotFaults TestConditionalWriteAtTheSingleRequestBound; do
         grep -q -- "--- PASS: $t " "$log" || { echo "did not pass against the real server: $t"; exit 1; }
       done
-  - name: realserver-kill
+  - name: realserver-fence
     run: |
       set -euo pipefail
       bin=$(mktemp -d)
       tools/ci/s3server.sh "$bin"
       export PATH="$bin:$PATH"
-      log="$bin/kill.log"
-      go test -count=1 -v -timeout 3m -run '^TestKillOverRealServer$' . | tee "$log"
-      grep -q -- '--- PASS: TestKillOverRealServer ' "$log" || { echo "TestKillOverRealServer did not pass"; exit 1; }
-      tools/ci/mount.sh ./pkg/mount run '^TestFUSEReadsExistingFilesOverS3$' TestFUSEReadsExistingFilesOverS3
-  - name: mount
-    run: |
-      tools/ci/mount.sh ./pkg/mount skip '^(TestFUSECheckout|TestFUSEInterruptsAreNotErrors|TestFUSEReadsExistingFilesOverS3)$' \
-        TestFUSEPOSIX TestFUSESemantics TestFUSEUnsupportedIsHonest TestFUSEHostileNames TestFUSEConcurrentSameFile \
-        TestFUSECommitPerClose TestFUSEKillDuringWrite TestFUSEUnlinkVersusRmdir TestFUSEPetabyteTruncate \
-        TestFUSEFileTooBig TestFUSEFsyncSurvivesKill \
-        TestInterruptIsEINTR TestCommitSurvivesItsCaller TestCloseWaitsForItsCommit TestReadWaitsForItsData \
-        TestInterruptedFsyncRetriesDoNotPileUp TestSessionRefusesANilContext TestLookedUpFileReadsOnTheMountContext
-  - name: mount-load
-    run: tools/ci/mount.sh ./pkg/mount run '^(TestFUSECheckout|TestFUSEInterruptsAreNotErrors)$' TestFUSECheckout TestFUSEInterruptsAreNotErrors
+      log="$bin/fence.log"
+      go test -count=1 -v -timeout 4m \
+        -run '^(TestRealServerCAS|TestSameRoundRace|TestFenceRefusesOlderRound|TestAttachNeedsAHigherRound|TestTakeoverLosesNoAcknowledgedCommit|TestRacingClaims|TestVolumeOnEveryStore|TestKillOverRealServer)$' . | tee "$log"
+      for t in TestRealServerCAS TestKillOverRealServer \
+               TestSameRoundRace/hanzo-s3 TestFenceRefusesOlderRound/hanzo-s3 TestAttachNeedsAHigherRound/hanzo-s3 \
+               TestTakeoverLosesNoAcknowledgedCommit/hanzo-s3 TestRacingClaims/hanzo-s3 TestVolumeOnEveryStore/hanzo-s3; do
+        grep -q -- "--- PASS: $t " "$log" || { echo "did not pass against the real server: $t"; exit 1; }
+      done
   - name: scale-a
     run: go test -count=1 -timeout 4m -run '^(TestHundredThousandFiles|TestMillionInodes|TestSyncCostDoesNotGrowWithTheTree|TestObjectBudget150GiB|TestMillionEntryDirectory|TestSequentialWriteMemory|TestSparsePetabyte)$' .
   - name: scale-b

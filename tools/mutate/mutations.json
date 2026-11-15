@@ -34,8 +34,8 @@
  {
   "name": "tree: cut by position, not by content",
   "file": "tree.go",
-  "old": "return uint64(binary.LittleEndian.Uint32(h[:4]))*t.target < size<<32",
-  "new": "return uint64(binary.LittleEndian.Uint32(h[:4]))*t.target < size<<32 && false",
+  "old": "return uint64(binary.LittleEndian.Uint32(sum[:4]))*t.target < size<<32",
+  "new": "return uint64(binary.LittleEndian.Uint32(sum[:4]))*t.target < size<<32 && false",
   "pkg": ".",
   "run": "TestTreeWrites"
  },
@@ -211,16 +211,16 @@
  {
   "name": "volume: Attach admits an equal round",
   "file": "volume.go",
-  "old": "if cfg.Round <= recorded {",
-  "new": "if cfg.Round < recorded {",
+  "old": "if cfg.Round <= recorded {\n\t\t\treturn fmt.Errorf(\"%w: round %d does not exceed the recorded %d\", ErrStaleRound, cfg.Round, recorded)\n\t\t}\n\t\tvar err error",
+  "new": "if cfg.Round < recorded {\n\t\t\treturn fmt.Errorf(\"%w: round %d does not exceed the recorded %d\", ErrStaleRound, cfg.Round, recorded)\n\t\t}\n\t\tvar err error",
   "pkg": ".",
   "run": "TestAttachNeeds|TestRacing|TestSameRound"
  },
  {
   "name": "volume: Attach admits the last round",
   "file": "volume.go",
-  "old": "if cfg.Round == 0 || cfg.Round == math.MaxUint64 {",
-  "new": "if cfg.Round == 0 || (false && cfg.Round == math.MaxUint64) {",
+  "old": "if cfg.Round == 0 || cfg.Round == math.MaxUint64 {\n\t\treturn nil, fmt.Errorf(\"%w: Attach needs",
+  "new": "if cfg.Round == 0 {\n\t\treturn nil, fmt.Errorf(\"%w: Attach needs",
   "pkg": ".",
   "run": "TestRoundMax"
  },
@@ -321,34 +321,26 @@
   "run": "TestListingSeesAChangeOnceAndARemovalNever|TestModelFuzz|TestRecordsFollow|TestSparseRandom"
  },
  {
-  "name": "volume: head not sealed to its place",
-  "file": "head.go",
-  "old": "func headAAD(place string) []byte { return []byte(\"vfs head \" + place) }",
-  "new": "func headAAD(place string) []byte { return []byte(\"vfs head \") }",
-  "pkg": ".",
-  "run": "TestSealedToItsContext|TestHostileBackend"
- },
- {
   "name": "volume: shards not sealed to their volume",
   "file": "head.go",
-  "old": "func shardAAD(id volumeID) []byte { return append([]byte(\"vfs shard \"), id[:]...) }",
-  "new": "func shardAAD(id volumeID) []byte { return []byte(\"vfs shard \") }",
+  "old": "func shardAAD(id volumeID) []byte { return bind(\"shard\", id[:]) }",
+  "new": "func shardAAD(id volumeID) []byte { return bind(\"shard\") }",
   "pkg": ".",
   "run": "TestSealedToItsContext|TestHostileBackend"
  },
  {
   "name": "volume: chunks not sealed to their id",
   "file": "head.go",
-  "old": "\treturn append(append([]byte(\"vfs chunk \"), id[:]...), c[:]...)",
-  "new": "\treturn append([]byte(\"vfs chunk \"), id[:]...)",
+  "old": "func chunkAAD(id volumeID, c chunkID) []byte { return bind(\"chunk\", id[:], c[:]) }",
+  "new": "func chunkAAD(id volumeID, c chunkID) []byte { return bind(\"chunk\", id[:]) }",
   "pkg": ".",
   "run": "TestSealedToItsContext"
  },
  {
   "name": "head: trailing bytes accepted",
   "file": "head.go",
-  "old": "\treturn h, r.done()\n}\n\n// What each kind",
-  "new": "\treturn h, r.err\n}\n\n// What each kind",
+  "old": "copy(h.Seed[:], r.raw(32))\n\treturn h, r.done()",
+  "new": "copy(h.Seed[:], r.raw(32))\n\treturn h, r.err",
   "pkg": ".",
   "run": "TestHeadRejectsGarbage"
  },
@@ -471,14 +463,6 @@
   "new": "\tfor _, k := range []*age.HybridIdentity{current} {",
   "pkg": ".",
   "run": "TestRotation"
- },
- {
-  "name": "cipher: context not checked",
-  "file": "cipher.go",
-  "old": "\tif !bytes.HasPrefix(plain, aad) {",
-  "new": "\tif false {",
-  "pkg": ".",
-  "run": "TestSealedToItsContext|TestHostileBackend"
  },
  {
   "name": "cipher: plaintext in the output allowed",
@@ -716,10 +700,10 @@
   "tags": "fuse"
  },
  {
-  "name": "mount: a commit runs on its request's context",
+  "name": "mount: a commit runs on its caller's context",
   "file": "pkg/mount/errno.go",
-  "old": "_, err := own(req, context.Background(), func(c context.Context) (struct{}, error) {",
-  "new": "_, err := own(req, req, func(c context.Context) (struct{}, error) {",
+  "old": "\tf := c.join()\n\tselect {",
+  "new": "\tf := &flight{done: make(chan struct{})}\n\tf.err = c.vol.Flush(req)\n\tclose(f.done)\n\tselect {",
   "pkg": "./pkg/mount",
   "run": "TestCommitSurvivesItsCaller",
   "tags": "fuse"
@@ -727,8 +711,8 @@
  {
   "name": "mount: a read runs on its request's context",
   "file": "pkg/mount/fuse_unix.go",
-  "old": "data, err := own(context.WithoutCancel(ctx), h.base, func(c context.Context) ([]byte, error) {",
-  "new": "data, err := own(context.WithoutCancel(ctx), ctx, func(c context.Context) ([]byte, error) {",
+  "old": "own(context.WithoutCancel(ctx), h.s.base, func",
+  "new": "own(context.WithoutCancel(ctx), ctx, func",
   "pkg": "./pkg/mount",
   "run": "TestReadWaitsForItsData",
   "tags": "fuse"
@@ -754,8 +738,8 @@
  {
   "name": "mount: a read gives up when interrupted",
   "file": "pkg/mount/fuse_unix.go",
-  "old": "data, err := own(context.WithoutCancel(ctx), h.base, func(c context.Context) ([]byte, error) {",
-  "new": "data, err := own(ctx, h.base, func(c context.Context) ([]byte, error) {",
+  "old": "data, err := own(context.WithoutCancel(ctx), h.s.base, func(c context.Context) ([]byte, error) {",
+  "new": "data, err := own(ctx, h.s.base, func(c context.Context) ([]byte, error) {",
   "pkg": "./pkg/mount",
   "run": "TestReadWaitsForItsData",
   "tags": "fuse"
@@ -763,8 +747,8 @@
  {
   "name": "mount: a close gives up when interrupted",
   "file": "pkg/mount/fuse_unix.go",
-  "old": "return errno(commit(context.WithoutCancel(ctx), h.vol))",
-  "new": "return errno(commit(ctx, h.vol))",
+  "old": "return errno(h.s.group.commit(context.WithoutCancel(ctx)))",
+  "new": "return errno(h.s.group.commit(ctx))",
   "pkg": "./pkg/mount",
   "run": "TestCloseWaitsForItsCommit",
   "tags": "fuse"

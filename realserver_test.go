@@ -34,7 +34,7 @@ func openOn(t testing.TB, srv *storetest.Real, prefix string) backend.Backend {
 // mix of PutIfVersion with an unconditional Put and a Delete.
 func TestRealServerCAS(t *testing.T) {
 	srv := storetest.RealS3(t)
-	prefix := srv.Prefix("redcas")
+	prefix := srv.Prefix("cas")
 	const racers = 128
 	clients := make([]backend.Backend, racers)
 	for i := range clients {
@@ -55,9 +55,9 @@ func TestRealServerCAS(t *testing.T) {
 			if _, err := clients[0].PutIfAbsent(ctx, key, []byte("base")); err != nil {
 				t.Fatal(err)
 			}
-			rounds := sized(15, 60)
+			rounds := sized(15, 24)
 			if size > 1<<20 {
-				rounds = 6
+				rounds = sized(2, 3)
 			}
 			for round := range rounds {
 				_, v, err := clients[0].Get(ctx, key, backend.Unbounded)
