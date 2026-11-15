@@ -4,7 +4,10 @@ import "syscall"
 
 type regs = syscall.PtraceRegs
 
-const renameat2 = 276
+const (
+	renameat  = syscall.SYS_RENAMEAT
+	renameat2 = 276 // not in the frozen syscall package
+)
 
 func sysnum(r *regs) uintptr { return uintptr(r.Regs[8]) }
 

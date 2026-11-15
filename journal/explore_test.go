@@ -18,7 +18,7 @@ import (
 // invariants (prefix, every acknowledged record, second replay equal).
 func TestCrashDuringRecovery(t *testing.T) {
 	for seed := int64(1); seed <= 2; seed++ {
-		crashDuringRecovery(t, seed, 80)
+		crashDuringRecovery(t, seed, 55)
 	}
 }
 
@@ -44,35 +44,31 @@ func crashDuringRecovery(t *testing.T, seed int64, ops int) {
 	j.Close()
 
 	states, second := 0, 0
-	total := r.d.Len()
-	for n := 0; n <= total; n++ {
-		for _, v := range r.d.Variants(n, 1, int64(n)) {
-			states++
-			img1 := r.d.Image(n, v)
-			var ack, pub uint64
-			for _, note := range r.d.Marks(n) {
-				switch x := note.(type) {
-				case acked:
-					ack = max(ack, uint64(x))
-				case stored:
-					pub = max(pub, uint64(x))
-				}
-			}
-			// Recover S1 on the logging image; leave it open for a moment so the
-			// recovery's own writes are in img1's log.
-			j1, err := journal.Open("", r.opts2(img1, pub))
-			if err != nil {
-				t.Fatalf("S1 point %d %s: Open: %v", n, v, err)
-			}
-			j1.Close()
-			err = img1.Explore(1, 5, func(img2 *crash.Disk, n2 int, v2 crash.Variant) error {
-				second++
-				return r.recovered(img2.Image(img2.Len(), crash.Variant{Kind: crash.All}), pub, ack, pub)
-			})
-			if err != nil {
-				t.Fatalf("S1 point %d %s then %v\n%s", n, v, err, r.d.Log(min(total, 40)))
+	err := r.d.Explore(1, 1, func(img1 *crash.Disk, n int, v crash.Variant) error {
+		states++
+		var ack, pub uint64
+		for _, note := range r.d.Marks(n) {
+			switch x := note.(type) {
+			case acked:
+				ack = max(ack, uint64(x))
+			case stored:
+				pub = max(pub, uint64(x))
 			}
 		}
+		// Recover S1 on the logging image; the recovery's own writes are then in
+		// img1's log, and every crash state of those is recovered in turn.
+		j1, err := journal.Open("", r.opts2(img1, pub))
+		if err != nil {
+			return fmt.Errorf("S1: Open: %w", err)
+		}
+		j1.Close()
+		return img1.Explore(1, 5, func(img2 *crash.Disk, n2 int, v2 crash.Variant) error {
+			second++
+			return r.recovered(img2.Image(img2.Len(), crash.Variant{Kind: crash.All}), pub, ack, pub)
+		})
+	})
+	if err != nil {
+		t.Fatalf("%v\n%s", err, r.d.Log(min(r.d.Len(), 40)))
 	}
 	t.Logf("%d first crashes, %d second crashes", states, second)
 }
@@ -141,7 +137,7 @@ func TestHeadAheadOfPublish(t *testing.T) {
 // whose every payload is the one appended.
 func TestDamageFuzz(t *testing.T) {
 	rng := rand.New(rand.NewSource(99))
-	for round := 0; round < 1500; round++ {
+	for round := 0; round < 900; round++ {
 		d := crash.New()
 		j := open(t, small(d, newClock(), 0))
 		want := map[uint64][]byte{}

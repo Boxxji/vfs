@@ -173,6 +173,7 @@ type Stats struct {
 
 const (
 	batchCap   = 4 << 20          // bytes one write holds before the next record starts another
+	batchSmall = 256 << 10        // the same, for a batch of small records
 	maxPending = 16 << 20         // bytes queued for the file before Append waits for the writer
 	syncBytes  = 8 << 20          // unsynced bytes that start a sync nobody asked for
 	exposed    = 16 << 20         // bytes written but not synced before the writer waits for a sync
@@ -563,7 +564,10 @@ func (j *Journal) place(payload []byte, sum uint32, n int64) (uint64, <-chan str
 // header. Caller holds mu.
 func (j *Journal) open(t *slot, header bool, n int64) *batch {
 	b := &batch{slot: t, off: t.end}
-	size := int64(batchCap)
+	size := int64(batchSmall)
+	if n > batchSmall/4 {
+		size = batchCap
+	}
 	if header {
 		b.off = 0
 		size += dataStart
@@ -584,18 +588,31 @@ func (j *Journal) open(t *slot, header bool, n int64) *batch {
 	return b
 }
 
-var buffers = sync.Pool{New: func() any { return make([]byte, 0, batchCap+dataStart) }}
+// Batches of small records get a small buffer: a journal that is opened, used
+// a little and closed, as a crash exploration does thousands of times, must not
+// allocate and clear four megabytes for each. Records over a quarter of it, and
+// anything bigger, get the large one.
+var (
+	smallBuffers = sync.Pool{New: func() any { return make([]byte, 0, batchSmall+dataStart) }}
+	buffers      = sync.Pool{New: func() any { return make([]byte, 0, batchCap+dataStart) }}
+)
 
 func getBuffer(size int) []byte {
-	if size <= batchCap+dataStart {
+	switch {
+	case size <= batchSmall+dataStart:
+		return smallBuffers.Get().([]byte)[:0]
+	case size <= batchCap+dataStart:
 		return buffers.Get().([]byte)[:0]
 	}
 	return make([]byte, 0, size)
 }
 
 func putBuffer(b []byte) {
-	if cap(b) == batchCap+dataStart {
-		buffers.Put(b[:0]) //nolint:staticcheck // a slice header per pooled buffer is cheaper than a boxed pointer here
+	switch cap(b) {
+	case batchSmall + dataStart:
+		smallBuffers.Put(b[:0]) //nolint:staticcheck // a slice header per pooled buffer is cheaper than a boxed pointer here
+	case batchCap + dataStart:
+		buffers.Put(b[:0]) //nolint:staticcheck // as above
 	}
 }
 

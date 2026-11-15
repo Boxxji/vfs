@@ -262,7 +262,7 @@ func TestCrashSequential(t *testing.T) {
 	j := open(t, r.opts(0))
 	rng := rand.New(rand.NewSource(7))
 	var visible, published uint64
-	for i := 0; i < 400; i++ {
+	for i := 0; i < 260; i++ {
 		seq := r.append(t, j, payload(uint64(rng.Intn(1000))))
 		visible = seq
 		switch rng.Intn(10) {

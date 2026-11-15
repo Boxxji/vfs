@@ -8,7 +8,10 @@ import "syscall"
 // tracing tests fail for want of the calls they look for.
 type regs = syscall.PtraceRegs
 
-const renameat2 = 1 << 31
+const (
+	renameat  = 1 << 31
+	renameat2 = 1<<31 + 1
+)
 
 func sysnum(*regs) uintptr { return 0 }
 

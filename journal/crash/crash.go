@@ -13,6 +13,8 @@
 package crash
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"math/rand"
@@ -333,6 +335,10 @@ func without(ws []pending, name string) []pending {
 // last few writes torn at assorted offsets, and scatter random states.
 func (d *Disk) Variants(n, scatter int, seed int64) []Variant {
 	_, volatile := d.durable(n)
+	return variants(volatile, scatter, seed)
+}
+
+func variants(volatile []pending, scatter int, seed int64) []Variant {
 	vs := []Variant{{Kind: Lost}}
 	p := len(volatile)
 	if p == 0 {
@@ -372,9 +378,22 @@ func (d *Disk) Variants(n, scatter int, seed int64) []Variant {
 // volatile writes left as v says. The image has an empty log of its own.
 func (d *Disk) Image(n int, v Variant) *Disk {
 	base, volatile := d.durable(n)
-	rng := rand.New(rand.NewSource(v.Seed))
+	return image(base, volatile, v)
+}
+
+// image builds the disk of one crash state from the durable files and the
+// volatile writes of a point. It leaves base as it found it.
+func image(base map[string][]byte, volatile []pending, v Variant) *Disk {
+	data := make(map[string][]byte, len(base))
+	for name, b := range base {
+		data[name] = append([]byte(nil), b...)
+	}
+	var rng *rand.Rand
+	if v.Kind == Scatter {
+		rng = rand.New(rand.NewSource(v.Seed))
+	}
 	for i, w := range volatile {
-		b, ok := base[w.name]
+		b, ok := data[w.name]
 		if !ok {
 			continue
 		}
@@ -410,26 +429,61 @@ func (d *Disk) Image(n int, v Variant) *Disk {
 		}
 	}
 	img := New()
-	for name, data := range base {
-		img.files[name] = &content{append([]byte(nil), data...)}
-		img.base[name] = data
+	for name, b := range data {
+		img.files[name] = &content{append([]byte(nil), b...)}
+		img.base[name] = b
 	}
 	return img
 }
 
 // Explore calls check on the image of every crash state: each point of the log
-// with each of its variants. It stops at the first error and returns it with
-// the point and the variant.
+// with each of its variants. Variants that leave the same bytes on the media at
+// one point are one state, and check sees it once, with the first variant that
+// made it. It stops at the first error and returns it with the point and the
+// variant.
 func (d *Disk) Explore(scatter int, seed int64, check func(img *Disk, point int, v Variant) error) error {
 	total := d.Len()
 	for n := 0; n <= total; n++ {
-		for _, v := range d.Variants(n, scatter, seed+int64(n)*1000) {
-			if err := check(d.Image(n, v), n, v); err != nil {
+		base, volatile := d.durable(n)
+		seen := map[[sha256.Size]byte]bool{}
+		for _, v := range variants(volatile, scatter, seed+int64(n)*1000) {
+			img := image(base, volatile, v)
+			key := img.fingerprint()
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			if err := check(img, n, v); err != nil {
 				return fmt.Errorf("crash at point %d of %d, %s: %w", n, total, v, err)
 			}
 		}
 	}
 	return nil
+}
+
+// fingerprint is a digest of the names and contents of the files.
+func (d *Disk) fingerprint() [sha256.Size]byte {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	names := make([]string, 0, len(d.files))
+	for name := range d.files {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	h := sha256.New()
+	var n [8]byte
+	for _, name := range names {
+		data := d.files[name].data
+		binary.LittleEndian.PutUint64(n[:], uint64(len(name)))
+		h.Write(n[:])
+		h.Write([]byte(name))
+		binary.LittleEndian.PutUint64(n[:], uint64(len(data)))
+		h.Write(n[:])
+		h.Write(data)
+	}
+	var sum [sha256.Size]byte
+	h.Sum(sum[:0])
+	return sum
 }
 
 // Log describes the first n points of the log, one per line, for failure messages.

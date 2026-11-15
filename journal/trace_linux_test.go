@@ -64,8 +64,8 @@ func (c call) String() string { return fmt.Sprintf("%s(%s %s %#x)", c.name, c.pa
 var names = map[uintptr]string{
 	syscall.SYS_FDATASYNC: "fdatasync",
 	syscall.SYS_FSYNC:     "fsync",
-	syscall.SYS_RENAMEAT:  "rename",
-	renameat2:             "rename", // not in the frozen syscall package: the number is per architecture
+	renameat:              "rename", // the numbers of the rename calls are per architecture
+	renameat2:             "rename",
 	syscall.SYS_UNLINKAT:  "unlink",
 	syscall.SYS_OPENAT:    "open",
 	syscall.SYS_FLOCK:     "flock",
