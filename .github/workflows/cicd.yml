@@ -29,7 +29,8 @@ jobs:
           - 'sqlite'
           - 'scale-a'
           - 'scale-b'
-          - '!realserver,realserver-kill,check,unit,race,model,sqlite,scale-a,scale-b'
+          - 'scale-c'
+          - '!realserver,realserver-kill,check,unit,race,model,sqlite,scale-a,scale-b,scale-c'
     uses: hanzoai/ci/.github/workflows/build.yml@v2
     with:
       gates: ${{ matrix.gates }}

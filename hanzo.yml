@@ -17,7 +17,7 @@
 #   sqlite           the packages that run a real SQLite engine on a Volume
 #   realserver       the engine and its store client against a real Hanzo S3 server
 #   realserver-kill  a writer killed at random moments, and the fence racing, against it
-#   scale-a/b        the measurements: 100,000 files, a million inodes, sync cost, the
+#   scale-a/b/c      the measurements: 100,000 files, a million inodes, sync cost, the
 #                    object budget, a petabyte, amplification (-short skips them)
 #   fuzz             the model run over many more seeds
 #
@@ -95,6 +95,8 @@ test:
   - name: scale-a
     run: go test -count=1 -timeout 4m -run '^(TestHundredThousandFiles|TestMillionInodes|TestSyncCostDoesNotGrowWithTheTree|TestObjectBudget150GiB|TestMillionEntryDirectory|TestSequentialWriteMemory|TestSparsePetabyte)$' .
   - name: scale-b
-    run: go test -count=1 -timeout 4m -run '^(TestCheckoutCost|TestCommitPerClose|TestChunkedFilesCommitCost|TestObjectsPerThousandSmallFiles|TestAppendWithFsyncAmplification|TestColdReadAmplification|TestSmallWritesAmplifyMemory|TestFlushLatency|TestSustainedWriteWithFsync|TestTinyExtentsCost|TestPetabyteScattered)$' .
+    run: go test -count=1 -timeout 4m -run '^(TestCheckoutCost|TestCommitPerClose|TestChunkedFilesCommitCost)$' .
+  - name: scale-c
+    run: go test -count=1 -timeout 4m -run '^(TestObjectsPerThousandSmallFiles|TestAppendWithFsyncAmplification|TestColdReadAmplification|TestSmallWritesAmplifyMemory|TestFlushLatency|TestSustainedWriteWithFsync|TestTinyExtentsCost|TestPetabyteScattered)$' .
   - name: fuzz
     run: go test -count=1 -timeout 4m -run '^TestModelFuzzMany$' .
