@@ -47,7 +47,7 @@ type op struct {
 
 // Event describes a file operation about to happen, for Intercept.
 type Event struct {
-	Kind string // "create", "remove", "write" or "sync"
+	Kind string // "create", "remove", "write", "writeback" or "sync"
 	Name string
 	Off  int64
 	Len  int
@@ -195,6 +195,12 @@ func (f *file) WriteAt(p []byte, off int64) (int, error) {
 	copy(f.c.data[off:], p)
 	f.d.log = append(f.d.log, op{kind: opWrite, name: f.name, off: off, data: append([]byte(nil), p...)})
 	return len(p), nil
+}
+
+// Writeback is a hint with no effect on what a crash leaves; it is reported to
+// Intercept so a test can see it.
+func (f *file) Writeback(off, n int64) error {
+	return f.d.intercept(Event{"writeback", f.name, off, int(n)})
 }
 
 func (f *file) Sync() error {
