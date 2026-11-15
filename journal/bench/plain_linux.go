@@ -37,6 +37,11 @@ func plainLatency(work string) {
 			files[w] = zeroFile(filepath.Join(work, fmt.Sprintf("w%d", w)), per)
 		}
 	}
+	streams := make([]*os.File, *bulk)
+	for b := range streams {
+		streams[b] = zeroFile(filepath.Join(work, fmt.Sprintf("bulk%d", b)), 256<<20)
+		defer streams[b].Close()
+	}
 	buf := make([]byte, *size)
 	deadline := time.Now().Add(*dur)
 	lats := make([][]time.Duration, *writers)
@@ -60,6 +65,19 @@ func plainLatency(work string) {
 				off = (off + int64(len(buf))) % (per - int64(len(buf)))
 			}
 		}(w)
+	}
+	for _, f := range streams {
+		wg.Add(1)
+		go func(f *os.File) {
+			defer wg.Done()
+			stream := make([]byte, 1<<20)
+			var off int64
+			for time.Now().Before(deadline) {
+				_, err := f.WriteAt(stream, off)
+				check(err)
+				off = (off + int64(len(stream))) % (256 << 20)
+			}
+		}(f)
 	}
 	wg.Wait()
 	elapsed := time.Since(start)

@@ -40,6 +40,7 @@ var (
 	total   = flag.String("total", "8GiB", "bytes a sequential run writes")
 	every   = flag.String("every", "1MiB", "plain sequential: bytes between fdatasync calls (0 = once at the end)")
 	shared  = flag.Bool("shared", false, "plain latency: all writers share one file")
+	bulk    = flag.Int("bulk", 0, "latency runs: extra writers streaming 1 MiB without waiting for durability")
 	drain   = flag.Float64("drain", 0, "journal: megabytes per second the publisher drains (0 = instantly)")
 	capa    = flag.String("capacity", "1GiB", "journal capacity")
 	segment = flag.String("segment", "64MiB", "journal segment size")
@@ -277,6 +278,20 @@ func journalLatency(work string) {
 				lats[w] = append(lats[w], time.Since(t0))
 			}
 		}(w)
+	}
+	for b := 0; b < *bulk; b++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			stream := make([]byte, 1<<20)
+			for time.Now().Before(deadline) {
+				if _, err := j.Append(context.Background(), stream); err == journal.ErrFull {
+					runtime.Gosched()
+				} else {
+					check(err)
+				}
+			}
+		}()
 	}
 	wg.Wait()
 	elapsed := time.Since(start)
