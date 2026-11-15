@@ -79,6 +79,11 @@ func TestIdentityCipherIsRefused(t *testing.T) {
 	if err := vfs.Create(ctx, cfg(mem, macOnly{}, 0)); !errors.Is(err, vfs.ErrBadCipher) {
 		t.Fatalf("Create with a Cipher that hides nothing = %v, want ErrBadCipher", err)
 	}
+	// Configuring is where it is refused, before any object is read or written: Open
+	// has nothing to seal, and finds no Volume, yet says the Cipher is bad.
+	if _, err := vfs.Open(ctx, cfg(mem, macOnly{}, 0)); !errors.Is(err, vfs.ErrBadCipher) {
+		t.Fatalf("Open with a Cipher that hides nothing = %v, want ErrBadCipher", err)
+	}
 	// A volume made with a real Cipher refuses to be attached through a bad one.
 	c := vfsAge(t)
 	if err := vfs.Create(ctx, cfg(mem, c, 0)); err != nil {
