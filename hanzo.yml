@@ -7,4 +7,11 @@ test:
     run: |
       set -euo pipefail
       go build ./...
+      # The journal's tests read the real system calls of its file layer under
+      # strace. Without it they prove nothing, so a missing strace is an error.
+      if ! command -v strace >/dev/null; then
+        { sudo -n apt-get update -qq && sudo -n apt-get install -y -qq strace; } \
+          || { apt-get update -qq && apt-get install -y -qq strace; } || true
+      fi
+      command -v strace >/dev/null || { echo "the journal tests need strace and it could not be installed" >&2; exit 1; }
       go test -race ./...
