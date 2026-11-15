@@ -12,13 +12,14 @@ prefix of a bucket (or a directory): the engine behind a Hanzo Disk.
 - **Sharded metadata**: inodes, directory entries and chunk references are records in one Merkle tree of immutable shards. A commit writes the shards that changed and nothing else, and it scales to a million inodes. Files up to 16 KiB live inside the metadata.
 - **One commit**: a single conditional PUT of a small `head` object. A crash at any point leaves the last committed tree, whole.
 - **Fenced**: `Attach` claims the Volume at a monotone Round; a commit from an older Round is refused, and a takeover carries forward the last landed commit.
-- **Sealed**: every object goes through a `Cipher`. The default is `luxfi/age` with a hybrid X25519 + ML-KEM-768 key. The engine never reads a key from a file or the environment.
+- **Sealed**: every object goes through a `Cipher`. The default is `luxfi/age` with a hybrid X25519 + ML-KEM-768 key. The engine never reads a key from a file or the environment, and seals each object to its Volume and place, so one copied in from elsewhere does not open.
+- **Sparse**: a hole stores nothing. Truncating a file to a petabyte and writing a few bytes into it costs a few objects.
 
 ## Quick start
 
 ```bash
 make build
-./bin/vfs keygen > /tmp/vol.key                       # the Volume key (keep it in KMS)
+./bin/vfs keygen > /tmp/vol.key                       # the Volume key (keep it in a secret store)
 B=file:///tmp/vol                                      # or s3://bucket/prefix?endpoint=host:port
 ./bin/vfs init  --backend $B   < /tmp/vol.key
 echo hello > /tmp/in.txt
@@ -37,7 +38,7 @@ the Volume at; it must exceed the last one used.
 ## Library
 
 ```go
-c := vfs.NewAgeCipher(key)                                  // key from KMS
+c := vfs.Hybrid(key)                                        // a key you hold
 _ = vfs.Create(ctx, vfs.Config{Backend: be, Cipher: c})
 v, _ := vfs.Attach(ctx, vfs.Config{Backend: be, Cipher: c, Round: 7})
 f, _ := v.Create(ctx, vfs.RootInode, "a.txt", 0o644)
@@ -49,7 +50,7 @@ v.Flush(ctx)                                                // durable: head adv
 `Flush` returns only after the Head naming everything written has advanced in the
 store. `Fsync` is `Flush`.
 
-See [`LLM.md`](./LLM.md) for the format, the commit and fence protocols, and what
+See [`docs/SPECIFICATION.md`](./docs/SPECIFICATION.md) for the on-disk layout and protocols as a third party could implement them, [`LLM.md`](./LLM.md) for the commit and fence protocols, and what
 is not built yet, and [`docs/PRODUCTION-READINESS.md`](./docs/PRODUCTION-READINESS.md)
 for the measurements.
 

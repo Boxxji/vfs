@@ -2,64 +2,80 @@
 
 ## What this is
 
-The Disk engine: a filesystem (a **Volume**) on an object-store prefix, sealed
-with a per-Volume post-quantum key. One writer at a time, fenced by a **Round**.
-The store is any S3-compatible service (Hanzo S3 first) or a directory. The
-engine knows nothing of sandboxes, runtimes, quotas or billing: the cloud agent
-mounts and leases Volumes, a runtime (Firecracker, kata, visor) consumes the same
-Disk through FUSE.
+A filesystem (a **Volume**) on an object-store prefix, sealed with a post-quantum
+key. One writer at a time, fenced by a **Round**. The store is any S3-compatible
+service or a directory. The engine knows nothing of who mounts it, what runs on
+it, or what it costs: it exposes a small POSIX-shaped Go API, a FUSE front, and a
+command line.
 
-Companion to `~/work/hanzo/replicate` (SQLite WAL to S3): `vfs` is the whole
-filesystem. The `replica/` subpackage (HIP-0107) is the older per-org SQLite HA
-substrate and shares the fence with the Volume (`pkg/fence`).
+The `replica/` subpackage (HIP-0107) replicates SQLite snapshots and WAL to an object
+store; it shares the Round fence with the Volume (`pkg/fence`).
 
-## Format (version 2)
+## On-disk layout
 
-A Volume is a prefix holding three kinds of object. Every byte is sealed by the
-Volume's `Cipher`; the backend sees ciphertext only.
+There is one layout and no version number: nothing in an object says which
+library wrote it, and no code path reads any other layout. Extension is by
+tagged records (below), not by numbered revisions. A Volume is a
+prefix holding three kinds of object. Every byte is sealed by the Volume's
+`Cipher`; the backend sees ciphertext only.
 
 | Key | What | Name |
 |---|---|---|
-| `head` | the one mutable object: root shard ref, next inode, commit count; fence header carries the Round | fixed |
+| `head` | the one mutable object: root shard ref, next inode, Seq, Volume id, chunking seed; its fence header carries the Round | fixed |
 | `meta/<2 hex>/<hash>` | metadata shard, immutable | blake3 of the sealed bytes |
 | `pack/<2 hex>/<id>` | pack of sealed chunks, immutable | 128 random bits |
 
 **Chunks** (`chunk.go`). File bytes are cut by FastCDC (gear hash, normalized
-chunking) into chunks of 64 KiB to 4 MiB; measured mean on random bytes 581 KiB.
-A cut depends only on the bytes since the previous cut, so an edit rewrites the
-chunks it touches and the cuts re-synchronize after it (measured: a 100 byte
-overwrite, insertion or deletion in 24 MiB changes 1 chunk). The gear table is
-derived from blake3's XOF over a fixed string and pinned by a test: it is part of
-the format. A chunk id is the blake3 of its plaintext; ids appear only inside
-sealed shards. Equal ids in one Volume mean equal bytes: that is dedupe. Volumes
-never share chunks (per-Volume key; cross-Volume dedupe is off).
+chunking) into chunks of 64 KiB to 4 MiB, mean 512 to 580 KiB. A cut depends only
+on the bytes since the previous cut, so an edit rewrites the chunks it touches and
+the cuts re-synchronize after it (a 100 byte overwrite, insertion or deletion in
+24 MiB changes one chunk). The gear table is drawn per Volume from the seed in the
+Head, so chunk lengths do not identify a known file across Volumes. A chunk id is
+the blake3 of its plaintext and appears only inside sealed shards; equal ids in one
+Volume mean equal bytes (dedupe). Volumes never share chunks.
 
 **Packs** (`pack.go`). Each chunk is sealed on its own and appended to the open
-pack; the pack is uploaded at 16 MiB or at Flush. A 150 GiB tree is therefore
-~9.6k pack PUTs, not one per chunk. Where a chunk lies is the chunk table, not a
-pack header. Packs stay under the S3 backend's single-request limit.
+pack, uploaded at 16 MiB or at Flush. A 150 GiB tree is ~9.6k pack PUTs. Where a
+chunk lies is the chunk table, not a pack header.
 
-**Small files** (at most `inlineMax` = 16 KiB) are not chunked: their bytes are a
+**Small files** (at most `small` = 16 KiB) are not chunked: their bytes are a
 record beside their inode. A file's form is a function of its size alone.
+
+**Holes.** A file's size is its inode's. Only runs of bytes that were written have
+chunks; a byte no chunk covers is a hole and reads as zero. Each run is cut on its
+own from its first byte. So a truncate to 1 PiB, or a write at an offset of a
+petabyte, costs the written runs and nothing for the gap: no chunks, no records, no
+memory (`TestSparsePetabyte`). The stored chunk list is, after any sequence of
+edits, exactly what a cut of the file's final bytes gives
+(`TestChunkListIsTheWholeFileCut`). `MaxSize` is 2^62.
 
 **Metadata** (`record.go`, `tree.go`, `shard.go`). All metadata is records in one
 ordered Merkle search tree (a prolly tree) of immutable shards:
 
 ```
-[1][ino]                 inode: mode, size, mtime, atime, ctime
+[1][ino]                 inode: tagged fields (mode, size, times; room for more)
 [2][dir ino][name]       directory entry: child ino, type
 [3][ino]                 inline file bytes
 [3][ino][offset]         chunk reference: chunk id, length
 [4][chunk id]            chunk table: pack id, offset, sealed length
 ```
 
+The inode record is a sequence of `[tag][length][value]` fields in ascending tag
+order. A reader checks the tags it knows, carries the ones it does not, and writes
+them back on rewrite, so owner, link count, device, symlink target and the like are
+new tags. New record kinds take the next `[table]` byte.
+
 Node boundaries are decided by the entries (a hash of the key under a threshold
 proportional to the entry's size), average 64 KiB, so the tree's shape is a pure
-function of its records. A change rewrites the changed leaves and their
-ancestors and nothing else; the new root equals the root built from scratch from
-the same records (`TestTreeMatchesModel` checks this after every random batch).
-Measured: ten changed files in 100,000 write ~21 shards of 197, and the cost does
-not grow with the tree (`TestSyncCostDoesNotGrowWithTheTree`).
+function of its records. A change rewrites the changed leaves and their ancestors
+and nothing else; the new root equals the root built from scratch
+(`TestTreeMatchesModel`, `TestTreeForcedCuts`).
+
+**Sealing context.** Every object is sealed together with what it is: a Head to
+the Volume's place (`Backend.String()`), a shard to its Volume id, a chunk to its
+Volume id and its own id. An object from another Volume or place does not open even
+under a Cipher both share. A Volume copied to another place does not open there
+until its Head is re-sealed (not built yet).
 
 ## Commit, Flush, Fsync
 
@@ -67,47 +83,63 @@ not grow with the tree (`TestSyncCostDoesNotGrowWithTheTree`).
 shards the changes touched, then replaces `head` with **one conditional PUT**
 (`If-Match` on the version read; `If-None-Match: *` for the first). Until that
 write lands `head` names the previous tree, which nothing touched: a crash at any
-point leaves the Volume exactly as the last Flush left it. Uploaded chunks, packs
-and shards of a failed Flush are unreferenced garbage, never corruption.
+point leaves the Volume as the last Flush left it. Uploaded chunks, packs and
+shards of a failed Flush are unreferenced garbage, never corruption.
 
-* `Flush` returns only after `head` advanced in the store. On error the changes
-  stay in memory for the next Flush; `ErrStaleRound` means they never land.
-* `Fsync` is `Flush`. There is no node journal yet (comes with V4), so no cheaper
-  durable point exists. FUSE `Flush` (every close) and `Fsync` both call it.
-* A max-age flush is a deadline timer owned by the caller of `Volume` (the agent),
-  not a poll inside the engine. Nothing here polls.
-* Flush holds the Volume exclusively for its duration.
-* Memory is bounded without a commit: past `Config.Dirty` bytes written the files
-  are chunked and uploaded; past `Config.Overlay` pending records they are written
-  into shards. Both leave `head` alone.
+The package documentation (`doc.go`) holds the **durability table**: what is
+durable when each call returns, and what a later journal must keep. In short: only
+`Flush` is durable; `Fsync` and the FUSE close are `Flush`; `Close` is not; `Attach`
+loses no acknowledged commit. Objects are written once under hash or random names,
+so repeating a write, or one that completes after its caller gave up, is harmless;
+the Head compare-and-swap is the only mutation.
+
+* On the mount an interrupt (a signal reaching a caller that waits) ends only fsync's
+  wait (EINTR; the commit runs on by itself). Read, write, close and the calls that
+  change the tree are never answered EINTR: a read answered EINTR reaches the caller as
+  EIO, close is not restarted, a restarted O_EXCL create would meet its own file. The
+  details are in `pkg/mount/errno.go`; `TestFUSEInterruptsAreNotErrors` hammers the
+  mount with signals.
+* On error the changes stay in memory for the next Flush and the outcome of that
+  attempt is unknown. `ErrStaleRound` means this Volume was fenced; if the store's
+  Head is exactly its tree, Flush says nil (the commit landed, the reply was lost).
+* `Head.Seq` numbers commit attempts and never repeats; it can skip.
+* A store that returns an older Head cannot be told from the current one by this
+  library; a caller that must notice keeps the Seq it last saw.
+* Nothing polls. A deadline timer belongs to the caller.
+* Flush holds the Volume exclusively for its duration, including its store calls.
+* Memory is bounded without a commit: past `Config.Dirty` bytes written (each
+  separate write is charged a fixed overhead too) the files are chunked and
+  uploaded; past `Config.Overlay` pending records they are written into shards.
 
 ## Fence
 
-`pkg/fence` is the only fencing implementation (it was `replica.FencedStore`):
-one object per key, a Round header in front of the payload, admitted iff
-`round >= recorded`, in one conditional write.
+`pkg/fence` is the only fencing implementation: one object per key, a Round header
+and a claimant token in front of the payload, admitted iff `round >= recorded`, in
+one conditional write.
 
-* `Attach(ctx, Config{Round: r})` calls `CarryForward`: it reads the last landed
-  Head and re-seals it at `r` by compare-and-set. `r` must exceed the recorded
-  Round (strict, `ErrStaleRound`); round 0 is never attached. No acknowledged
-  commit is lost; every commit by a lower Round is then refused.
+* `Attach(ctx, Config{Round: r})` calls `Claim`: it reads the last landed Head and
+  re-seals it at `r` by compare-and-set. `r` must exceed the recorded Round
+  (strict, `ErrStaleRound`); 0 and 2^64-1 are refused. No acknowledged commit is
+  lost; every commit by a lower Round is then refused. A claim that landed with its
+  reply lost is recognised by its token, byte for byte.
 * A fenced Volume answers every write with `ErrStaleRound`.
 * `Open` is read-only and claims nothing.
-* The Round comes from the caller (cloud mints it from its row's compare-and-set).
+* The Round comes from the caller.
 
 ## Keys
 
 `Cipher` (`cipher.go`): `Seal(plaintext) (sealed, keyID, err)`, `Open(sealed,
 keyID)`. The engine frames every object as `[len keyID][keyID][sealed]`, so a
 Cipher holding several keys keeps opening old objects while sealing new ones under
-its current key: rotation without re-encryption. `NewAgeCipher(current,
-retired...)` is the default: luxfi/age hybrid X25519 + ML-KEM-768, one age file per
-chunk and shard. The engine never reads a key from a file or the environment and
-never stores one. `Provider` is the seam the caller implements (the agent with Hanzo
-KMS). The CLI's provider reads **standard input**: one `AGE-SECRET-KEY-PQ-1...`
-identity per line, the first seals, the others are retired. Why stdin: it cannot
-leave a key in argv, the environment or a file, it needs no exec of a user string,
-and `hanzo kms secrets get ... | vfs ...` composes with it.
+its current key. `Hybrid(current, retired...)` is the default: luxfi/age hybrid
+X25519 + ML-KEM-768, one age file per chunk and shard. A Volume checks its Cipher
+when configured and refuses one that returns its input, does not open what it
+sealed, or opens altered bytes (`ErrBadCipher`). The engine never reads a key from
+a file or the environment and never stores one. `Provider` is the seam a caller
+implements to fetch a Cipher. The CLI's provider reads **standard input**: one
+`AGE-SECRET-KEY-PQ-1...` identity per line, the first seals, the others are
+retired. Why stdin: it cannot leave a key in argv, the environment or a file, and
+it composes with any secret store that can print to a pipe.
 
 ## Go API
 
@@ -120,19 +152,20 @@ f, _ := v.Open(ctx, ino)             // *File: ReadAt, WriteAt, Truncate, Stat, 
 v.Truncate(ctx, ino, size); v.Flush(ctx); v.Stats(); v.Close()
 ```
 
-The API is by inode and name, as FUSE is, so V1 (Rename, Symlink, Link, chmod,
-Statfs, xattr, locks) adds methods and record kinds without reshaping anything.
-Removing a file while it is open makes its handles fail (no orphan inodes yet).
+The API is by inode and name, as FUSE is, so rename, symlink, link, attributes and
+xattr add methods and record kinds without reshaping anything. Removing a file
+while it is open makes its handles fail (no orphan inodes yet).
 
 ## Layout
 
 ```
 vfs/
-├── volume.go head.go        # format docs, Create/Open/Attach/Flush, Head
-├── ops.go file.go           # namespace operations; File, settle, recut
+├── doc.go                   # layout, commit, durability table, crash matrix, fence
+├── volume.go head.go        # Create/Open/Attach/Flush; Head and sealing contexts
+├── ops.go file.go           # namespace operations; File, settle, recut, holes
 ├── chunk.go pack.go         # FastCDC; packs, putChunk/getChunk
 ├── record.go tree.go shard.go overlay.go codec.go lru.go   # metadata tree
-├── cipher.go                # Cipher, Provider, NewAgeCipher
+├── cipher.go                # Cipher, Provider, Hybrid, the configuration check
 ├── cmd/vfs/                 # CLI: keygen init put get ls stats mount
 ├── cmd/vfs-cost/            # cost model (pkg/cost)
 ├── pkg/backend/             # Backend interface; file/ and s3/ implementations
@@ -140,66 +173,74 @@ vfs/
 ├── pkg/mount/               # FUSE front (build tag fuse): bazil on Linux, jacobsa on macOS
 ├── replica/                 # SQLite snapshot replication (HIP-0107)
 ├── internal/storetest/      # Mem store, S3 protocol server, real-server harness, conformance suite
+├── tools/mutate/            # the mutation check: breaks the source, expects a test to fail
+├── docs/SPECIFICATION.md    # the layout and protocols, normatively
 └── docs/PRODUCTION-READINESS.md
 ```
 
 ## Backends
 
-`backend.Backend`: `Get` (returns bytes and a `Version`), `GetRange`, `Put`,
-`PutIfAbsent`, `PutIfVersion`, `Delete`, `List`, `Stat`. The two conditional
-writes must decide and write atomically (exactly one of N racers on a version wins).
+`backend.Backend`: `Get(ctx, key, max)` (bytes and a `Version`; an object larger
+than `max` is `ErrTooLarge`), `GetRange`, `Put`, `PutIfAbsent`, `PutIfVersion`,
+`Delete`, `List`, `Stat`. The two conditional writes decide and write atomically
+(exactly one of N racers on a version wins) or are refused with `ErrTooLarge`;
+never silently unconditional. `String()` names the place (bucket and prefix) and
+never a credential or endpoint.
 
 | URL | |
 |---|---|
 | `file:///dir` | atomic via one flock; version = blake3 of content; dev and tests |
-| `s3://bucket/prefix?endpoint=host:port[&insecure=1][&region=r]` | S3 API through `hanzos3/go`; ETag as version; `If-Match`/`If-None-Match`; 412 is `ErrConflict`; objects over 64 MiB go multipart and are aborted on failure |
+| `s3://bucket/prefix?endpoint=host:port[&insecure=1][&region=r]` | S3 API through `hanzos3/go`; ETag as version; `If-Match`/`If-None-Match`; 412 is `ErrConflict`; no credential in the URL (refused); the prefix is validated (no empty, `.` or `..` segment, no control character) |
 
 `s3.New(s3.Config{...})` takes the credential from the caller; the URL form uses
-the SDK's standard chain. The engine assumes nothing about which store answers: it
-receives a bucket and a prefix.
+the SDK's standard chain. Objects over 64 MiB go in parts, so a conditional write
+that large is refused. The SDK retries a failing request for about half a minute
+and hides that from the caller: retries and deadlines are not built yet.
 
 ## Tests
 
 ```
-go test ./...                                   # fast + scale tests
-go test -short -race ./...                      # what CI runs
-go test -tags fuse ./pkg/mount                  # needs /dev/fuse + fusermount
-PATH=$DIR:$PATH go test ./...                   # $DIR holds an `s3` built from hanzoai/s3: adds the real-server tests
+go test ./...                                    # fast + scale tests
+go test -short -race ./...                       # the unit step of CI
+go test -tags fuse ./pkg/mount                   # needs /dev/fuse + fusermount
+PATH=$DIR:$PATH go test ./...                    # $DIR holds an `s3` built from github.com/hanzoai/s3
+go run ./tools/mutate                            # every mutation must be killed by a test
 ```
 
 The real-server tests start `s3 server` (own-storage mode) in a temp dir with a
-throwaway key pair, race 16 writers on one version for 150 rounds and 16 creators
-of a key for 100 keys, and run whole Volumes on it. Without the binary they skip.
-Crash tests kill a re-executed test binary with SIGKILL between pack, shard and
-Head writes (the key arrives on its stdin). The mount tests serve the Volume from
-a re-executed child for a reason that bites: a process that mounts a Volume and
-also opens a file on that mount deadlocks. Go registers the open file with its
-poller, the kernel asks the file system for readiness (FUSE_POLL), and the server
-needs the same poller to read its next request. Nothing in the process can answer,
-and without root (`/sys/fs/fuse/connections/N/abort`) the threads stay in D state
-until reboot. The engine is unaffected (the agent never reads its own mount); tests
-must never be both sides of one mount.
+throwaway key pair, race 16 and 128 writers on one version, run whole Volumes on it,
+and kill a writer at random moments. CI builds that server from a pinned commit of
+`hanzoai/s3` and fails if any of them skips (`hanzo.yml`). Crash tests kill a
+re-executed test binary with SIGKILL at every point of a commit (the key arrives on
+its stdin). A mount test serves the Volume from a child process, always: a process
+that mounts a Volume and also opens a file on that mount deadlocks. Go registers the
+open file with its poller, the kernel asks the file system for readiness, and the
+server needs the same poller to read its next request; nothing in the process can
+answer, and without root the threads stay in D state until reboot.
 
 ## Not yet built (plain statement of fact)
 
-V1 POSIX ops (rename, symlink, hardlink, chmod/chown/utimens, statfs, xattr,
-locks, unlink-while-open); V4 node cache and journal (Fsync is Flush),
-parallel upload pipeline, read-ahead; V7 `vfs serve` / agent; V8 GC of orphan
-chunks, packs and shards, Snapshot/Clone/Usage, import/export; V9 retries with
-backoff, breaker, metrics, SlowDown handling; sparse files (a truncate-extend
-writes zero chunks, deduplicated); compression.
-
-For V1 and V4, `~/work/hanzo/s3/s3/mount` (the s3 repo's own POSIX mount) is the
-reference for behaviour and test cases only (file locks, rename across directories,
-unlink-while-open, write-buffer back-pressure, metadata flush retry); vfs stays the
-single Disk engine and copies nothing from it.
+* POSIX operations beyond Lookup, ReadDir, Mkdir, Create, Remove, Truncate, Read,
+  Write, Flush, Fsync: rename, symlink, hard link, chmod/chown/utimens, statfs,
+  xattr, locks, unlink-while-open. The mount answers the missing ones ENOSYS.
+* The node cache and journal (Fsync costs a commit), group commit, parallel
+  uploads, read-ahead, partial-chunk reads.
+* A server and agent process around the Volume.
+* Garbage collection of chunks, packs and shards no Head names (a deposed writer
+  can upload packs until its next commit), Snapshot, Clone, Usage, import, export.
+* Retries with backoff, deadlines on store calls, a circuit breaker, metrics,
+  handling of a store's slow-down answers. The Volume lock is held across the store
+  calls of a commit.
+* Paged directory listing: ReadDir returns a whole directory.
+* Re-sealing a Volume's Head for a new place.
+* Compression.
 
 ## Rules
 
 1. Never store plaintext or a key. Everything crosses `Cipher`.
 2. One way: one fence, one metadata tree, one commit (a single conditional PUT).
-3. Orphans are garbage for GC, never corruption: write order is chunks and packs,
-   then shards, then `head`.
+3. Orphans are garbage for a collector, never corruption: write order is chunks and
+   packs, then shards, then `head`.
 4. No polling. A deadline timer is the caller's.
 5. No test-only environment variables or build tags.
 6. LLM.md is the one project memory file; CLAUDE.md / AGENTS.md are local symlinks.
