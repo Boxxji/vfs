@@ -212,6 +212,12 @@ func journalDir(t *testing.T, prep ...func(dir string)) string {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	// The kernel reports a descriptor's path with its symbolic links resolved;
+	// the child is given the same path so the two can be compared.
+	dir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, p := range prep {
 		p(dir)
 	}

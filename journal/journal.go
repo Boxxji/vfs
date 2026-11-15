@@ -344,6 +344,9 @@ func newJournal(opt Options) (*Journal, error) {
 func Open(dir string, opt Options) (*Journal, error) {
 	j, err := newJournal(opt)
 	if err != nil {
+		if opt.Disk != nil {
+			opt.Disk.Close() // the journal owns the Disk from the call, even one it refused
+		}
 		return nil, err
 	}
 	disk := opt.Disk

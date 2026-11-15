@@ -194,11 +194,12 @@ func (g *groupSync) wait() {
 
 // groupLatency is the plain baseline that does what the journal does for the
 // fsync callers and nothing else: no record framing, no replay, no watermarks,
-// no deadline, no backpressure. Every writer writes at its own offset of one
-// shared file, then waits for a shared fdatasync.
+// no deadline, no backpressure. The writers append to one shared file, each at
+// the next free offset (so the writes are one sequential stream, as in a log),
+// then wait for a shared fdatasync.
 func groupLatency(work string) {
-	const per = 16 << 20
-	f := zeroFile(filepath.Join(work, "group"), per*int64(*writers))
+	const span = 256 << 20
+	f := zeroFile(filepath.Join(work, "group"), span)
 	defer f.Close()
 	g := newGroupSync(f)
 	streams := make([]*os.File, *bulk)
@@ -209,21 +210,20 @@ func groupLatency(work string) {
 	buf := make([]byte, *size)
 	deadline := time.Now().Add(*dur)
 	lats := make([][]time.Duration, *writers)
+	var next atomic.Int64
 	var wg sync.WaitGroup
 	start := time.Now()
 	for w := 0; w < *writers; w++ {
 		wg.Add(1)
 		go func(w int) {
 			defer wg.Done()
-			base := int64(w) * per
-			var off int64
 			for time.Now().Before(deadline) {
 				t0 := time.Now()
-				_, err := f.WriteAt(buf, base+off)
+				off := (next.Add(int64(len(buf))) - int64(len(buf))) % (span - int64(len(buf)))
+				_, err := f.WriteAt(buf, off)
 				check(err)
 				g.wait()
 				lats[w] = append(lats[w], time.Since(t0))
-				off = (off + int64(len(buf))) % (per - int64(len(buf)))
 			}
 		}(w)
 	}
