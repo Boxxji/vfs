@@ -198,13 +198,32 @@ func (c *committer) fly(f *flight) {
 	}
 }
 
-// finish commits what the mount wrote once the kernel has released it. A Volume
-// that was only opened has nothing to commit.
+// finishGrace is how long the end of a mount waits for its last commit.
+const finishGrace = 3 * time.Second
+
+// finish commits what the mount wrote once the kernel has released it. A Volume that was
+// only opened has nothing to commit. Every close is a commit already, so what is left is
+// what a holder wrote after the commit that SIGTERM made, and it is small. A commit that
+// the store does not answer keeps the Volume's lock, and anything that asks for the lock
+// waits as long, a Stats as much as a Flush: so all of it runs apart and the wait for it
+// ends after finishGrace, with an error that says what was not committed, and the process
+// can end. A supervisor that waits longer for a stalled store gets nothing more.
 func finish(vol *vfs.Volume, serveErr error) error {
-	if vol.Stats().Round == 0 {
-		return serveErr
+	done := make(chan error, 1)
+	go func() {
+		if vol.Stats().Round == 0 {
+			done <- nil
+			return
+		}
+		done <- vol.Flush(context.Background())
+	}()
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(finishGrace):
+		err = fmt.Errorf("the last commit did not finish in %s: what the mount held and had not committed is lost", finishGrace)
 	}
-	if err := vol.Flush(context.Background()); err != nil && serveErr == nil {
+	if err != nil && serveErr == nil {
 		return err
 	}
 	return serveErr
