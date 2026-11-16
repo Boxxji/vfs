@@ -94,27 +94,32 @@ const (
 )
 
 // kindOf classifies the first headerSize bytes of a file. A header torn by a
-// crash is ours and free: its magic is the one it had, or the zeros that were
-// being written over it, and either way its checksum fails. A write of a
-// sector is whole or absent; a tear that leaves part of the magic is not one
-// the media makes.
+// crash is ours and free. A write is torn at any byte, so the magic can be what
+// a prefix of a new header left over zeros, or what a prefix of zeros left over
+// the magic: every byte of it is then zero or the magic's own at that place,
+// and the checksum fails. A magic with any other byte in it is not ours.
 func kindOf(b []byte) headerKind {
-	if len(b) < headerSize {
-		if allZero(b) {
-			return headerFree
-		}
-		return headerForeign
-	}
 	switch m := b[4:8]; {
 	case string(m) == string(magic[:]):
 		if _, _, _, ok := parseHeader(b); ok {
 			return headerLive
 		}
 		return headerFree
-	case allZero(m):
+	case tornMagic(m):
 		return headerFree
 	}
 	return headerForeign
+}
+
+// tornMagic reports whether every byte of m is zero or the magic's own byte at
+// its place: zeros, or a part of the magic over zeros, or zeros over a part of it.
+func tornMagic(m []byte) bool {
+	for i, c := range m {
+		if c != 0 && c != magic[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func allZero(b []byte) bool {
@@ -148,16 +153,26 @@ func appendMark(dst []byte, seed uint32, through, floor uint64) []byte {
 	return append(dst, m[:]...)
 }
 
-// parseMarks reads the two mark slots of a segment whose preamble is b.
-func parseMarks(b []byte, seed uint32) (through, floor uint64) {
+// parseMarks reads the two mark slots of a segment whose preamble is b: the
+// highest through and floor of the slots that validate, and the slot that holds
+// them, the newest. With none valid it is the second, so that the first mark
+// written goes to the first.
+func parseMarks(b []byte, seed uint32) (through, floor uint64, newest int) {
+	newest = 1
+	var found bool
 	for i := 0; i < 2; i++ {
 		m := b[headerSize+i*markSize : headerSize+(i+1)*markSize]
-		if crc32.Update(seed, castagnoli, m[4:]) == binary.LittleEndian.Uint32(m) {
-			through = max(through, binary.LittleEndian.Uint64(m[4:]))
-			floor = max(floor, binary.LittleEndian.Uint64(m[12:]))
+		if crc32.Update(seed, castagnoli, m[4:]) != binary.LittleEndian.Uint32(m) {
+			continue
 		}
+		t, f := binary.LittleEndian.Uint64(m[4:]), binary.LittleEndian.Uint64(m[12:])
+		if !found || t > through || (t == through && f > floor) {
+			newest = i
+		}
+		found = true
+		through, floor = max(through, t), max(floor, f)
 	}
-	return through, floor
+	return through, floor, newest
 }
 
 // appendRecord encodes one record onto dst, which must have room for it.
@@ -285,52 +300,60 @@ func scan(f File, seed uint32, expect uint64, fn func(record, int64) error) (uin
 	}
 }
 
-// behind finds the records that follow a damaged one at the end of the log of a
-// segment: the record at off whose header is whole, so that its length is to be
-// believed, but whose payload does not match its checksum, and the valid
-// records after it. It returns the range from that record to the last valid one
-// after it, and the zero Range when no valid record follows or the header
-// itself is damaged: a header that fails its checksum cannot be passed.
+// behind finds the valid records that follow a damaged one at the end of the
+// log of a segment: the record at off is the one with sequence expect, whose
+// header is whole, so that its length is to be believed, and whose payload does
+// not match its checksum. The records after it are followed by their headers,
+// past any whose payloads are damaged too, and it returns the range from expect
+// to the last valid one, or the zero Range when none follows. A header that
+// fails its checksum cannot be passed: what follows it is not looked for.
 func behind(f File, seed uint32, expect uint64, off int64) (Range, error) {
 	w := window{f: f}
-	b, err := w.view(off, recordHeader)
-	if err != nil || len(b) < recordHeader || !headerOK(b, seed) {
-		return Range{}, err
-	}
-	n := length(b)
-	if binary.LittleEndian.Uint64(b[8:]) != expect || n > f.Size()-off-recordHeader {
-		return Range{}, nil
-	}
-	if p, err := w.view(off, recordHeader+n); err != nil {
-		return Range{}, err
-	} else if _, ok := parseRecord(p, seed); ok {
-		return Range{}, nil // not damaged
-	}
-	off += recordHeader + n
-	last := uint64(0)
-	for next := expect + 1; ; next++ {
+	var last uint64
+	for seq := expect; ; seq++ {
 		b, err := w.view(off, recordHeader)
-		if err != nil || len(b) < recordHeader || !headerOK(b, seed) {
-			return rangeFrom(expect, last), err
+		if err != nil {
+			return Range{}, err
+		}
+		if len(b) < recordHeader || !headerOK(b, seed) || binary.LittleEndian.Uint64(b[8:]) != seq {
+			break
 		}
 		n := length(b)
 		if n > f.Size()-off-recordHeader {
-			return rangeFrom(expect, last), nil
+			break
 		}
-		if b, err = w.view(off, recordHeader+n); err != nil {
+		p, err := w.view(off, recordHeader+n)
+		if err != nil {
 			return Range{}, err
 		}
-		if r, ok := parseRecord(b, seed); !ok || r.seq != next {
-			return rangeFrom(expect, last), nil
+		if _, ok := parseRecord(p, seed); ok && seq != expect {
+			last = seq
 		}
-		last = next
 		off += recordHeader + n
 	}
+	if last == 0 {
+		return Range{}, nil
+	}
+	return Range{expect, last}, nil
 }
 
-func rangeFrom(first, last uint64) Range {
-	if last == 0 {
-		return Range{}
+// reach is the range of records a segment holds that a reader could find: the
+// valid run from its first record, and the valid records behind a damaged payload
+// after it. The zero Range when it holds none.
+func reach(s *slot) (Range, error) {
+	next, end, err := scan(s.file, s.seed, s.first, func(record, int64) error { return nil })
+	if err != nil {
+		return Range{}, err
 	}
-	return Range{first, last}
+	b, err := behind(s.file, s.seed, next, end)
+	if err != nil {
+		return Range{}, err
+	}
+	switch {
+	case b != Range{}:
+		return Range{s.first, b.Last}, nil
+	case next > s.first:
+		return Range{s.first, next - 1}, nil
+	}
+	return Range{}, nil
 }

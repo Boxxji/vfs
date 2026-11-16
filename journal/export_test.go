@@ -11,3 +11,6 @@ func MarkEvery(n int) func() {
 	markRounds = n
 	return func() { markRounds = old }
 }
+
+// ProductionMarkEvery is the cadence a journal has when nothing has set one.
+var ProductionMarkEvery = markRounds

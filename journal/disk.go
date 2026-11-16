@@ -139,6 +139,17 @@ func (d *directory) Close() error {
 	return err
 }
 
+// ownTemp reports whether name is the temporary file of a Create: a segment's
+// name and the suffix. Any other file that ends in the suffix is not the journal's.
+func ownTemp(name string) bool {
+	base, ok := strings.CutSuffix(name, tempSuffix)
+	if !ok {
+		return false
+	}
+	_, ok = parseSlot(base)
+	return ok
+}
+
 // List also removes the temporary files an interrupted Create leaves behind.
 func (d *directory) List() ([]string, error) {
 	entries, err := os.ReadDir(d.path)
@@ -149,7 +160,7 @@ func (d *directory) List() ([]string, error) {
 	for _, e := range entries {
 		switch {
 		case !e.Type().IsRegular():
-		case strings.HasSuffix(e.Name(), tempSuffix):
+		case ownTemp(e.Name()):
 			if err := os.Remove(filepath.Join(d.path, e.Name())); err != nil {
 				return nil, err
 			}

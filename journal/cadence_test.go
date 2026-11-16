@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"sync/atomic"
 	"testing"
 
 	"github.com/hanzoai/vfs/journal"
@@ -50,7 +51,14 @@ func TestCrashExplorationWithProductionCadence(t *testing.T) {
 func TestAMarkIsWrittenAfterAMegabyteWhateverTheRounds(t *testing.T) {
 	defer journal.MarkEvery(1000)()
 	d := crash.New()
-	j := open(t, journal.Options{Capacity: 8 << 20, Segment: 2 << 20, Disk: d, Clock: newClock()})
+	var marks atomic.Int32
+	d.Intercept(func(e crash.Event) error {
+		if isMarkWrite(e) {
+			marks.Add(1)
+		}
+		return nil
+	})
+	j := open(t, journal.Options{Capacity: 16 << 20, Segment: 4 << 20, Disk: d, Clock: newClock()})
 	big := make([]byte, 300<<10)
 	for i := 1; i <= 4; i++ {
 		mustSync(t, j, mustAppend(t, j, big))
@@ -61,6 +69,39 @@ func TestAMarkIsWrittenAfterAMegabyteWhateverTheRounds(t *testing.T) {
 	_, first, through, _ := preamble(t, img, "000000.seg")
 	if first != 1 || through != 3 {
 		t.Fatalf("after four rounds of 300 KiB the mark says through %d (first %d), want 3", through, first)
+	}
+	// The count starts again from there: the next mark is four rounds later, not
+	// at every round from then on.
+	for i := 5; i <= 8; i++ {
+		mustSync(t, j, mustAppend(t, j, big))
+	}
+	if n := marks.Load(); n != 2 {
+		t.Fatalf("%d marks in eight rounds of 300 KiB, want 2: one for each megabyte", n)
+	}
+	closeWithin(t, j)
+}
+
+// Nothing set, a journal writes a mark every sixteenth round: the crash tests
+// pin a mark per round, and this is the cadence of production.
+func TestMarksAtTheProductionCadence(t *testing.T) {
+	defer journal.MarkEvery(journal.ProductionMarkEvery)()
+	if journal.ProductionMarkEvery != 16 {
+		t.Fatalf("the production cadence is %d rounds, the document says 16", journal.ProductionMarkEvery)
+	}
+	d := crash.New()
+	var marks atomic.Int32
+	d.Intercept(func(e crash.Event) error {
+		if isMarkWrite(e) {
+			marks.Add(1)
+		}
+		return nil
+	})
+	j := open(t, small(d, newClock(), 0))
+	for i := 1; i <= 48; i++ {
+		mustSync(t, j, mustAppend(t, j, []byte("x")))
+	}
+	if n := marks.Load(); n != 3 {
+		t.Fatalf("%d marks in 48 rounds, want 3", n)
 	}
 	closeWithin(t, j)
 }

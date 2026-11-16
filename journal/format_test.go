@@ -6,6 +6,7 @@ import (
 	"errors"
 	"hash/crc32"
 	"reflect"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -334,5 +335,90 @@ func TestRestoredBackupIsInvisible(t *testing.T) {
 	}
 	if r := j.Recovery(); len(r.Dropped) != 0 {
 		t.Fatalf("a restored backup is not detectable, yet Open reports %+v", r)
+	}
+}
+
+// Damage to the header of the tail segment of a journal closed cleanly: the
+// marks that prove its records are in the same block, and are unreadable without
+// the life the header holds. Open succeeds and the records are gone; this is
+// accepted, as the loss of a block is the loss of the disk, and it is not silent:
+// the report names the segment. A flip in the magic is refused outright.
+func TestDamagedHeaderOfTheTailSegmentIsReported(t *testing.T) {
+	d := crash.New()
+	j := open(t, small(d, newClock(), 0))
+	for i := 1; i <= 9; i++ {
+		mustAppend(t, j, bigRecord(i))
+	}
+	mustSync(t, j, 9)
+	closeWithin(t, j) // clean: the final mark is in the tail segment
+	tail := segmentStarting(t, d, 7)
+	for _, flip := range []int64{0, 9, 12, 20, 30, 39} { // checksum, first, life, lineage
+		img := d.Image(d.Len(), crash.Variant{Kind: crash.All})
+		f, _ := img.Open(tail)
+		b := make([]byte, 1)
+		f.ReadAt(b, flip)
+		b[0] ^= 0x01
+		f.WriteAt(b, flip)
+		jj, err := journal.Open("", small(img, newClock(), 0))
+		if err != nil {
+			t.Fatalf("flip byte %d: %v", flip, err)
+		}
+		r := jj.Recovery()
+		if r.Last != 6 {
+			t.Errorf("flip byte %d: the log runs through %d; the records of the damaged segment are not readable, so 6", flip, r.Last)
+		}
+		if len(r.Warnings) != 1 || !strings.Contains(r.Warnings[0], tail) || !strings.Contains(r.Warnings[0], "4096 bytes") {
+			t.Errorf("flip byte %d: Warnings %q do not name the segment and its size", flip, r.Warnings)
+		}
+		closeWithin(t, jj)
+	}
+	img := d.Image(d.Len(), crash.Variant{Kind: crash.All})
+	f, _ := img.Open(tail)
+	f.WriteAt([]byte{'K'}, 4) // one byte of the magic
+	if _, err := journal.Open("", small(img, newClock(), 0)); !errors.Is(err, journal.ErrFormat) {
+		t.Fatalf("a flipped byte of the magic: %v, want ErrFormat", err)
+	}
+}
+
+// A header torn on its way into a new, empty segment has nothing after it, and
+// Open says nothing.
+func TestTornNewHeaderIsQuiet(t *testing.T) {
+	d := crash.New()
+	put(t, d, "000000.seg", 4096, []byte{0xff, 0, 0, 0, 'J', 'R', 'N', 'L', 1, 2, 3, 4})
+	j, err := journal.Open("", small(d, newClock(), 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeWithin(t, j)
+	if r := j.Recovery(); len(r.Warnings) != 0 {
+		t.Fatalf("Warnings %q for a segment with nothing in it", r.Warnings)
+	}
+}
+
+// A restored directory is invisible to a Head at or below its last record, and
+// refused under one beyond it.
+func TestRestoredBackupUnderANewerHead(t *testing.T) {
+	d := crash.New()
+	j := open(t, small(d, newClock(), 0))
+	for i := 1; i <= 5; i++ {
+		mustAppend(t, j, []byte{byte('A'), byte(i)})
+	}
+	mustSync(t, j, 5)
+	closeWithin(t, j)
+	backup := d.Image(d.Len(), crash.Variant{Kind: crash.Lost})
+	for _, head := range []uint64{3, 5, 7, 9} {
+		img := backup.Image(backup.Len(), crash.Variant{Kind: crash.All})
+		jj, err := journal.Open("", small(img, newClock(), head))
+		if head <= 5 {
+			if err != nil {
+				t.Errorf("Head %d, backup holds 1 to 5: %v", head, err)
+				continue
+			}
+			closeWithin(t, jj)
+			continue
+		}
+		if !errors.Is(err, journal.ErrMismatch) {
+			t.Errorf("Head %d beyond the backup's last record: %v, want ErrMismatch", head, err)
+		}
 	}
 }

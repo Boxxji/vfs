@@ -57,6 +57,17 @@ func inventory(disk Disk, want *lineage) (all, live []*slot, err error) {
 		}
 		switch kindOf(pre[:]) {
 		case headerFree:
+			if !allZero(pre[4:8]) && s.size > dataStart {
+				// Ours, with a header that fails its checksum. If nothing follows
+				// the header block it is a header torn on its way in. If something
+				// does, it is a segment that held records, or one that is being
+				// freed; either way its records cannot be read, and it is said.
+				rec := make([]byte, min(recordHeader, s.size-dataStart))
+				if _, err := f.ReadAt(rec, dataStart); err != nil {
+					return all, nil, err
+				}
+				s.damaged = !allZero(rec)
+			}
 			continue
 		case headerForeign:
 			return all, nil, fmt.Errorf("%w: %s", ErrFormat, name)
@@ -66,7 +77,9 @@ func inventory(disk Disk, want *lineage) (all, live []*slot, err error) {
 			return all, nil, fmt.Errorf("%w: %s", ErrLineage, name)
 		}
 		s.first, s.life, s.seed = first, life, seedOf(life, l)
-		s.through, s.floor = parseMarks(pre[:], s.seed)
+		var newest int
+		s.through, s.floor, newest = parseMarks(pre[:], s.seed)
+		s.marks = uint64(newest) // the next mark goes to the other slot
 		live = append(live, s)
 	}
 	sort.Slice(live, func(a, b int) bool {
@@ -107,12 +120,6 @@ func chainOf(live []*slot, fn func(record, int64) error) (chain, orphans []*slot
 		last = next - 1
 	}
 	return chain, orphans, last, nil
-}
-
-// rangeOf is the run of valid records a segment holds, read without changing anything.
-func rangeOf(s *slot) (Range, error) {
-	next, _, err := scan(s.file, s.seed, s.first, func(record, int64) error { return nil })
-	return Range{s.first, next - 1}, err
 }
 
 // wipe makes a segment free: its header is zeroed and the zeroing made durable.
@@ -190,12 +197,17 @@ func (j *Journal) recover(published uint64) error {
 		j.report.First, j.report.Last = max(chain[0].first, published+1), last
 	}
 	for _, s := range orphans {
-		r, err := rangeOf(s)
+		r, err := reach(s)
 		if err != nil {
 			return err
 		}
-		if r.Last >= r.First {
+		if r != (Range{}) {
 			j.report.Dropped = append(j.report.Dropped, r)
+		}
+	}
+	for _, s := range all {
+		if s.damaged {
+			j.report.Warnings = append(j.report.Warnings, fmt.Sprintf("%s (%d bytes): its header is damaged and something follows it; its records could not be read", s.name, s.size))
 		}
 	}
 	if n := len(chain); n > 0 {
@@ -337,7 +349,15 @@ func Discard(dir string, opt Options, first, last uint64) (err error) {
 		return err
 	}
 	var held Range
-	if len(chain) > 0 {
+	if n := len(chain); n > 0 {
+		// The records behind a damaged payload at the end of the log are held too.
+		tail, err := behind(chain[n-1].file, chain[n-1].seed, end+1, chain[n-1].end)
+		if err != nil {
+			return err
+		}
+		if tail != (Range{}) {
+			end = tail.Last
+		}
 		held = Range{chain[0].first, end}
 	}
 	if held != (Range{first, last}) {
@@ -347,11 +367,11 @@ func Discard(dir string, opt Options, first, last uint64) (err error) {
 	// named covers them, as the copy of a segment does; any other stays, and
 	// Discard changes nothing.
 	for _, s := range orphans {
-		r, err := rangeOf(s)
+		r, err := reach(s)
 		if err != nil {
 			return err
 		}
-		if r.Last >= r.First && (r.First < first || r.Last > last) {
+		if r != (Range{}) && (r.First < first || r.Last > last) {
 			return fmt.Errorf("%w: the journal also holds %d through %d, which the range named does not cover", ErrRange, r.First, r.Last)
 		}
 	}

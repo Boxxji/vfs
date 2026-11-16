@@ -1,12 +1,15 @@
 package journal_test
 
 import (
+	"bufio"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -51,8 +54,10 @@ func TestLockSameProcessLinkAndDiscard(t *testing.T) {
 	}
 }
 
-// a child process holds the lock and is killed with SIGKILL: the kernel
+// A child process holds the lock and is killed with SIGKILL: the kernel
 // releases it and the next Open works. While the child lives, Open is refused.
+// The child ends with the test, however the test ends: it reads its standard
+// input, which a dead parent closes.
 func TestLockHeldByAChildDiesWithIt(t *testing.T) {
 	t.Parallel() // real time, not CPU: it runs beside the others once the serial tests are done
 	if os.Getenv("JOURNAL_HOLD") != "" {
@@ -61,23 +66,37 @@ func TestLockHeldByAChildDiesWithIt(t *testing.T) {
 	dir := filepath.Join(scratch(t), "j")
 	cmd := exec.Command(os.Args[0], "-test.run=^TestLockHoldHelper$", "-test.v")
 	cmd.Env = append(os.Environ(), "JOURNAL_HOLD="+dir)
-	stdout, _ := cmd.StdoutPipe()
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	buf := make([]byte, 64)
-	n, _ := stdout.Read(buf) // the helper prints READY once the journal is open
-	if n == 0 {
-		t.Fatal("helper did not start")
-	}
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		if _, err := os.Stat(dir); err == nil || time.Now().After(deadline) {
-			break
+	defer func() { stdin.Close(); cmd.Process.Kill(); cmd.Wait() }()
+	ready := make(chan string, 1)
+	go func() {
+		sc := bufio.NewScanner(stdout)
+		for sc.Scan() {
+			if line := sc.Text(); line == "READY" || strings.HasPrefix(line, "OPENFAIL") {
+				ready <- line
+				return
+			}
 		}
-		time.Sleep(10 * time.Millisecond)
+		ready <- ""
+	}()
+	select {
+	case line := <-ready:
+		if line != "READY" {
+			t.Fatalf("the helper did not open the journal: %q", line)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the helper did not start")
 	}
-	time.Sleep(200 * time.Millisecond)
 	if _, err := journal.Open(dir, realOptions(dir)); !errors.Is(err, journal.ErrLocked) {
 		t.Fatalf("Open while another process holds the journal: %v", err)
 	}
@@ -103,7 +122,7 @@ func TestLockHoldHelper(t *testing.T) {
 	seq, _ := j.Append(ctx, []byte("held"))
 	j.Sync(ctx, seq)
 	os.Stdout.WriteString("READY\n")
-	time.Sleep(time.Hour)
+	io.Copy(io.Discard, os.Stdin) // until the parent is gone
 }
 
 // a descriptor must not leak into a child that outlives the journal. Start

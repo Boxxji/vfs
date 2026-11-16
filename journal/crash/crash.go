@@ -332,7 +332,8 @@ func without(ws []pending, name string) []pending {
 
 // Variants lists the crash states worth checking at point n: nothing
 // persisted, everything persisted, each prefix of the volatile writes, the
-// last few writes torn at assorted offsets, and scatter random states.
+// last few writes torn at assorted offsets, and scatter random states. Tears
+// is the one that tears a write at the start of a file after every byte.
 func (d *Disk) Variants(n, scatter int, seed int64) []Variant {
 	_, volatile := d.durable(n)
 	return variants(volatile, scatter, seed)
@@ -362,7 +363,8 @@ func variants(volatile []pending, scatter int, seed int64) []Variant {
 	}
 	for i := max(1, p-2); i <= p; i++ {
 		size := len(volatile[i-1].data)
-		for _, keep := range []int{1, 100, Sector, Sector + 100, size / 2 / Sector * Sector, size - 1} {
+		keeps := []int{1, 100, Sector, Sector + 100, size / 2 / Sector * Sector, size - 1}
+		for _, keep := range keeps {
 			if keep > 0 && keep < size {
 				vs = append(vs, Variant{Kind: Torn, N: i, Keep: keep})
 			}
@@ -372,6 +374,29 @@ func variants(volatile []pending, scatter int, seed int64) []Variant {
 		vs = append(vs, Variant{Kind: Scatter, Seed: seed + int64(s)})
 	}
 	return vs
+}
+
+// Tears returns the disks a restart finds after a crash at point n in which the
+// newest volatile write, when it is a write at the start of a file (where a
+// header goes, or the zeros that wipe one), is torn after each of its first upto
+// bytes in turn, one disk for each difference: a write may be torn at any byte,
+// not only at the few places Variants tries. It returns nil for any other point.
+func (d *Disk) Tears(n, upto int) []*Disk {
+	base, volatile := d.durable(n)
+	p := len(volatile)
+	if p == 0 || volatile[p-1].off != 0 {
+		return nil
+	}
+	var out []*Disk
+	seen := map[[sha256.Size]byte]bool{}
+	for keep := 1; keep <= min(upto, len(volatile[p-1].data)-1); keep++ {
+		img := image(base, volatile, Variant{Kind: Torn, N: p, Keep: keep})
+		if key := img.Fingerprint(); !seen[key] {
+			seen[key] = true
+			out = append(out, img)
+		}
+	}
+	return out
 }
 
 // Image returns the disk a restart finds after a crash at point n with the
