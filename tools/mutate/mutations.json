@@ -337,14 +337,6 @@
   "run": "TestSealedToItsContext"
  },
  {
-  "name": "head: trailing bytes accepted",
-  "file": "head.go",
-  "old": "copy(h.Seed[:], r.raw(32))\n\treturn h, r.done()",
-  "new": "copy(h.Seed[:], r.raw(32))\n\treturn h, r.err",
-  "pkg": ".",
-  "run": "TestHeadRejectsGarbage"
- },
- {
   "name": "record: unknown inode fields dropped",
   "file": "record.go",
   "old": "\tw.raw(in.later)\n",
@@ -928,14 +920,6 @@
   "run": "^TestResealCrashAtTheWrite|^TestResealIsRepeatable"
  },
  {
-  "name": "reseal: no place, no root check",
-  "file": "volume.go",
-  "old": "\t\t\tif _, err := w.t.sh.load(ctx, h.Root); err != nil {",
-  "new": "\t\t\tif _, err := w.t.sh.load(ctx, h.Root); err != nil && false {",
-  "pkg": ".",
-  "run": "^TestResealWithoutThePlace"
- },
- {
   "name": "reseal: admits an equal round",
   "file": "volume.go",
   "old": "\t\tif cfg.Round <= recorded {\n\t\t\treturn nil, fmt.Errorf(\"%w: round %d does not exceed the recorded %d\", ErrStaleRound, cfg.Round, recorded)\n\t\t}\n\t\tvar plain",
@@ -944,30 +928,30 @@
   "run": "^TestResealIsRepeatable"
  },
  {
-  "name": "mount: lookup answered EINTR",
+  "name": "mount: lookup runs on the request context",
   "file": "pkg/mount/fuse_unix.go",
-  "old": "func (n *node) Lookup(ctx context.Context, name string) (bzfs.Node, error) {\n\tctx = context.WithoutCancel(ctx) // no request is answered EINTR: see errno.go\n",
+  "old": "func (n *node) Lookup(ctx context.Context, name string) (bzfs.Node, error) {\n\tctx, done := patient(ctx)\n\tdefer done()\n",
   "new": "func (n *node) Lookup(ctx context.Context, name string) (bzfs.Node, error) {\n",
   "pkg": "./pkg/mount",
-  "run": "^Test(LookupIsNotAnsweredEINTR|EveryHandlerOutlivesItsRequest)$",
+  "run": "^Test(LookupIsNotAnsweredEINTR|KilledColdLookupIsFreedAfterTheGrace|EveryHandlerOutlivesItsRequest)$",
   "tags": "fuse"
  },
  {
-  "name": "mount: attr answered EINTR",
+  "name": "mount: attr runs on the request context",
   "file": "pkg/mount/fuse_unix.go",
-  "old": "func (n *node) Attr(ctx context.Context, a *fuse.Attr) error {\n\tctx = context.WithoutCancel(ctx) // no request is answered EINTR: see errno.go\n",
+  "old": "func (n *node) Attr(ctx context.Context, a *fuse.Attr) error {\n\tctx, done := patient(ctx)\n\tdefer done()\n",
   "new": "func (n *node) Attr(ctx context.Context, a *fuse.Attr) error {\n",
   "pkg": "./pkg/mount",
-  "run": "^Test(AttrIsNotAnsweredEINTR|EveryHandlerOutlivesItsRequest)$",
+  "run": "^Test(AttrIsNotAnsweredEINTR|KilledColdLookupIsFreedAfterTheGrace|EveryHandlerOutlivesItsRequest)$",
   "tags": "fuse"
  },
  {
-  "name": "mount: readdir answered EINTR",
+  "name": "mount: readdir runs on the request context",
   "file": "pkg/mount/fuse_unix.go",
-  "old": "func (n *node) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {\n\tctx = context.WithoutCancel(ctx) // no request is answered EINTR: see errno.go\n",
+  "old": "func (n *node) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {\n\tctx, done := patient(ctx)\n\tdefer done()\n",
   "new": "func (n *node) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {\n",
   "pkg": "./pkg/mount",
-  "run": "^Test(ReaddirIsNotAnsweredEINTR|EveryHandlerOutlivesItsRequest)$",
+  "run": "^Test(ReaddirIsNotAnsweredEINTR|KilledColdLookupIsFreedAfterTheGrace|EveryHandlerOutlivesItsRequest)$",
   "tags": "fuse"
  },
  {
@@ -1137,6 +1121,390 @@
   "new": "if err := error(nil); err != nil && serveErr == nil {",
   "pkg": "./pkg/mount",
   "run": "^TestFinish",
+  "tags": "fuse"
+ },
+ {
+  "name": "pin: shard key shape: second hex pair",
+  "file": "shard.go",
+  "old": "return \"meta/\" + h[:2] + \"/\" + h",
+  "new": "return \"meta/\" + h[2:4] + \"/\" + h",
+  "pkg": ".",
+  "run": "^(Test(ObjectKeysAreTheSpecShapes|FenceTokenIsSixteenBytes|TheSizesOfTheText|TheCipherOpensAGoldenObject)$|TestSpec)"
+ },
+ {
+  "name": "pin: pack key shape: 3 hex digits",
+  "file": "pack.go",
+  "old": "return \"pack/\" + h[:2] + \"/\" + h",
+  "new": "return \"pack/\" + h[:3] + \"/\" + h",
+  "pkg": ".",
+  "run": "^(Test(ObjectKeysAreTheSpecShapes|FenceTokenIsSixteenBytes|TheSizesOfTheText|TheCipherOpensAGoldenObject)$|TestSpec)"
+ },
+ {
+  "name": "pin: max chunk 2 MiB",
+  "file": "chunk.go",
+  "old": "maxChunk = 4 << 20",
+  "new": "maxChunk = 2 << 20",
+  "pkg": ".",
+  "run": "^(Test(ObjectKeysAreTheSpecShapes|FenceTokenIsSixteenBytes|TheSizesOfTheText|TheCipherOpensAGoldenObject)$|TestSpec)"
+ },
+ {
+  "name": "pin: head bound 63 KiB",
+  "file": "volume.go",
+  "old": "const maxHead = 64 << 10",
+  "new": "const maxHead = 63 << 10",
+  "pkg": ".",
+  "run": "^(Test(ObjectKeysAreTheSpecShapes|FenceTokenIsSixteenBytes|TheSizesOfTheText|TheCipherOpensAGoldenObject)$|TestSpec)"
+ },
+ {
+  "name": "pin: fence token 8 bytes",
+  "file": "pkg/fence/fence.go",
+  "old": "const tokenLen = 16",
+  "new": "const tokenLen = 8",
+  "pkg": ".",
+  "run": "^(Test(ObjectKeysAreTheSpecShapes|FenceTokenIsSixteenBytes|TheSizesOfTheText|TheCipherOpensAGoldenObject)$|TestSpec)"
+ },
+ {
+  "name": "pin: node cap 256 KiB",
+  "file": "tree.go",
+  "old": "nodeMax    = 512 << 10",
+  "new": "nodeMax    = 256 << 10",
+  "pkg": ".",
+  "run": "^(Test(ObjectKeysAreTheSpecShapes|FenceTokenIsSixteenBytes|TheSizesOfTheText|TheCipherOpensAGoldenObject)$|TestSpec)"
+ },
+ {
+  "name": "pin: pack key without fan-out",
+  "file": "pack.go",
+  "old": "return \"pack/\" + h[:2] + \"/\" + h",
+  "new": "return \"pack/\" + h",
+  "pkg": ".",
+  "run": "^(Test(ObjectKeysAreTheSpecShapes|FenceTokenIsSixteenBytes|TheSizesOfTheText|TheCipherOpensAGoldenObject)$|TestSpec)"
+ },
+ {
+  "name": "pin: shard key without fan-out",
+  "file": "shard.go",
+  "old": "return \"meta/\" + h[:2] + \"/\" + h",
+  "new": "return \"meta/\" + h",
+  "pkg": ".",
+  "run": "^(Test(ObjectKeysAreTheSpecShapes|FenceTokenIsSixteenBytes|TheSizesOfTheText|TheCipherOpensAGoldenObject)$|TestSpec)"
+ },
+ {
+  "name": "Open runs on the request's context",
+  "file": "pkg/mount/fuse_unix.go",
+  "old": "func (n *node) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenResponse) (bzfs.Handle, error) {\n\tctx = context.WithoutCancel(ctx) // no request is answered EINTR: see errno.go\n",
+  "new": "func (n *node) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenResponse) (bzfs.Handle, error) {\n",
+  "pkg": "./pkg/mount",
+  "run": "^TestEveryHandlerOutlivesItsRequest$",
+  "tags": "fuse"
+ },
+ {
+  "name": "Setattr runs on the request's context",
+  "file": "pkg/mount/fuse_unix.go",
+  "old": "func (n *node) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse.SetattrResponse) error {\n\tctx = context.WithoutCancel(ctx) // no request is answered EINTR: see errno.go\n",
+  "new": "func (n *node) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse.SetattrResponse) error {\n",
+  "pkg": "./pkg/mount",
+  "run": "^TestEveryHandlerOutlivesItsRequest$",
+  "tags": "fuse"
+ },
+ {
+  "name": "Fsync returns without committing",
+  "file": "pkg/mount/fuse_unix.go",
+  "old": "func (n *node) Fsync(ctx context.Context, _ *fuse.FsyncRequest) error {\n\treturn errno(n.s.group.commit())",
+  "new": "func (n *node) Fsync(ctx context.Context, _ *fuse.FsyncRequest) error {\n\treturn nil",
+  "pkg": "./pkg/mount",
+  "run": "^Test(FsyncWaitsForItsCommit|FUSEFsyncSurvivesKill|CloseWaitsForItsCommit)$",
+  "tags": "fuse"
+ },
+ {
+  "name": "Flush returns without committing",
+  "file": "pkg/mount/fuse_unix.go",
+  "old": "func (h *handle) Flush(ctx context.Context, _ *fuse.FlushRequest) error {\n\treturn errno(h.s.group.commit())",
+  "new": "func (h *handle) Flush(ctx context.Context, _ *fuse.FlushRequest) error {\n\treturn nil",
+  "pkg": "./pkg/mount",
+  "run": "^Test(CloseWaitsForItsCommit|FUSEFsyncSurvivesKill|FUSE)",
+  "tags": "fuse"
+ },
+ {
+  "name": "Reseal already-moved returns the plaintext",
+  "file": "volume.go",
+  "old": "\t\t\t\treturn payload, nil // already sealed to this place\n",
+  "new": "\t\t\t\treturn plain, nil // already sealed to this place\n",
+  "pkg": ".",
+  "run": "."
+ },
+ {
+  "name": "unsealAny keeps the context bytes",
+  "file": "cipher.go",
+  "old": "\treturn plain[bindLen:], nil\n}\n\n// open reverses",
+  "new": "\treturn plain, nil\n}\n\n// open reverses",
+  "pkg": ".",
+  "run": "."
+ },
+ {
+  "name": "redact: every prefix is a scheme",
+  "file": "pkg/backend/backend.go",
+  "old": "\t\tdefault:\n\t\t\treturn false\n\t\t}\n\t}\n\treturn s != \"\"",
+  "new": "\t\tdefault:\n\t\t\treturn true\n\t\t}\n\t}\n\treturn s != \"\"",
+  "pkg": "./pkg/backend",
+  "run": "^TestRedact"
+ },
+ {
+  "name": "s3 URL: trailing slash cleaned",
+  "file": "pkg/backend/s3/s3.go",
+  "old": "prefix := strings.TrimPrefix(u.Path, \"/\")",
+  "new": "prefix := strings.Trim(u.Path, \"/\")",
+  "pkg": ".",
+  "run": "."
+ },
+ {
+  "name": "committer: every joiner makes a new flight",
+  "file": "pkg/mount/errno.go",
+  "old": "\tif c.next == nil {\n\t\tc.next = &flight{done: make(chan struct{})}\n\t}\n\treturn c.next",
+  "new": "\tc.next = &flight{done: make(chan struct{})}\n\treturn c.next",
+  "pkg": "./pkg/mount",
+  "run": "^Test(FsyncCallersShareTwoCommits|FsyncWaitsForItsCommit|CloseWaitsForItsCommit)$",
+  "tags": "fuse"
+ },
+ {
+  "name": "a fenced Volume answers EIO, not EROFS",
+  "file": "pkg/mount/errno.go",
+  "old": "\tcase errors.Is(err, vfs.ErrReadOnly), errors.Is(err, vfs.ErrStaleRound):",
+  "new": "\tcase errors.Is(err, vfs.ErrReadOnly):",
+  "pkg": "./pkg/mount",
+  "run": "^Test(FUSE|Errno|Construct|Policy)",
+  "tags": "fuse"
+ },
+ {
+  "name": "DEL allowed in a prefix",
+  "file": "pkg/backend/backend.go",
+  "old": "if r < 0x20 || r == 0x7f {",
+  "new": "if r < 0x20 {",
+  "pkg": "./pkg/backend",
+  "run": "TestValidPrefix"
+ },
+ {
+  "name": "prefix limit 513",
+  "file": "pkg/backend/backend.go",
+  "old": "if len(p) > 512 {",
+  "new": "if len(p) > 513 {",
+  "pkg": "./pkg/backend",
+  "run": "^TestValidPrefix$"
+ },
+ {
+  "name": "entry key table byte",
+  "file": "record.go",
+  "old": "\ttEntry byte = 2\n",
+  "new": "\ttEntry byte = 7\n",
+  "pkg": ".",
+  "run": "."
+ },
+ {
+  "name": "mode: sticky bit moved in entry type bits",
+  "file": "record.go",
+  "old": "tData  byte = 3\n",
+  "new": "tData  byte = 6\n",
+  "pkg": ".",
+  "run": "."
+ },
+ {
+  "name": "chunk id over a prefixed plaintext",
+  "file": "chunk.go",
+  "old": "func sumChunk(p []byte) chunkID { return blake3.Sum256(p) }",
+  "new": "func sumChunk(p []byte) chunkID { return blake3.Sum256(append([]byte{0}, p...)) }",
+  "pkg": ".",
+  "run": "."
+ },
+ {
+  "name": "ref of the plaintext node, not the sealed bytes (writer and verifier alike via ref type)",
+  "file": "shard.go",
+  "old": "\tif blake3.Sum256(sealed) != r {",
+  "new": "\tif blake3.Sum256(sealed[1:]) != r {",
+  "pkg": ".",
+  "run": "."
+ },
+ {
+  "name": "root inode is 2",
+  "file": "record.go",
+  "old": "const RootInode InodeID = 1",
+  "new": "const RootInode InodeID = 2",
+  "pkg": ".",
+  "run": "."
+ },
+ {
+  "name": "name limit 256",
+  "file": "ops.go",
+  "old": "len(name) > 255",
+  "new": "len(name) > 256",
+  "pkg": ".",
+  "run": "."
+ },
+ {
+  "name": "file size limit 2^63",
+  "file": "file.go",
+  "old": "const MaxSize = 1 << 62",
+  "new": "const MaxSize = 1 << 63 - 1",
+  "pkg": ".",
+  "run": "."
+ },
+ {
+  "name": "head context reads a truncated place",
+  "file": "head.go",
+  "old": "func headAAD(place string) []byte { return bind(\"head\", []byte(place)) }",
+  "new": "func headAAD(place string) []byte { return bind(\"head\", []byte(place)[:min(len(place), 8)]) }",
+  "pkg": ".",
+  "run": "^(TestHeadContextIsExact|TestSpecContexts)$"
+ },
+ {
+  "name": "head: the tail is not written back",
+  "file": "head.go",
+  "old": "\tw.raw([]byte(h.Tail))\n",
+  "new": "",
+  "pkg": ".",
+  "run": "^Test(HeadRejectsGarbage|HeadNeeds|TheHeadHasRoomForTheJournalSequence|HeadFieldsSurviveACommit|HeadOfALaterBuildIsRefusedByEveryDoor|SpecHead)$"
+ },
+ {
+  "name": "head: an unknown Needs bit is accepted",
+  "file": "head.go",
+  "old": "if unknown := h.Needs &^ knownNeeds; unknown != 0 {",
+  "new": "if unknown := h.Needs &^ knownNeeds; unknown != 0 && false {",
+  "pkg": ".",
+  "run": "^Test(HeadRejectsGarbage|HeadNeeds|TheHeadHasRoomForTheJournalSequence|HeadFieldsSurviveACommit|HeadOfALaterBuildIsRefusedByEveryDoor|SpecHead)$"
+ },
+ {
+  "name": "head: the journal sequence is dropped",
+  "file": "head.go",
+  "old": "\th.Journal = r.uvarint()\n",
+  "new": "\t_ = r.uvarint()\n",
+  "pkg": ".",
+  "run": "^Test(HeadRejectsGarbage|HeadNeeds|TheHeadHasRoomForTheJournalSequence|HeadFieldsSurviveACommit|HeadOfALaterBuildIsRefusedByEveryDoor|SpecHead)$"
+ },
+ {
+  "name": "head: a Head without Needs is accepted",
+  "file": "head.go",
+  "old": "\th.Needs = r.uvarint()\n\tif r.err != nil {",
+  "new": "\tif len(r.b) > 0 {\n\t\th.Needs = r.uvarint()\n\t}\n\tif r.err != nil {",
+  "pkg": ".",
+  "run": "^Test(HeadRejectsGarbage|HeadNeeds|TheHeadHasRoomForTheJournalSequence|HeadFieldsSurviveACommit|HeadOfALaterBuildIsRefusedByEveryDoor|SpecHead)$"
+ },
+ {
+  "name": "reseal: the copy is not checked",
+  "file": "volume.go",
+  "old": "\t\tif err := w.checkTree(ctx, cfg.Verify); err != nil {",
+  "new": "\t\tif err := w.checkTree(ctx, cfg.Verify); err != nil && false {",
+  "pkg": ".",
+  "run": "^TestReseal(ChecksTheCopy|WithoutAPlaceRefusesAnotherKindOfObject|WithoutThePlace)$"
+ },
+ {
+  "name": "reseal: verify checks nothing more",
+  "file": "verify.go",
+  "old": "\tif !full {\n\t\treturn nil\n\t}",
+  "new": "\tif true {\n\t\treturn nil\n\t}",
+  "pkg": ".",
+  "run": "^TestResealChecksTheCopy$"
+ },
+ {
+  "name": "reseal: the root directory is not required",
+  "file": "verify.go",
+  "old": "\tif !ok {\n\t\treturn fmt.Errorf(\"%w: the tree has no root directory\", ErrCorrupt)\n\t}",
+  "new": "\t_ = ok",
+  "pkg": ".",
+  "run": "^TestResealWithoutAPlaceRefusesAnotherKindOfObject$"
+ },
+ {
+  "name": "reseal: a pack that is short passes verify",
+  "file": "verify.go",
+  "old": "if uint64(size) < end {",
+  "new": "if false {",
+  "pkg": ".",
+  "run": "^TestResealChecksTheCopy$"
+ },
+ {
+  "name": "extension: replaced without the seen version",
+  "file": "ext.go",
+  "old": "PutIfVersion(ctx, objKey, sealed, ver)",
+  "new": "PutIfVersion(ctx, objKey, sealed, ver+\"x\")",
+  "pkg": ".",
+  "run": "^TestExtensionObjects"
+ },
+ {
+  "name": "extension: sealed to no key",
+  "file": "ext.go",
+  "old": "return bind(\"ext\", id[:], []byte(name), []byte(rest))",
+  "new": "return bind(\"ext\", id[:], []byte(name))",
+  "pkg": ".",
+  "run": "^(TestExtensionObjectIsSealedToItsVolumeNameAndKey|TestSpecExtension)$"
+ },
+ {
+  "name": "extension: sealed to no name",
+  "file": "ext.go",
+  "old": "return bind(\"ext\", id[:], []byte(name), []byte(rest))",
+  "new": "return bind(\"ext\", id[:], []byte(rest))",
+  "pkg": ".",
+  "run": "^(TestExtensionObjectIsSealedToItsVolumeNameAndKey|TestSpecExtension)$"
+ },
+ {
+  "name": "extension: sealed to no Volume",
+  "file": "ext.go",
+  "old": "return bind(\"ext\", id[:], []byte(name), []byte(rest))",
+  "new": "return bind(\"ext\", []byte(name), []byte(rest))",
+  "pkg": ".",
+  "run": "^(TestExtensionObjectIsSealedToItsVolumeNameAndKey|TestSpecExtension)$"
+ },
+ {
+  "name": "extension: a read-only Volume writes",
+  "file": "ext.go",
+  "old": "\tif round == 0 {\n\t\treturn ErrReadOnly\n\t}",
+  "new": "\t_ = round",
+  "pkg": ".",
+  "run": "^TestExtensionObjectsAndTheFence$"
+ },
+ {
+  "name": "extension: key not hashed",
+  "file": "ext.go",
+  "old": "\tsum := blake3.Sum256(key)\n\treturn hex.EncodeToString(sum[:])",
+  "new": "\t_ = blake3.Sum256(key)\n\treturn hex.EncodeToString(append(key, make([]byte, 32)...)[:32])",
+  "pkg": ".",
+  "run": "^(TestExtensionObjectsOnEveryStore|TestSpecExtension)$"
+ },
+ {
+  "name": "file backend: a stray key is hidden",
+  "file": "pkg/backend/file/file.go",
+  "old": "if rel == \".lock\" || rel == \".tmp\" {",
+  "new": "if rel == \".lock\" || rel == \".tmp\" || strings.HasPrefix(filepath.Base(rel), \".\") {",
+  "pkg": "./pkg/backend/file",
+  "run": "^TestFileListHidesOnlyTheStoresOwn$"
+ },
+ {
+  "name": "file backend: list is by directory",
+  "file": "pkg/backend/file/file.go",
+  "old": "if !strings.HasPrefix(rel, prefix) {",
+  "new": "if false {",
+  "pkg": "./pkg/backend/file",
+  "run": "^TestFileConforms$"
+ },
+ {
+  "name": "file backend: open creates the directory",
+  "file": "pkg/backend/file/file.go",
+  "old": "\treal, err := canonical(root)\n",
+  "new": "\t_ = os.MkdirAll(root, 0o755)\n\treal, err := canonical(root)\n",
+  "pkg": "./pkg/backend/file",
+  "run": "^TestFileOpenCreatesNothing$"
+ },
+ {
+  "name": "mount: SIGTERM does not detach a mount in use",
+  "file": "pkg/mount/stop.go",
+  "old": "\tif busy != nil {\n\t\tfmt.Fprintf(os.Stderr, \"vfs mount: %s is in use (%v): detaching it\\n\", mountpoint, busy)",
+  "new": "\tif false {\n\t\tfmt.Fprintf(os.Stderr, \"vfs mount: %s is in use (%v): detaching it\\n\", mountpoint, busy)",
+  "pkg": "./pkg/mount",
+  "run": "^TestFUSETermStopsAMountInUse$",
+  "tags": "fuse"
+ },
+ {
+  "name": "mount: the grace is not a grace",
+  "file": "pkg/mount/errno.go",
+  "old": "\t\t\tt := time.NewTimer(interruptGrace)",
+  "new": "\t\t\tt := time.NewTimer(0)",
+  "pkg": "./pkg/mount",
+  "run": "^TestLookupIsNotAnsweredEINTR$|^TestKilledColdLookupIsFreedAfterTheGrace$",
   "tags": "fuse"
  }
 ]

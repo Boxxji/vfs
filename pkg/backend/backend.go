@@ -118,7 +118,7 @@ func redact(raw string) string {
 		return raw
 	}
 	head := ""
-	if i := strings.Index(raw, "://"); i > 0 && i < at && isScheme(raw[:i]) {
+	if i := strings.Index(raw, "://"); i > 0 && isScheme(raw[:i]) {
 		head = raw[:i+3]
 	}
 	return head + "***@" + raw[at+1:]

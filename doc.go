@@ -75,7 +75,7 @@
 // restarted, and a restarted create(2) with O_EXCL would meet its own file. Nothing a
 // caller's interrupt does cancels a commit or a fetch. The cost is that a call waits
 // as long as the store takes: store requests have no deadline yet (docs/SPECIFICATION.md,
-// section 11).
+// section 11.2).
 //
 // What a failed Flush tells the caller. nil: committed. Any other error: the
 // outcome of that attempt is unknown to the caller (a reply can be lost after the

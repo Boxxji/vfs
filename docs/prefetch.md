@@ -960,9 +960,11 @@ never evicts a byte that has not been published.
 ### S6. Traces
 
 1. The engine SHOULD record the trace of an attachment and, at detach, store it
-   as one object of the volume's bucket, sealed with the volume's key, under the
-   attachment's workflow key. With no workflow key the engine MUST NOT prefetch
-   from a trace; read-ahead (S7) still applies.
+   as one extension object of the volume (docs/SPECIFICATION.md 3.1: `PutExt`,
+   extension `trace`), keyed by the attachment's workflow key. The object is at
+   `ext/trace/<BLAKE3 of the workflow key, 64 hex digits>`, and is sealed with the
+   volume's key to the volume, the extension and that key. With no workflow key the
+   engine MUST NOT prefetch from a trace; read-ahead (S7) still applies.
 2. A trace MUST contain chunk identifiers in first-touch order, nothing else
    that identifies content, and MUST be bounded: at most 1 048 576 entries,
    the earliest kept.

@@ -1,6 +1,8 @@
 package vfs_test
 
 import (
+	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -103,6 +105,37 @@ func TestPlacesAreRefusedNotCleaned(t *testing.T) {
 	for _, raw := range []string{"s3://bkt?endpoint=h:1", "s3://bkt/?endpoint=h:1", "file://localhost" + t.TempDir() + "/x"} {
 		if _, err := backend.Open(ctx, raw); err != nil {
 			t.Errorf("%q: %v", raw, err)
+		}
+	}
+}
+
+// No error from backend.Open, whatever the spelling, may contain the secret.
+func TestRedactionOfEverySpelling(t *testing.T) {
+	const sec = "SeCr3tPw"
+	spell := []string{
+		"s3://AK:%s@h/b", "s3//AK:%s@h/b", "s3:/AK:%s@h/b", "://AK:%s@h/b", "S3://AK:%s@h/b", "s3://AK:%s@h:bad/b",
+		"s3://AK:%s@h/%%zz", "s3://AK:%s@[::1/b", "s3://AK:%s@h\n/b", "file://AK:%s@h/x", "s3://%%zz:%s@h/b",
+		"http://AK:%s@h", "AK:%s@h/b", "s3 ://AK:%s@h/b", "s3://AK:%s@h@i/b", "s3://AK:p://%s@h/b", "x:y://AK:%s@h/b",
+		"AK:p://%s@h/b", "1s3://AK:%s@h/b", "s3://AK:%s@h/b?endpoint=%s", "s3://h/b?endpoint=AK:%s@h:1&insecure=zz",
+		"s3://h/b?access=%s&secret=%s&bad=%%zz", "//AK:%s@h/b", "\\\\AK:%s@h\\b", "s3://AK:%s@",
+		"s3:///b?x=AK:%s@y%%", "s3://AK:%s%%40@h/b", "s3://AK:%s%%2540@h/b", "s3://AK%%3A%s@h/b",
+	}
+	for _, f := range spell {
+		raw := f
+		if n := strings.Count(f, "%s"); n > 0 {
+			args := make([]any, n)
+			for i := range args {
+				args[i] = sec
+			}
+			raw = fmt.Sprintf(f, args...)
+		}
+		be, err := backend.Open(context.Background(), raw)
+		if err == nil {
+			be.Close()
+			continue
+		}
+		if strings.Contains(err.Error(), sec) {
+			t.Errorf("LEAK in %q\n  -> %v", raw, err)
 		}
 	}
 }

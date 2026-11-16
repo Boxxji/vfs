@@ -34,11 +34,11 @@
 # (a close is not interrupted by the kernel, truncate and chmod answer as Linux's do,
 # an unmount ends the server), and need /dev/fuse and a fusermount3 that mounts for an
 # unprivileged user, or a user namespace with tools/fusemount in its place
-# (tools/ci/mount.sh). On a runner whose kernel answers FUSE differently they would test
-# that kernel. They run on a Linux host: `go test -tags fuse ./pkg/mount
-# ./internal/sqlitecheck`. What the mount does that needs no kernel (the commits, the
-# interrupts, the context every read runs on) is tested by calling its handlers, in the
-# `race` gate.
+# (tools/ci/mount.sh). Where the kernel answers FUSE differently they would test that
+# kernel. They run on a Linux host before a release, on amd64 and on arm64:
+# `go test -tags fuse -count=1 ./pkg/mount ./internal/sqlitecheck`. What the mount does
+# that needs no kernel (the commits, the interrupts, the context every read runs on) is
+# tested by calling its handlers, in the `race` gate.
 test:
   - name: realserver
     run: |
@@ -48,13 +48,14 @@ test:
       export PATH="$bin:$PATH"
       log="$bin/realserver.log"
       go test -count=1 -v -timeout 4m \
-        -run '^(TestRealServerConforms|TestRealServerRaceStress|TestRealServerMultipartIsConditional|TestPrefixConfinement|TestCommitRateOnRealServer|TestGetPairsBodyWithVersion|TestCancelledS3RequestsAreNotFaults|TestConditionalWriteAtTheSingleRequestBound|TestSameRoundRace|TestFenceRefusesOlderRound|TestAttachNeedsAHigherRound|TestTakeoverLosesNoAcknowledgedCommit|TestRacingClaims|TestVolumeOnEveryStore)$' \
+        -run '^(TestRealServerConforms|TestRealServerRaceStress|TestRealServerMultipartIsConditional|TestPrefixConfinement|TestCommitRateOnRealServer|TestGetPairsBodyWithVersion|TestCancelledS3RequestsAreNotFaults|TestConditionalWriteAtTheSingleRequestBound|TestSameRoundRace|TestFenceRefusesOlderRound|TestAttachNeedsAHigherRound|TestTakeoverLosesNoAcknowledgedCommit|TestRacingClaims|TestVolumeOnEveryStore|TestExtensionObjectsOnEveryStore|TestExtensionObjectsRaced|TestStrayKeysAreIgnoredAndKept)$' \
         . ./pkg/backend/s3 | tee "$log"
       for t in TestRealServerConforms TestRealServerRaceStress TestRealServerMultipartIsConditional \
                TestPrefixConfinement TestCommitRateOnRealServer TestGetPairsBodyWithVersion \
                TestCancelledS3RequestsAreNotFaults TestConditionalWriteAtTheSingleRequestBound \
                TestSameRoundRace/hanzo-s3 TestFenceRefusesOlderRound/hanzo-s3 TestAttachNeedsAHigherRound/hanzo-s3 \
-               TestTakeoverLosesNoAcknowledgedCommit/hanzo-s3 TestRacingClaims/hanzo-s3 TestVolumeOnEveryStore/hanzo-s3; do
+               TestTakeoverLosesNoAcknowledgedCommit/hanzo-s3 TestRacingClaims/hanzo-s3 TestVolumeOnEveryStore/hanzo-s3 \
+               TestExtensionObjectsOnEveryStore/hanzo-s3 TestExtensionObjectsRaced/hanzo-s3 TestStrayKeysAreIgnoredAndKept/hanzo-s3; do
         grep -q -- "--- PASS: $t " "$log" || { echo "did not pass against the real server: $t"; exit 1; }
       done
   - name: realserver-cas
@@ -105,7 +106,7 @@ test:
       set -euo pipefail
       go test -race -short -count=1 ./pkg/...
       go test -race -short -count=1 -run '^Test(ConcurrentWorkers|NoGoroutineLeak|SameRoundRace|RacingClaims|TakeoverLosesNoAcknowledgedCommit|FenceRefusesOlderRound|AttachNeedsAHigherRound|AttachLostAckIsNotStale|StalledCommitHonoursItsDeadline|DeposedWriterIsToldAtItsNextCommit|LostAckNoLostUpdateNoDuplicate|LostAckThenTakeoverIsNotReportedLost|VolumeOnEveryStore)$' .
-      go test -race -tags fuse -short -count=1 -run '^Test(InterruptIsEINTR|FsyncWaitsForItsCommit|CloseWaitsForItsCommit|ReadWaitsForItsData|FsyncCallersShareTwoCommits|SessionRefusesANilContext|LookedUpFileReadsOnTheMountContext|CreateOfAnExistingFileOpensIt|LookupIsNotAnsweredEINTR|AttrIsNotAnsweredEINTR|ReaddirIsNotAnsweredEINTR|MkdirIsNotAnsweredEINTR|RemoveIsNotAnsweredEINTR|CreateIsNotAnsweredEINTR|NodesAreBuiltOnlyByTheirConstructors|EveryHandlerOutlivesItsRequest|FinishCommitsWhatTheMountWrote|FinishReportsWhatWentWrong|FinishOfAReadOnlyVolumeCommitsNothing)$' ./pkg/mount
+      go test -race -tags fuse -short -count=1 -run '^Test(InterruptIsEINTR|FsyncWaitsForItsCommit|CloseWaitsForItsCommit|ReadWaitsForItsData|FsyncCallersShareTwoCommits|SessionRefusesANilContext|LookedUpFileReadsOnTheMountContext|CreateOfAnExistingFileOpensIt|LookupIsNotAnsweredEINTR|AttrIsNotAnsweredEINTR|ReaddirIsNotAnsweredEINTR|MkdirIsNotAnsweredEINTR|RemoveIsNotAnsweredEINTR|CreateIsNotAnsweredEINTR|NodesAreBuiltOnlyByTheirConstructors|EveryHandlerOutlivesItsRequest|FinishCommitsWhatTheMountWrote|FinishReportsWhatWentWrong|FinishOfAReadOnlyVolumeCommitsNothing|KilledColdLookupIsFreedAfterTheGrace|ErrnoMapping|FsyncJoinsAFlightThatCoversIt)$' ./pkg/mount
   - name: model
     run: go test -short -count=1 -run '^Test(Sparse|Model|TreeForced)' .
   - name: sparse

@@ -66,7 +66,10 @@ func TestGroundNamesDoNotBloatTheTree(t *testing.T) {
 	pp, pb := countShards(t, plain)
 	gp, gb := countShards(t, ground)
 	t.Logf("%d ordinary names: %d shards (%d KiB); %d names ground against another key: %d shards (%d KiB)", n, pp, pb>>10, n, gp, gb>>10)
-	if gp > 3*pp {
+	// Unkeyed, every ground name ends a node: about n shards. Keyed, a few nodes end
+	// where they happen to, and a draw of the seed that ends two or three more is not a
+	// guest's doing: the bound is a tenth of the names, far from both.
+	if gp > max(3*pp, n/10) {
 		t.Errorf("names chosen by a guest multiply the shards written by %.1fx (%d vs %d): the node boundary is not keyed", float64(gp)/float64(pp), gp, pp)
 	}
 }

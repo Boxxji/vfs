@@ -1,11 +1,10 @@
 //go:build linux
 
 // Command fusemount stands in for fusermount3 where there is no setuid helper to
-// mount with. A sandboxed CI runner ignores the setuid bit and gives its user no
-// capability, but lets that user make a user namespace in which it holds every
-// capability, and mount a file system there. Run inside one (`unshare -Urm`), with
-// this program on PATH under the name fusermount3, the FUSE mount tests find the
-// helper they ask for.
+// mount with. A host that ignores the setuid bit and gives its user no capability can
+// still let that user make a user namespace in which it holds every capability, and
+// mount a file system there. Run inside one (`unshare -Urm`), with this program on PATH
+// under the name fusermount3, the FUSE mount tests find the helper they ask for.
 //
 // It speaks the protocol of the real one, which is all the FUSE libraries use:
 //

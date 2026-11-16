@@ -45,15 +45,32 @@ The cost is that a call waits for the store, and there are no deadlines on store
 requests yet. The kernel keeps a request that reached the daemon until the daemon answers
 it, so with the store stopped a caller that is killed stays in state D until the store
 resumes (measured for read, stat, readdir, create, mkdir, unlink, truncate, write and
-fsync; close and exit were freed; before this change a kill freed lookups and fsync).
-Callers of fsync add nothing while they wait: 12 writers blocked for 11 s against a
-stopped store left the daemon at 20,344 kB before and after, with two commits at most.
-Abandoned requests of other kinds do add: 1,600 reads at distinct offsets grew the
-daemon by about 225 MB, and 3,000 distinct lookups by about 386 MB (about 128 KiB for
-each request, held by the FUSE library until its handler returns). Bounding what a read
-allocates itself changed nothing (245 MB for 1,600 reads either way), so the memory is
-freed only by answering the abandoned requests, which is what a deadline on the store
-will do. Deadlines are the next change (section 11 of the specification).
+fsync). Measured again with the store stopped, so that the facts are not a guess:
+
+* A cold lookup (the store is asked, no commit is running), a stat and a readdir are
+  freed 3 s after the kill: an interrupt ends a request that changes nothing only after
+  that grace. A mount that answered them at once freed the caller in 0.03 s, and could not
+  be used by C callers.
+* Anything behind a stalled commit is not freed: stat, a lookup of an absent name, readdir,
+  mkdir, unlink, truncate by path, fsync of a read-only descriptor. The Volume's lock is
+  held across the commit and a lock does not honour a request's context.
+* read, create, truncate and write, and fsync on a descriptor, are not freed, before or
+  now. A mount that answered fsync `EINTR` still waited: a goroutine dump shows the
+  flush that the exit of the dying caller sends, which waits for the same commit. Close and
+  exit are not freed behind a stalled commit either.
+* Killing the daemon frees every caller in 20 ms (`ENOTCONN`) and loses what was not
+  committed.
+* The daemon holds about 134 KiB for each abandoned request, until its handler returns:
+  1,600 reads at distinct offsets, 1,600 more through the page cache and 3,000 distinct
+  lookups took it from 16.8 MB to 831 MB, with no panic and the data intact after the
+  store resumed. Bounding what a read allocates changed nothing. Callers of fsync add
+  nothing while they wait (12 writers blocked for 11 s: 20,344 kB before and after, two
+  commits at most).
+
+A supervisor therefore needs a store-latency watchdog that kills the daemon, limits on
+processes and memory for the mount's callers and the daemon, and a lazy unmount at
+teardown. Deadlines on store requests, and a lock that gives way to a context, are the
+next change (section 11.2 of the specification).
 
 What a failed `Flush` tells the caller. `nil`: committed. Any other error: the outcome
 of that attempt is unknown (a reply can be lost after the write landed) and the
@@ -148,17 +165,25 @@ build of the main commit cbf3d650. `TestSigkill` runs all six kill points in eve
 gate that runs it; the `-short` runs skip only the sizes of the randomised tests.
 
 **The tests on a kernel mount are not CI gates, and why.** A gate runs on whatever
-kernel its runner has, and these tests assert what Linux's FUSE does: that after
+kernel it is given, and these tests assert what Linux's FUSE does: that after
 `fsync(2)` the file is in the store, that truncate and chmod answer as Linux's do, that
 a close is not interrupted by the kernel itself, and that an unmount ends the server.
 They need `/dev/fuse` and a `fusermount3` that can mount for an unprivileged user (or
 a user namespace, where `tools/fusemount` stands in for it: `tools/ci/mount.sh` runs
-the tests that way). On a runner whose kernel answers FUSE differently, a test of
-what Linux does would test that kernel, so none is gated there and none skips there.
-They run on a Linux host: `go test -tags fuse ./pkg/mount ./internal/sqlitecheck`,
-passing on amd64 and arm64 kernels (the results of the last run are in the pull
-request that changed the mount), and the proposal is a runner with a Linux kernel for
-them. What the mount does that needs no kernel is gated: the commits, the interrupts
+the tests that way). Where the kernel answers FUSE differently, a test of what Linux
+does would test that kernel, so none is gated there and none skips there. They run on a
+Linux host, and they are part of releasing:
+
+> **Release checklist.** On an amd64 Linux kernel and on an arm64 one, from test binaries
+> built with the toolchain of `go.mod` (`go test -tags fuse -c ./pkg/mount` and
+> `./internal/sqlitecheck`, with `GOARCH=amd64 CGO_ENABLED=0` for a host without the
+> toolchain), run each binary ten times, one at a time:
+> `nice -n19 ./mount.test -test.count=1 -test.timeout 22m` and
+> `./sqlitecheck.test -test.count=1`, with `s3` of `tools/ci/s3server.sh` on `PATH`. Every
+> round passes. `TestFUSEInterruptsAreNotErrors` fails only for a call that failed, never
+> for how long the host took.
+
+What the mount does that needs no kernel is gated: the commits, the interrupts
 (no request is answered `EINTR`, checked by a test of the source and by calling every
 handler), the context every read runs on, and the creation of a file that exists, all
 by calling the handlers, under the race detector.
@@ -187,7 +212,7 @@ by calling the handlers, under the race detector.
 
 ### Under signals, through the mount
 
-Measured on an arm64 Linux 7.0 kernel (a runner whose kernel is not Linux's cannot run this test; see above). The
+Measured on an arm64 Linux 7.0 kernel (a kernel that is not Linux's cannot run this test; see above). The
 work is bounded by count and by the clock, whichever comes first (2,000 fsyncs and 8 GiB
 of reads, at most 45 s each), so it is fast on a busy disk.
 
@@ -201,18 +226,18 @@ of reads, at most 45 s each), so it is fast on a busy disk.
 | What | Result | Test |
 |---|---|---|
 | Truncate a file to 64 GiB, then Flush | 7 µs, then 297 µs; no allocation | `TestSparseTruncateIsBoundedWork` |
-| A 1 PiB file: truncate, write at the start, the middle and near the end, Flush, reopen, read back | 19 ms in all; 1 shard (4 KiB), 1 pack, 1 Head; heap +1 MiB; ceilings asserted on seconds, shard count and bytes, and memory | `TestSparsePetabyte` |
+| A 1 PiB file: truncate, write at the start, the middle and near the end, Flush, reopen, read back | 2 to 19 ms in all, by machine; 1 shard (4 KiB), 1 pack, 1 Head; heap +1 MiB; ceilings asserted on seconds, shard count and bytes, and memory | `TestSparsePetabyte` |
 | The same through the mount, in a child process | truncate, three writes and fsync in 3 ms; the server's RSS +2 MiB; 4 objects in the store | `TestFUSEPetabyteTruncate` |
 | 2,000,000 one-byte writes with no Flush | `Stats.Dirty` 62.9 MB (each write span is charged 64 bytes), the heap grew 297 MiB: about 5 times the accounted bytes, so in that pattern memory is bounded by five times `Config.Dirty` | `TestSmallWritesAmplifyMemory` |
 
 ### The cost of a small file, through the mount
 
 Every `close(2)` on the mount is a commit (see Not yet built), so a tree written by
-`cp -r` or `tar x` pays one Head, a few shards and one pack per file.
+`cp -r` or `tar x` pays one Head, a few shards and one pack per file. The count varies with the Volume's seed, which decides where its nodes end: 20 KiB files cost 2.0, 2.8, 3.2 and 4.9 objects each in four runs on one machine, and a checkout of 5,000 files 4.9 to 6.0 objects each (143 to 168 files/s).
 
 | What | Result | Test |
 |---|---|---|
-| 400 files of 20 KiB written through the mount | 1.1 s (374 files/s); the store went from 2 to 802 objects, 2.0 per file; 23.0 MiB held for 7.8 MiB of data (2.94 times). The count per file differs from run to run (2.0 to 3.2 in the runs of this round): each Volume draws its own seed, and with it where its nodes end | `TestFUSECommitPerClose` |
+| 400 files of 20 KiB written through the mount | 1.1 s (374 files/s); the store went from 2 to 802 objects, 2.0 per file; 23.0 MiB held for 7.8 MiB of data (2.94 times). The count per file differs from run to run (2.0, 2.8, 3.2 and 4.9 in four runs on one machine): each Volume draws its own seed, and with it where its nodes end | `TestFUSECommitPerClose` |
 | 500 files of 20 KiB, Flush per file, engine alone | 3.0 objects per file (1 Head, 1 shard, 1 pack) at no latency, 360 files/s; at 5 ms store latency 4.8 per file and 23.8 files/s | `TestCommitPerClose` |
 | A 5,000-file checkout (284.6 MiB; 55% under 4 KiB, 30% to 32 KiB, 12% to 256 KiB, 3% to 2 MiB), a commit per file, through the mount | 35.1 s (143 files/s); the store holds 24,537 objects (4.91 per file) and 1,333.0 MiB (4.68 times the data) | `TestFUSECheckout` |
 | The same 5,000 files, Flush per file, engine alone | 28,283 objects written (5.66 per file: 5,000 Heads, 21,667 shards, 1,616 packs); 23,285 held, 1,461.7 MiB (5.14 times) in 31.0 s | `TestCheckoutCost` |
@@ -234,7 +259,7 @@ Flush at the end of the same tree leaves nothing behind.
 
 `TestObjectBudget150GiB` builds every metadata record such a tree would have into a
 real tree on a counting store, and models the data from the measured chunk mean and
-sealing overhead (150 GiB is not written). The previous layout needed 39,321,600
+sealing overhead (150 GiB is not written). The 4 KiB block store this layout replaced needed 39,321,600
 objects for the same bytes.
 
 | Shape | Chunks | Metadata shards | Packs | Objects |
@@ -301,7 +326,7 @@ Plain statements of fact; each is its own change.
   times, out of sight: an unreachable endpoint took about 31 s to fail, and the mount
   flushes at its end with no deadline, so an unmount can take that long.
 * A commit per `close(2)` on the mount: a file costs a Head, its shards and a pack
-  (3.2 objects through the mount, above); group commit is not built. The node cache
+  (2.0 to 4.9 objects through the mount, above); group commit is not built. The node cache
   and journal are not built either: reads and writes go to the store, `Fsync` costs a
   commit, uploads are sequential, and there is no read-ahead.
 * Concurrent cold readers of one chunk each fetch it: there is no shared in-flight

@@ -8,12 +8,11 @@
 # fails the step (the one test that only serves as the mount's child excepted): a
 # step that cannot mount is a step that failed, not one that passed.
 #
-# A CI runner is a sandbox whose kernel ignores the setuid bit and gives its user no
-# capability, so the usual helper, fusermount3, cannot be installed or used. The
-# runner does let its user make a user namespace, in which it holds every
-# capability and may mount a file system, and /dev/fuse is open to everyone. So the
-# tests run inside one (`unshare -Urm`), with tools/fusemount, which does what
-# fusermount3 does in a namespace, on PATH under that name.
+# Where there is no usable fusermount3 (the kernel ignores the setuid bit, or the user has
+# no capability), a user can still make a user namespace, in which it holds every
+# capability and may mount a file system, if /dev/fuse is open to it. So the tests run
+# inside one (`unshare -Urm`), with tools/fusemount, which does what fusermount3 does in
+# a namespace, on PATH under that name.
 set -euo pipefail
 pkg=${1:?usage: mount.sh PACKAGE run|skip REGEXP [TEST ...]}
 mode=${2:?usage: mount.sh PACKAGE run|skip REGEXP [TEST ...]}

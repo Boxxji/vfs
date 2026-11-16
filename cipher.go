@@ -173,9 +173,8 @@ type ageCipher struct {
 const tagLen = 32
 
 // errOlder is what a tag that is missing or wrong most often means: this layout has no
-// version to read, so a Volume written by an earlier build, which sealed its objects
-// another way, fails here and nowhere sooner.
-const errOlder = "the object was altered, or the Volume was written by an earlier build whose layout this one does not read"
+// version number, so a Volume sealed some other way fails here and nowhere sooner.
+const errOlder = "the object was altered, or the Volume was written in a layout this build does not read"
 
 // tagKey derives the tag key of an identity from its secret.
 func tagKey(k *age.HybridIdentity) (key [32]byte) {

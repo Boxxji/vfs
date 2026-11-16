@@ -97,7 +97,7 @@ durable when each call returns, and what a later journal must keep. In short: on
 `Flush` is durable; `Fsync` and the FUSE close are `Flush`; `Close` is not; `Attach`
 loses no acknowledged commit. Objects are written once under hash or random names,
 so repeating a write, or one that completes after its caller gave up, is harmless;
-the Head compare-and-swap is the only mutation.
+the Head compare-and-swap is the only mutation of the tree.
 
 * On the mount no request is answered EINTR: an interrupt (a signal reaching a caller
   that waits) does not end the wait, and every call returns its own result. C callers
@@ -109,15 +109,33 @@ the Head compare-and-swap is the only mutation.
   a stalled store stalls its callers and SIGKILL frees none of read, stat, readdir,
   create, mkdir, unlink, truncate, write or fsync (the kernel keeps a request the daemon
   holds), and the daemon holds 128 KiB for each abandoned request (1,600 reads: 225 MB;
-  3,000 lookups: 386 MB). Deadlines on the store are the next change; SPECIFICATION 11. The details are in `pkg/mount/errno.go`;
-  `TestFUSEInterruptsAreNotErrors` hammers the mount with signals.
+  3,000 lookups: 386 MB). Deadlines on the store are the next change; SPECIFICATION 11.2.
+  The one exception is a lookup, a getattr and a readdir, which change nothing: an
+  interrupt ends them after 3 s (`patient`), so a killed caller of a cold lookup is
+  freed. The details are in `pkg/mount/errno.go`; `TestFUSEInterruptsAreNotErrors`
+  hammers the mount with signals.
+* SIGTERM on a mount commits, asks for the unmount, detaches a mount in use after 5 s
+  and returns within 3 s more (`pkg/mount/stop.go`). A supervisor needs a lazy unmount
+  at teardown and a store-latency watchdog (SPECIFICATION 11.2).
 * A moved Volume is `vfs reseal --backend NEW --round N [--from OLD]` after copying its
   objects; it can be repeated at a higher round, and `--from` can be left out
-  (SPECIFICATION 5.4 says what that trusts).
+  (SPECIFICATION 5.4 says what that trusts). The copy is always checked (the root shard
+  opens and holds the root directory); `--verify` reads every shard and checks every pack.
 * The layout bytes are pinned by `spec_test.go`, which rebuilds each from the
-  specification text. Change a byte and it fails; change the text and the test together.
-* Objects beside the tree (a trace store, say) are extension objects under `ext/`
-  (SPECIFICATION 3.1): readers ignore what they do not know and a collector never deletes it.
+  specification text, and by `pin_test.go` (key shapes, sizes, a fixture of the default
+  Cipher). Change a byte and one fails; change the text and the test together.
+* The Head ends in `Journal` (the journal sequence it includes, 0 for none) and `Needs`
+  (feature bits, 0 for none; none is defined). A build refuses a Head with a bit it does
+  not know (`ErrNeeds`) and carries the bytes after `Needs` unchanged. `snapshots`,
+  `links` and `base` are reserved bits (SPECIFICATION 5.1): a change that must be honoured
+  by every writer or every collector sets one.
+* Objects beside the tree (a trace store, say) are extension objects (SPECIFICATION 3.1):
+  `Volume.PutExt` and `GetExt` keep one at `ext/<name>/<BLAKE3 of the key, hex>`, sealed
+  to the Volume, the name and the key, outside the Round's fence. Readers ignore keys
+  they do not know and a collector never deletes them (11.1 says how collection will go).
+* A key of any backend is 1 to 511 bytes of `a-z`, `0-9`, `-` in segments of at most 255,
+  separated by `/`; every backend refuses another (`backend.ErrKey`). `List` returns
+  objects with size and modification time, by string prefix.
 * On error the changes stay in memory for the next Flush and the outcome of that
   attempt is unknown. `ErrStaleRound` means this Volume was fenced; if the store's
   Head is exactly its tree, Flush says nil (the commit landed, the reply was lost).
@@ -230,13 +248,14 @@ go run ./tools/mutate                            # every mutation must be killed
 The real-server tests start `s3 server` (own-storage mode) in a temp dir with a
 throwaway key pair, race 16 and 128 writers on one version, run whole Volumes on it,
 and kill a writer at random moments. CI (`hanzo.yml`, `.github/workflows/cicd.yml`)
-runs eleven gates as parallel jobs, each under five minutes: `check`, `unit`, `race`,
-`model`, `sqlite` (the only gate that builds the SQLite engine), `realserver` and
-`realserver-kill` (against the published image of the server, pinned by digest, which
-fail if a test did not pass), `scale-a`, `scale-b`, `scale-c` and `fuzz`. The tests on a kernel
-mount are not gates: the runner's kernel is a sandbox whose FUSE is not Linux's, and
-`docs/PRODUCTION-READINESS.md` says what it does differently. They run on a Linux
-kernel, with `go test -tags fuse ./pkg/mount ./internal/sqlitecheck`, or with
+runs fifteen gates as parallel jobs, each under five minutes: `check`, `unit`, `race`,
+`model`, `sparse`, `sparse-tiny`, `sqlite` (the only gate that builds the SQLite engine),
+`realserver`, `realserver-cas`, `realserver-cas-large` and `realserver-kill` (against the
+published image of the server, pinned by digest, which fail if a test did not pass),
+`scale-a`, `scale-b`, `scale-c` and `fuzz`. The tests on a kernel mount are not gates: they
+assert what Linux's FUSE does, which a kernel of another kind answers differently
+(`docs/PRODUCTION-READINESS.md` has the release checklist). They run on a Linux
+kernel before a release, with `go test -tags fuse -count=1 ./pkg/mount ./internal/sqlitecheck`, or with
 `tools/ci/mount.sh` where there is no `fusermount3` (it mounts in a user namespace
 through `tools/fusemount`). Crash tests kill a
 re-executed test binary with SIGKILL at every point of a commit (the key arrives on
