@@ -218,7 +218,7 @@ of reads, at most 45 s each), so it is fast on a busy disk.
 
 | What | Result | Test |
 |---|---|---|
-| 2,000 small files written, fsynced and closed, two writers, SIGURG at their threads | 25,828 signals in 7.6 s; 0 failures; the callers saw `EINTR` from neither fsync nor close (an earlier build answered fsync `EINTR` 7,909 times in one run) | `TestFUSEInterruptsAreNotErrors` |
+| 2,000 small files written, fsynced and closed, two writers, SIGURG at their threads | 25,828 signals in 7.6 s; 0 failures; the callers saw `EINTR` from neither fsync nor close (a mount that answered fsync `EINTR` showed it 7,909 times in one run) | `TestFUSEInterruptsAreNotErrors` |
 | 8 GiB read back in 1 MiB reads of a 256 MiB file, two readers, same signals | 49,526 signals in 6.5 s (1,325 MB/s); 0 failures | same |
 
 ### Holes
