@@ -42,14 +42,18 @@ caller as `EIO` (20 GiB of Go reads under signals failed at the first block).
 commit or a fetch.
 
 The cost is that a call waits for the store, and there are no deadlines on store
-requests yet. With the store stopped, a caller that is killed stays in the kernel
-until the store resumes, and the daemon holds every abandoned request: 1,600 reads at
-distinct offsets grew it by about 225 MB, and 3,000 distinct lookups by about 386 MB
-(about 128 KiB for each request, held by the FUSE library until its handler returns).
-Bounding what a read allocates itself changed nothing (245 MB for 1,600 reads either
-way), so the memory is freed only by answering the abandoned requests, which is what a
-deadline on the store will do. Deadlines are the next change (section 11 of the
-specification).
+requests yet. The kernel keeps a request that reached the daemon until the daemon answers
+it, so with the store stopped a caller that is killed stays in state D until the store
+resumes (measured for read, stat, readdir, create, mkdir, unlink, truncate, write and
+fsync; close and exit were freed; before this change a kill freed lookups and fsync).
+Callers of fsync add nothing while they wait: 12 writers blocked for 11 s against a
+stopped store left the daemon at 20,344 kB before and after, with two commits at most.
+Abandoned requests of other kinds do add: 1,600 reads at distinct offsets grew the
+daemon by about 225 MB, and 3,000 distinct lookups by about 386 MB (about 128 KiB for
+each request, held by the FUSE library until its handler returns). Bounding what a read
+allocates itself changed nothing (245 MB for 1,600 reads either way), so the memory is
+freed only by answering the abandoned requests, which is what a deadline on the store
+will do. Deadlines are the next change (section 11 of the specification).
 
 What a failed `Flush` tells the caller. `nil`: committed. Any other error: the outcome
 of that attempt is unknown (a reply can be lost after the write landed) and the

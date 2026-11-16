@@ -77,8 +77,10 @@ func errno(err error) error {
 //
 // The cost is that a call waits for the store. There are no deadlines on the store yet,
 // so a store that stops answering stops every call that needs it, and killing a caller
-// does not free it: read, write, create, truncate and the exit of a process with an open
-// file were seen to stay in the kernel until the store answered, while the daemon holds
+// does not free it: the kernel keeps a request that reached the daemon until the daemon
+// answers it, so read, stat, readdir, create, mkdir, unlink, truncate, write and fsync
+// stayed in state D after SIGKILL until the store answered (an interrupt honoured
+// with EINTR is what freed lookups and fsync before), while the daemon holds
 // every abandoned request: the FUSE library holds a message buffer of about 128 KiB for
 // each until its handler returns, whatever the handler does (3,000 stalled lookups held
 // 386 MB and 1,600 stalled reads 225 MB, and limiting what a read allocates itself did

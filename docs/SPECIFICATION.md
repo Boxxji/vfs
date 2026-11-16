@@ -547,10 +547,13 @@ Known limits of the reference implementation. None changes the layout.
 
 * **A stalled store stalls its callers, and a kill does not free them.** A store request
   has no deadline. A call that needs the store waits for it, because no call is answered
-  "interrupted" (section 8). With a store that has stopped answering, a caller
-  that is killed leaves its read, write, create, truncate or exit in the kernel until the
-  store resumes, and the daemon holds every abandoned request. Measured with the store
-  stopped: 1,600 reads at distinct offsets grew the daemon by about 225 MB and 3,000
+  "interrupted" (section 8). The kernel keeps a request that reached the daemon until
+  the daemon answers it, so with a store that has stopped answering a caller that is
+  killed stays in the kernel (state D) until the store resumes: measured for read, stat,
+  readdir, create, mkdir, unlink, truncate, write and fsync, while a process in close(2)
+  or exiting was freed. Before this change a kill freed lookups and fsync, which answered
+  "interrupted"; a deadline on the store gives that back, by answering after a bounded
+  wait. The daemon holds every abandoned request. Measured with the store stopped: 1,600 reads at distinct offsets grew the daemon by about 225 MB and 3,000
   distinct lookups by about 386 MB, about 128 KiB for each request, which the FUSE
   library holds until the handler returns; limiting what a handler allocates does not
   change it (it was tried for reads: 245 MB for 1,600 reads with and without). A flush
