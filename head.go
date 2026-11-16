@@ -33,7 +33,28 @@ type Head struct {
 	// chunking table, which is why chunk lengths are not comparable across Volumes.
 	ID   volumeID
 	Seed [32]byte
+
+	// Journal is the highest sequence of the node journal (docs/journal.md) whose
+	// effects this Head includes: what the store holds of it. 0 when there is none.
+	Journal uint64
+
+	// Needs is a set of feature bits a reader must know to read the Volume at all. A
+	// build refuses a Head with a bit it does not know (ErrNeeds), so a change that
+	// every writer must honour, or every collector, is announced by a bit and never
+	// reaches a build that would break it. No bit is defined yet.
+	Needs uint64
+
+	// Tail is what follows Needs: fields a later build appends that no bit announces,
+	// so they can be ignored. This build keeps them and writes them back unchanged.
+	Tail string
 }
+
+// ErrNeeds is returned for a Volume whose Head announces a feature this build does
+// not have. Nothing was read or changed.
+var ErrNeeds = errors.New("vfs: the Volume needs a feature this build does not have")
+
+// knownNeeds is the set of Needs bits this build understands.
+const knownNeeds uint64 = 0
 
 type volumeID [16]byte
 
@@ -44,6 +65,9 @@ func (h Head) marshal() []byte {
 	w.uvarint(h.Next)
 	w.raw(h.ID[:])
 	w.raw(h.Seed[:])
+	w.uvarint(h.Journal)
+	w.uvarint(h.Needs)
+	w.raw([]byte(h.Tail))
 	return w.b
 }
 
@@ -54,7 +78,16 @@ func unmarshalHead(b []byte) (Head, error) {
 	h.Next = r.uvarint()
 	copy(h.ID[:], r.raw(16))
 	copy(h.Seed[:], r.raw(32))
-	return h, r.done()
+	h.Journal = r.uvarint()
+	h.Needs = r.uvarint()
+	if r.err != nil {
+		return Head{}, r.err
+	}
+	if unknown := h.Needs &^ knownNeeds; unknown != 0 {
+		return Head{}, fmt.Errorf("%w: bits %#x", ErrNeeds, unknown)
+	}
+	h.Tail = string(r.b)
+	return h, nil
 }
 
 // bindLen is the length of what every object is sealed to.

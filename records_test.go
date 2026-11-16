@@ -215,25 +215,51 @@ func covered(t *testing.T, v *Volume, ino InodeID, size uint64) {
 	}
 }
 
-// TestHeadRejectsGarbage: a Head that is truncated, or has bytes after its end, is an
-// error, not a guess.
+// TestHeadRejectsGarbage: a Head that is truncated is an error, not a guess; one with
+// bytes after Needs keeps them (5.1), and one that needs what this build does not have
+// is refused, whatever follows.
 func TestHeadRejectsGarbage(t *testing.T) {
 	good := Head{Seq: 1, Next: 2}.marshal()
 	for name, b := range map[string][]byte{
-		"empty":     nil,
-		"truncated": good[:len(good)-1],
-		"short":     good[:10],
-		"trailing":  append(append([]byte(nil), good...), 0),
+		"empty":                nil,
+		"truncated":            good[:len(good)-1],
+		"short":                good[:10],
+		"without Needs":        good[:len(good)-1],
+		"without Journal":      good[:len(good)-2],
+		"a Needs of ten bytes": append(append([]byte(nil), good[:len(good)-1]...), 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff),
 	} {
 		if _, err := unmarshalHead(b); err == nil {
 			t.Fatalf("a Head that is %s was accepted", name)
 		}
 	}
-	h := Head{Seq: 9, Next: 77}
+	h := Head{Seq: 9, Next: 77, Journal: 12345, Tail: "later fields"}
 	h.Root[3] = 5
 	got, err := unmarshalHead(h.marshal())
 	if err != nil || got != h {
 		t.Fatalf("Head round trip: %+v, %v", got, err)
+	}
+}
+
+// TestHeadNeeds: every Needs bit is unknown to this build, so every Head that sets one
+// is refused with ErrNeeds, with or without trailing fields, and one that sets none is
+// read whatever trails it.
+func TestHeadNeeds(t *testing.T) {
+	for bit := range 64 {
+		h := Head{Seq: 1, Next: 2, Needs: 1 << bit}
+		if _, err := unmarshalHead(h.marshal()); !errors.Is(err, ErrNeeds) {
+			t.Fatalf("Needs bit %d: %v, want ErrNeeds", bit, err)
+		}
+		h.Tail = "x"
+		if _, err := unmarshalHead(h.marshal()); !errors.Is(err, ErrNeeds) {
+			t.Fatalf("Needs bit %d with a tail: %v, want ErrNeeds", bit, err)
+		}
+	}
+	h := Head{Seq: 1, Next: 2}
+	for _, tail := range []string{"a", "\x00\x00", "any bytes at all \xff\xfe"} {
+		h.Tail = tail
+		if got, err := unmarshalHead(h.marshal()); err != nil || got.Tail != tail {
+			t.Fatalf("tail %q: %+v %v", tail, got, err)
+		}
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/hex"
 	"io/fs"
 	"math/rand/v2"
 	"testing"
@@ -102,10 +103,14 @@ func TestSpecHead(t *testing.T) {
 	for range 200 {
 		var h Head
 		h.Seq, h.Next = r.Uint64()>>uint(r.IntN(60)), r.Uint64()>>uint(r.IntN(60))
+		h.Journal = r.Uint64() >> uint(r.IntN(64))
 		for _, b := range [][]byte{h.Root[:], h.ID[:], h.Seed[:]} {
 			for i := range b {
 				b[i] = byte(r.Uint32())
 			}
+		}
+		if r.IntN(2) == 0 {
+			h.Tail = string([]byte{byte(r.Uint32()), byte(r.Uint32()), 7})
 		}
 		var want []byte
 		want = append(want, specUvarint(h.Seq)...)
@@ -113,9 +118,20 @@ func TestSpecHead(t *testing.T) {
 		want = append(want, specUvarint(h.Next)...)
 		want = append(want, h.ID[:]...)
 		want = append(want, h.Seed[:]...)
+		want = append(want, specUvarint(h.Journal)...)
+		want = append(want, specUvarint(h.Needs)...)
+		want = append(want, h.Tail...)
 		if !bytes.Equal(h.marshal(), want) {
 			t.Fatalf("Head differs from 5.1")
 		}
+		if got, err := unmarshalHead(want); err != nil || got != h {
+			t.Fatalf("5.1: the Head does not read back: %+v %v", got, err)
+		}
+	}
+	// 5.1: the fixed bytes of a Head with nothing set (Journal 0, Needs 0) end in two zero bytes.
+	var zero Head
+	if got := zero.marshal(); len(got) != 1+32+1+16+32+1+1 || got[len(got)-2] != 0 || got[len(got)-1] != 0 {
+		t.Fatalf("an empty Head is %x", got)
 	}
 }
 
@@ -295,6 +311,44 @@ func TestSpecChunker(t *testing.T) {
 		b = b[:64<<10+r.IntN(4<<20-64<<10)]
 		if got, want := cut(newGear(seed), b), spec(b); got != want {
 			t.Fatalf("cut = %d, SPEC 7.2 says %d", got, want)
+		}
+	}
+}
+
+// 3.1 and 4.2: an extension object is at ext/<name>/<64 hex of BLAKE3(key)> and is sealed to
+// the context of kind "ext" with the Volume id, the name and that last segment.
+func TestSpecExtension(t *testing.T) {
+	ctx := context.Background()
+	be := storetest.NewMem()
+	k, _ := age.GenerateHybridIdentity()
+	c := Hybrid(k)
+	if err := Create(ctx, Config{Backend: be, Cipher: c}); err != nil {
+		t.Fatal(err)
+	}
+	v, err := Attach(ctx, Config{Backend: be, Cipher: c, Round: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range [][]byte{nil, []byte("workflow key"), bytes.Repeat([]byte{0xff}, 3000)} {
+		sum := blake3.Sum256(key)
+		rest := hex.EncodeToString(sum[:])
+		if len(rest) != 64 {
+			t.Fatal("the text says 64 hex digits")
+		}
+		data := []byte("the trace of " + rest[:8])
+		if err := v.PutExt(ctx, "trace", key, data); err != nil {
+			t.Fatal(err)
+		}
+		sealed, ok := be.Dump()["ext/trace/"+rest]
+		if !ok {
+			t.Fatalf("the object is not at ext/trace/%s", rest)
+		}
+		got, err := unseal(c, specContext("ext", v.id[:], []byte("trace"), []byte(rest)), sealed)
+		if err != nil || !bytes.Equal(got, data) {
+			t.Fatalf("the object does not open under the context of 4.2: %q %v", got, err)
+		}
+		if !bytes.Equal(extAAD(v.id, "trace", rest), specContext("ext", v.id[:], []byte("trace"), []byte(rest))) {
+			t.Fatal("extAAD differs from 4.2")
 		}
 	}
 }
