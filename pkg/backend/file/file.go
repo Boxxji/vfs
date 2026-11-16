@@ -40,9 +40,15 @@ type fileBackend struct {
 func openFile(_ context.Context, u *url.URL) (backend.Backend, error) {
 	// file:///abs/path  → u.Path = "/abs/path"
 	// file://./relpath  → u.Host = ".", u.Path = "/relpath"
+	// file://host/path names a host, which this backend does not reach: refused,
+	// not read as the directory host/path.
 	root := u.Path
-	if u.Host != "" && u.Host != "localhost" {
+	switch u.Host {
+	case "", "localhost":
+	case ".":
 		root = filepath.Join(u.Host, u.Path)
+	default:
+		return nil, fmt.Errorf("file backend: the URL names the host %q, which this backend does not reach; use file:///dir, or file://./dir for a relative directory", u.Host)
 	}
 	if root == "" {
 		return nil, fmt.Errorf("file backend: missing path in %q", u.String())

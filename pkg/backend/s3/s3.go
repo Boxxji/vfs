@@ -67,7 +67,7 @@ func New(c Config) (backend.Backend, error) {
 	if c.Endpoint == "" || c.Bucket == "" {
 		return nil, fmt.Errorf("s3 backend: endpoint and bucket are required")
 	}
-	prefix := strings.Trim(c.Prefix, "/")
+	prefix := c.Prefix
 	if err := backend.ValidPrefix(prefix); err != nil {
 		return nil, fmt.Errorf("s3 backend: %w", err)
 	}
@@ -100,7 +100,9 @@ func openS3(_ context.Context, u *url.URL) (backend.Backend, error) {
 	if u.Host == "" {
 		return nil, fmt.Errorf("s3 backend: missing bucket")
 	}
-	prefix := strings.Trim(u.Path, "/")
+	// The path is "/" and the prefix: the one slash is syntax, and what follows is
+	// refused if it is not a prefix ("bucket/vol/" has an empty segment).
+	prefix := strings.TrimPrefix(u.Path, "/")
 	if err := backend.ValidPrefix(prefix); err != nil {
 		return nil, fmt.Errorf("s3 backend: %w", err)
 	}

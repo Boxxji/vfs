@@ -106,8 +106,11 @@ func TestURLPrefixValidated(t *testing.T) {
 			t.Errorf("URL path %q was accepted", path)
 		}
 	}
-	if _, err := backend.Open(context.Background(), "s3://bucket/org/vol/?endpoint=127.0.0.1:1&insecure=1&region=r"); err != nil {
-		t.Errorf("a plain prefix with a trailing slash: %v", err)
+	if _, err := backend.Open(context.Background(), "s3://bucket/org/vol/?endpoint=127.0.0.1:1&insecure=1&region=r"); err == nil {
+		t.Error("a prefix with a trailing slash was cleaned instead of refused")
+	}
+	if _, err := backend.Open(context.Background(), "s3://bucket/org/vol?endpoint=127.0.0.1:1&insecure=1&region=r"); err != nil {
+		t.Errorf("a plain prefix: %v", err)
 	}
 }
 

@@ -23,7 +23,7 @@ func prefixed(t *testing.T, srv *storetest.Real, prefix string) backend.Backend 
 // may reach another Volume's objects. Keys are built as prefix + "/" + key, and a
 // store may treat "a//b" or "a/./b" as another spelling of "a/b", so the backend
 // refuses a prefix with an empty, "." or ".." segment, a control character, or too
-// many bytes, rather than trust the store to take it literally.
+// many bytes, rather than trust the store to take it literally (SPEC 2).
 func TestPrefixConfinement(t *testing.T) {
 	srv := storetest.RealS3(t)
 	base := srv.Prefix("pfx")
@@ -65,11 +65,15 @@ func TestPrefixConfinement(t *testing.T) {
 			t.Errorf("URL path %q was accepted", base+u)
 		}
 	}
-	// Plain spellings, with a leading or trailing slash, are the same prefix.
-	for _, ok := range []string{base + "/b", "/" + base + "/b", base + "/b/"} {
-		be := prefixed(t, srv, ok)
-		if _, err := vfs.Open(ctx, cfg(be, c, 0)); err != nil {
-			t.Errorf("prefix %q: %v", ok, err)
+	// A leading or trailing slash is an empty segment: refused like the others, not cleaned.
+	for _, bad := range []string{"/" + base + "/b", base + "/b/"} {
+		if _, err := s3.New(s3.Config{Endpoint: srv.Endpoint, Insecure: true, Region: "us-east-1", Bucket: srv.Bucket,
+			Prefix: bad, AccessKey: srv.AccessKey, SecretKey: srv.SecretKey}); err == nil {
+			t.Errorf("prefix %q was accepted", bad)
 		}
+	}
+	be := prefixed(t, srv, base+"/b")
+	if _, err := vfs.Open(ctx, cfg(be, c, 0)); err != nil {
+		t.Errorf("prefix %q: %v", base+"/b", err)
 	}
 }

@@ -41,22 +41,32 @@ func Past(max int64) int64 {
 	return max + 1
 }
 
-// redact removes what a URL carries before the last "@" of its authority, which
-// is where a credential would be, so that a URL can be named in an error.
+// redact removes what a URL carries before its last "@", which is where a credential
+// would be, so that a URL can be named in an error. It is applied to text that did not
+// parse, so it does not look for the authority: whatever the scheme was spelled like,
+// everything before the last "@" is dropped except a well-formed "scheme://".
 func redact(raw string) string {
-	rest := raw
+	at := strings.LastIndex(raw, "@")
+	if at < 0 {
+		return raw
+	}
 	head := ""
-	if i := strings.Index(raw, "://"); i >= 0 {
-		head, rest = raw[:i+3], raw[i+3:]
+	if i := strings.Index(raw, "://"); i > 0 && i < at && isScheme(raw[:i]) {
+		head = raw[:i+3]
 	}
-	end := strings.IndexAny(rest, "/?#")
-	if end < 0 {
-		end = len(rest)
+	return head + "***@" + raw[at+1:]
+}
+
+func isScheme(s string) bool {
+	for i, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z':
+		case i > 0 && (r >= '0' && r <= '9' || r == '+' || r == '-' || r == '.'):
+		default:
+			return false
+		}
 	}
-	if at := strings.LastIndex(rest[:end], "@"); at >= 0 {
-		rest = "***@" + rest[at+1:]
-	}
-	return head + rest
+	return s != ""
 }
 
 // ValidPrefix reports whether p can name a Volume's place in a bucket: slash
@@ -155,7 +165,7 @@ type Backend interface {
 // Open dispatches a backend URL to the right implementation. Recognised
 // schemes:
 //
-//	file://path           — local filesystem (dev and tests)
+//	file:///dir           — local filesystem (dev and tests); file://./dir is relative
 //	s3://bucket/prefix    — any S3-compatible store (Hanzo S3 first)
 //
 // The opener function is registered by each backend package's init().
