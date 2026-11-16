@@ -99,7 +99,7 @@ test:
       GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go vet -tags fuse ./pkg/mount
       test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
   - name: unit
-    run: go test -short -count=1 -skip '^Test(Sparse|Model|TreeForced)' . ./cmd/... ./pkg/...
+    run: go test -short -count=1 -skip '^Test(Sparse|Model|TreeForced)' . ./cmd/... ./pkg/... ./internal/storetest
   - name: race
     run: |
       set -euo pipefail
