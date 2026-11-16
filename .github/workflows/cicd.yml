@@ -19,6 +19,8 @@ jobs:
       matrix:
         gates:
           - 'realserver'
+          - 'realserver-cas'
+          - 'realserver-cas-large'
           - 'realserver-kill'
           - 'check'
           - 'unit'
@@ -29,7 +31,7 @@ jobs:
           - 'scale-a'
           - 'scale-b'
           - 'scale-c'
-          - '!realserver,realserver-kill,check,unit,race,model,sparse,sqlite,scale-a,scale-b,scale-c'
+          - '!realserver,realserver-cas,realserver-cas-large,realserver-kill,check,unit,race,model,sparse,sqlite,scale-a,scale-b,scale-c'
     uses: hanzoai/ci/.github/workflows/build.yml@v2
     with:
       gates: ${{ matrix.gates }}
