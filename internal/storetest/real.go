@@ -6,11 +6,13 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	mrand "math/rand/v2"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -92,32 +94,64 @@ func outlive(server int) {
 	}
 }
 
+// tail returns the last n lines of a file, or why it cannot.
+func tail(path string, n int) string {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return err.Error()
+	}
+	lines := strings.Split(strings.TrimRight(string(b), "\n"), "\n")
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return strings.Join(lines, "\n")
+}
+
 func randHex(n int) string {
 	b := make([]byte, n)
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
 }
 
-// freePorts returns n ports p such that p and p+10000 are both free: the server
-// puts its gRPC listener 10000 above each HTTP port.
+// freePorts returns n ports for the server's HTTP listeners. From each the server derives
+// others: 10000 above is a gRPC listener, 20000 above is a second listener of the master
+// and the filer, and the S3 front has one more at 10001 above. All of them must be free,
+// below 65536 (a port past it wraps to a privileged one and the server dies at start: the
+// kernel hands out ports up to 50000 and above), and clear of the range the kernel gives to
+// connections, which a busy host fills. So the choice is made from the bottom of the
+// registered range: p plus 20000 is under 32768. No two choices are within 2 of each other.
 func freePorts(n int) ([]int, error) {
 	var out []int
-	for len(out) < n {
-		l, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			return nil, err
+	for try := 0; len(out) < n; try++ {
+		if try > 10000 {
+			return nil, fmt.Errorf("storetest: no free ports for the server")
 		}
-		p := l.Addr().(*net.TCPAddr).Port
-		l.Close()
-		if p > 50000 {
+		p := 10240 + mrand.IntN(2400)
+		near := false
+		for _, q := range out {
+			if p-q < 2 && q-p < 2 {
+				near = true
+			}
+		}
+		if near {
 			continue
 		}
-		g, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", p+10000))
-		if err != nil {
-			continue
+		var held []net.Listener
+		free := true
+		for _, q := range []int{p, p + 10000, p + 10001, p + 20000} {
+			l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", q))
+			if err != nil {
+				free = false
+				break
+			}
+			held = append(held, l)
 		}
-		g.Close()
-		out = append(out, p)
+		for _, l := range held {
+			l.Close()
+		}
+		if free {
+			out = append(out, p)
+		}
 	}
 	return out, nil
 }
@@ -152,7 +186,15 @@ func startReal(bin string) (*Real, error) {
 		"-master.volumeSizeLimitMB=64", "-volume.max=128", "-s3.allowDeleteBucketNotEmpty")
 	r.cmd.Dir = dir
 	r.cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + dir}
-	if err := r.cmd.Start(); err != nil {
+	logPath := filepath.Join(dir, "server.log")
+	logFile, err := os.Create(logPath)
+	if err != nil {
+		return nil, err
+	}
+	r.cmd.Stdout, r.cmd.Stderr = logFile, logFile
+	err = r.cmd.Start()
+	logFile.Close() // the server holds its own descriptor
+	if err != nil {
 		return nil, err
 	}
 	outlive(r.cmd.Process.Pid)
@@ -172,8 +214,9 @@ func startReal(bin string) (*Real, error) {
 			return r, nil
 		}
 		if time.Now().After(deadline) {
+			alive := r.cmd.Process.Signal(syscall.Signal(0)) == nil
 			_ = r.cmd.Process.Kill()
-			return nil, fmt.Errorf("no bucket after 120s: %w", err)
+			return nil, fmt.Errorf("no bucket after 120s (server running: %v): %w\nthe end of its log:\n%s", alive, err, tail(logPath, 12))
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
