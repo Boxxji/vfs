@@ -25,6 +25,9 @@
 #                    object budget, a petabyte, amplification (-short skips them)
 #   fuzz             the model run over many more seeds
 #   fuzz-head        the Head parser against a decoder written from the text, coverage-guided
+#   internal         the hash (internal/blake3) and the buffer pool (internal/bufpool), under
+#                    the race detector: their tests check the digests against the official
+#                    vectors and a second library, and the pool's sharing rules
 #
 # The realserver gates fail if a test they exist for did not pass: a skip is a
 # failure there, never a pass. The real server is the published image of release
@@ -132,3 +135,5 @@ test:
     run: go test -count=1 -timeout 4m -run '^TestModelFuzzMany$' .
   - name: fuzz-head
     run: go test -count=1 -timeout 3m -run '^$' -fuzz '^FuzzHead$' -fuzztime 20s .
+  - name: internal
+    run: go test -race -count=1 -timeout 4m ./internal/blake3 ./internal/bufpool

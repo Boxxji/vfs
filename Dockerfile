@@ -16,5 +16,6 @@ COPY --from=builder /usr/share/zoneinfo /usr/share/zoneinfo
 COPY --from=builder /etc/passwd /etc/passwd
 COPY --from=builder /etc/group /etc/group
 COPY --from=builder /vfs /usr/local/bin/vfs
+COPY --from=builder /build/LICENSE /build/THIRD_PARTY_NOTICES /usr/share/licenses/vfs/
 USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/vfs"]

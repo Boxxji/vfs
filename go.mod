@@ -10,6 +10,7 @@ require (
 	github.com/luxfi/age v1.6.0
 	github.com/spf13/cobra v1.10.2
 	github.com/zeebo/blake3 v0.2.4
+	lukechampine.com/blake3 v1.4.1
 )
 
 require (
