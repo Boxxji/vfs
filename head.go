@@ -44,8 +44,9 @@ type Head struct {
 	// reaches a build that would break it. No bit is defined yet.
 	Needs uint64
 
-	// Tail is what follows Needs: fields a later build appends that no bit announces,
-	// so they can be ignored. This build keeps them and writes them back unchanged.
+	// Tail is what follows Needs: fields that later builds append, each [tag][length]
+	// [value] with tags strictly increasing (SPECIFICATION 5.1). This build understands
+	// none, skips every one and writes them back unchanged.
 	Tail string
 }
 
@@ -53,8 +54,12 @@ type Head struct {
 // not have. Nothing was read or changed.
 var ErrNeeds = errors.New("vfs: the Volume needs a feature this build does not have")
 
-// knownNeeds is the set of Needs bits this build understands.
+// knownNeeds is the set of Needs bits this build understands. Bit N announces the field
+// of the Tail with tag N; no bit is defined.
 const knownNeeds uint64 = 0
+
+// maxTailFields bounds the number of fields of a Tail.
+const maxTailFields = 256
 
 type volumeID [16]byte
 
@@ -86,8 +91,39 @@ func unmarshalHead(b []byte) (Head, error) {
 	if unknown := h.Needs &^ knownNeeds; unknown != 0 {
 		return Head{}, fmt.Errorf("%w: bits %#x", ErrNeeds, unknown)
 	}
+	if err := checkTail(r.b, h.Needs); err != nil {
+		return Head{}, err
+	}
 	h.Tail = string(r.b)
 	return h, nil
+}
+
+// checkTail checks that b is a Tail: fields [tag uvarint][length uvarint][value], each
+// whole, with tags strictly increasing, at most maxTailFields of them, and a field for
+// every bit of needs. It looks inside no value: what a field holds is its build's.
+func checkTail(b []byte, needs uint64) error {
+	r := reader{b: b}
+	var last, seen uint64
+	for n := 0; len(r.b) > 0; n++ {
+		tag := r.uvarint()
+		r.bytes()
+		switch {
+		case r.err != nil:
+			return fmt.Errorf("%w: a field of the Head's tail is not whole", ErrCorrupt)
+		case n > 0 && tag <= last:
+			return fmt.Errorf("%w: Head field %d after %d", ErrCorrupt, tag, last)
+		case n >= maxTailFields:
+			return fmt.Errorf("%w: a Head of more than %d fields", ErrCorrupt, maxTailFields)
+		}
+		last = tag
+		if tag < 64 {
+			seen |= 1 << tag
+		}
+	}
+	if missing := needs &^ seen; missing != 0 {
+		return fmt.Errorf("%w: the Head needs fields %#x that it does not carry", ErrCorrupt, missing)
+	}
+	return nil
 }
 
 // bindLen is the length of what every object is sealed to.

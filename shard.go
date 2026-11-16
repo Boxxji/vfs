@@ -47,7 +47,11 @@ func (n *node) encode() []byte {
 
 func decodeNode(b []byte) (*node, error) {
 	r := reader{b: b}
-	n := &node{level: int(r.uvarint()), size: int64(len(b))}
+	level := r.uvarint()
+	if level > 255 { // the level is one byte of the boundary hash's input (SPEC 6.3)
+		return nil, fmt.Errorf("%w: node of level %d", ErrCorrupt, level)
+	}
+	n := &node{level: int(level), size: int64(len(b))}
 	count := r.uvarint()
 	if count == 0 || count > uint64(len(b)) {
 		return nil, fmt.Errorf("%w: node of %d entries", ErrCorrupt, count)

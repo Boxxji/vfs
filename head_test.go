@@ -3,6 +3,7 @@ package vfs
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"testing"
 
@@ -21,10 +22,16 @@ func TestTheHeadHasRoomForTheJournalSequence(t *testing.T) {
 	if err != nil || got.Journal != 70_000 {
 		t.Fatalf("a Head with a journal sequence reads back as %+v, %v", got, err)
 	}
-	later, err := unmarshalHead(append(h.marshal(), 7, 8))
-	if err != nil || later.Journal != 70_000 || later.Tail != "\x07\x08" {
+	field := tlv(1000, "a field of a later build")
+	later, err := unmarshalHead(append(h.marshal(), field...))
+	if err != nil || later.Journal != 70_000 || later.Tail != field {
 		t.Fatalf("a Head with a field after Needs reads as %+v, %v", later, err)
 	}
+}
+
+// tlv is one field of a Head's tail: [tag uvarint][length uvarint][value].
+func tlv(tag uint64, value string) string {
+	return string(binary.AppendUvarint(binary.AppendUvarint(nil, tag), uint64(len(value)))) + value
 }
 
 // The journal sequence, the bits and the tail that a Head carried are the ones the next
@@ -42,7 +49,7 @@ func TestHeadFieldsSurviveACommit(t *testing.T) {
 		t.Fatal(err)
 	}
 	v.mu.Lock()
-	v.head.Journal, v.head.Tail = 41, "a field of a later build"
+	v.head.Journal, v.head.Tail = 41, tlv(40, "a field")+tlv(41, "of a later")+tlv(1<<40, "build")
 	v.mu.Unlock()
 	if _, err := v.Create(ctx, RootInode, "f", 0o644); err != nil {
 		t.Fatal(err)
@@ -54,7 +61,7 @@ func TestHeadFieldsSurviveACommit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.head.Journal != 41 || r.head.Tail != "a field of a later build" {
+	if r.head.Journal != 41 || r.head.Tail != tlv(40, "a field")+tlv(41, "of a later")+tlv(1<<40, "build") {
 		t.Fatalf("after a commit the Head has Journal %d, Tail %q", r.head.Journal, r.head.Tail)
 	}
 }

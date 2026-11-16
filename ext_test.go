@@ -9,15 +9,18 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/zeebo/blake3"
-
 	"github.com/hanzoai/vfs"
 	"github.com/hanzoai/vfs/pkg/backend"
 )
 
-func extObject(name string, key []byte) string {
-	sum := blake3.Sum256(key)
-	return fmt.Sprintf("ext/%s/%x", name, sum[:])
+// extObject is where the Volume keeps the object of an extension under a key.
+func extObject(t testing.TB, v *vfs.Volume, name string, key []byte) string {
+	t.Helper()
+	at, err := v.ExtKey(name, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return at
 }
 
 // SPEC 3.1: extension objects work the same on every store: created, replaced whole, read
@@ -53,8 +56,8 @@ func TestExtensionObjectsOnEveryStore(t *testing.T) {
 					t.Fatalf("key %d after a replacement reads %d bytes, %v", i, len(got), err)
 				}
 				// the object is where the text says, and nowhere else
-				if _, _, err := st.client(t).Get(ctx, extObject("trace", key), backend.Unbounded); err != nil {
-					t.Fatalf("key %d is not at %s: %v", i, extObject("trace", key), err)
+				if _, _, err := st.client(t).Get(ctx, extObject(t, v, "trace", key), backend.Unbounded); err != nil {
+					t.Fatalf("key %d is not at %s: %v", i, extObject(t, v, "trace", key), err)
 				}
 			}
 			// another extension, and an empty object, are other objects

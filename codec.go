@@ -3,6 +3,7 @@ package vfs
 import (
 	"encoding/binary"
 	"errors"
+	"math"
 )
 
 // ErrCorrupt is returned when an object fails to authenticate, hash to its name,
@@ -26,9 +27,12 @@ type reader struct {
 
 func (r *reader) fail() { r.err = ErrCorrupt; r.b = nil }
 
+// uvarint reads an unsigned integer in its shortest form: an encoding that ends in a
+// zero byte after a continuation (0x80 0x00 for 0) is another spelling of a number that
+// has one, so two byte strings would be one record, and it is refused.
 func (r *reader) uvarint() uint64 {
 	x, n := binary.Uvarint(r.b)
-	if n <= 0 {
+	if n <= 0 || n > 1 && r.b[n-1] == 0 {
 		r.fail()
 		return 0
 	}
@@ -36,9 +40,21 @@ func (r *reader) uvarint() uint64 {
 	return x
 }
 
+// uvarint32 reads an unsigned integer that its field holds in 32 bits: a wider value is
+// not truncated into one that fits, it is refused.
+func (r *reader) uvarint32() uint32 {
+	x := r.uvarint()
+	if x > math.MaxUint32 {
+		r.fail()
+		return 0
+	}
+	return uint32(x)
+}
+
+// varint reads a signed integer in its shortest form (the zigzag of it is shortest).
 func (r *reader) varint() int64 {
 	x, n := binary.Varint(r.b)
-	if n <= 0 {
+	if n <= 0 || n > 1 && r.b[n-1] == 0 {
 		r.fail()
 		return 0
 	}

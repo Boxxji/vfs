@@ -109,8 +109,15 @@ func TestSpecHead(t *testing.T) {
 				b[i] = byte(r.Uint32())
 			}
 		}
-		if r.IntN(2) == 0 {
-			h.Tail = string([]byte{byte(r.Uint32()), byte(r.Uint32()), 7})
+		// 5.1: the Tail is [tag uvarint][length uvarint][value], tags strictly increasing
+		var tag uint64
+		for range r.IntN(4) {
+			tag += 1 + r.Uint64()>>uint(32+r.IntN(32))
+			value := make([]byte, r.IntN(5))
+			for i := range value {
+				value[i] = byte(r.Uint32())
+			}
+			h.Tail += string(specUvarint(tag)) + string(specUvarint(uint64(len(value)))) + string(value)
 		}
 		var want []byte
 		want = append(want, specUvarint(h.Seq)...)
@@ -315,23 +322,42 @@ func TestSpecChunker(t *testing.T) {
 	}
 }
 
-// 3.1 and 4.2: an extension object is at ext/<name>/<64 hex of BLAKE3(key)> and is sealed to
-// the context of kind "ext" with the Volume id, the name and that last segment.
+// specExtName is 3.1: the last segment of an extension object's key, in 64 lower case hex
+// digits, of BLAKE3 keyed with DeriveKey("hanzoai/vfs extension names", Seed) over the length
+// of the name as a uvarint, the name, and the key.
+func specExtName(seed [32]byte, name string, key []byte) string {
+	var k [32]byte
+	blake3.DeriveKey("hanzoai/vfs extension names", seed[:], k[:])
+	h, _ := blake3.NewKeyed(k[:])
+	h.Write(specUvarint(uint64(len(name))))
+	h.Write([]byte(name))
+	h.Write(key)
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// 3.1 and 4.2: an extension object is at ext/<name>/<64 hex digits of a hash keyed from the
+// Seed> and is sealed to the context of kind "ext" with the Volume id, the name and that last
+// segment. The same key in two Volumes is two names, and so is one key under two extensions.
 func TestSpecExtension(t *testing.T) {
 	ctx := context.Background()
-	be := storetest.NewMem()
 	k, _ := age.GenerateHybridIdentity()
 	c := Hybrid(k)
-	if err := Create(ctx, Config{Backend: be, Cipher: c}); err != nil {
-		t.Fatal(err)
+	vol := func() (*storetest.Mem, *Volume) {
+		be := storetest.NewMem()
+		if err := Create(ctx, Config{Backend: be, Cipher: c}); err != nil {
+			t.Fatal(err)
+		}
+		v, err := Attach(ctx, Config{Backend: be, Cipher: c, Round: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return be, v
 	}
-	v, err := Attach(ctx, Config{Backend: be, Cipher: c, Round: 1})
-	if err != nil {
-		t.Fatal(err)
-	}
+	be, v := vol()
+	be2, v2 := vol()
+	names := map[string]bool{}
 	for _, key := range [][]byte{nil, []byte("workflow key"), bytes.Repeat([]byte{0xff}, 3000)} {
-		sum := blake3.Sum256(key)
-		rest := hex.EncodeToString(sum[:])
+		rest := specExtName(v.head.Seed, "trace", key)
 		if len(rest) != 64 {
 			t.Fatal("the text says 64 hex digits")
 		}
@@ -349,6 +375,23 @@ func TestSpecExtension(t *testing.T) {
 		}
 		if !bytes.Equal(extAAD(v.id, "trace", rest), specContext("ext", v.id[:], []byte("trace"), []byte(rest))) {
 			t.Fatal("extAAD differs from 4.2")
+		}
+		// the same key in another Volume, and under another name, is another object
+		if err := v2.PutExt(ctx, "trace", key, data); err != nil {
+			t.Fatal(err)
+		}
+		other := specExtName(v2.head.Seed, "trace", key)
+		if other == rest {
+			t.Fatal("two Volumes name the object of one key alike")
+		}
+		if _, ok := be2.Dump()["ext/trace/"+other]; !ok {
+			t.Fatalf("the object of the second Volume is not at ext/trace/%s", other)
+		}
+		for _, n := range []string{rest, other, specExtName(v.head.Seed, "trace2", key), specExtName(v.head.Seed, "trac", append([]byte("e"), key...))} {
+			if names[n] {
+				t.Fatal("two extension objects have one name")
+			}
+			names[n] = true
 		}
 	}
 }

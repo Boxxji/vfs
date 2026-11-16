@@ -127,7 +127,7 @@ func decodeInode(id InodeID, b []byte) (Inode, error) {
 		v := reader{b: value}
 		switch tag {
 		case fieldMode:
-			in.Mode = fs.FileMode(v.uvarint())
+			in.Mode = fs.FileMode(v.uvarint32())
 		case fieldSize:
 			in.Size = v.uvarint()
 		case fieldMtime:
@@ -163,7 +163,7 @@ func encodeEntry(child InodeID, mode fs.FileMode) []byte {
 
 func decodeEntry(b []byte) (InodeID, fs.FileMode, error) {
 	r := reader{b: b}
-	id, mode := InodeID(r.uvarint()), fs.FileMode(r.uvarint())
+	id, mode := InodeID(r.uvarint()), fs.FileMode(r.uvarint32())
 	return id, mode, r.done()
 }
 
@@ -187,7 +187,7 @@ func decodeExtent(off uint64, b []byte) (extent, error) {
 	r := reader{b: b}
 	e := extent{off: off}
 	copy(e.id[:], r.raw(32))
-	e.n = uint32(r.uvarint())
+	e.n = r.uvarint32()
 	return e, r.done()
 }
 

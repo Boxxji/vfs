@@ -232,7 +232,7 @@ func TestHeadRejectsGarbage(t *testing.T) {
 			t.Fatalf("a Head that is %s was accepted", name)
 		}
 	}
-	h := Head{Seq: 9, Next: 77, Journal: 12345, Tail: "later fields"}
+	h := Head{Seq: 9, Next: 77, Journal: 12345, Tail: tlv(70, "later fields")}
 	h.Root[3] = 5
 	got, err := unmarshalHead(h.marshal())
 	if err != nil || got != h {
@@ -249,13 +249,13 @@ func TestHeadNeeds(t *testing.T) {
 		if _, err := unmarshalHead(h.marshal()); !errors.Is(err, ErrNeeds) {
 			t.Fatalf("Needs bit %d: %v, want ErrNeeds", bit, err)
 		}
-		h.Tail = "x"
+		h.Tail = tlv(uint64(bit), "x")
 		if _, err := unmarshalHead(h.marshal()); !errors.Is(err, ErrNeeds) {
 			t.Fatalf("Needs bit %d with a tail: %v, want ErrNeeds", bit, err)
 		}
 	}
 	h := Head{Seq: 1, Next: 2}
-	for _, tail := range []string{"a", "\x00\x00", "any bytes at all \xff\xfe"} {
+	for _, tail := range []string{tlv(0, ""), tlv(1, "x"), tlv(3, "") + tlv(200, "any bytes \xff\xfe"), tlv(5, "a") + tlv(6, "b") + tlv(1<<62, "c")} {
 		h.Tail = tail
 		if got, err := unmarshalHead(h.marshal()); err != nil || got.Tail != tail {
 			t.Fatalf("tail %q: %+v %v", tail, got, err)

@@ -2,6 +2,7 @@ package vfs
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -29,9 +30,16 @@ const (
 	extReplace = 8
 )
 
+// reservedExt are the names of the features that the bits of Head.Needs reserve (5.1): a
+// feature keeps its objects under its own name, so no other use may take it.
+var reservedExt = map[string]bool{"snapshots": true, "links": true, "base": true}
+
 // validExtName reports whether name can name an extension: 1 to 32 bytes of "a" to "z",
-// "0" to "9" and "-".
+// "0" to "9" and "-", and not one reserved for a feature of the Head.
 func validExtName(name string) error {
+	if reservedExt[name] {
+		return fmt.Errorf("%w: the extension name %q is reserved for the feature of that name", fs.ErrInvalid, name)
+	}
 	if len(name) == 0 || len(name) > 32 {
 		return fmt.Errorf("%w: an extension name has 1 to 32 bytes, not %d", fs.ErrInvalid, len(name))
 	}
@@ -43,13 +51,22 @@ func validExtName(name string) error {
 	return nil
 }
 
-// extRest is the last segment of an extension object's key: the BLAKE3 hash of the
-// caller's key, in 64 lower case hex digits. Every key of an extension is then one
-// segment of one length, so none is a prefix of another and every store keeps it as
-// written.
-func extRest(key []byte) string {
-	sum := blake3.Sum256(key)
-	return hex.EncodeToString(sum[:])
+// extRest is the last segment of an extension object's key: 64 lower case hex digits of
+// the BLAKE3 hash, keyed from the Volume's Seed, of the extension's name, length-framed,
+// and the caller's key. The Seed is secret to the Volume, so the store, which sees every
+// name, cannot confirm a guess at a key by hashing it, and cannot tell that two Volumes
+// use one key; every other name it sees is the hash of sealed bytes or a random id. Every
+// key of an extension is one segment of one length, so none is a prefix of another and
+// every store keeps it as written. The name is framed by its length, so no split of a
+// string into name and key gives another's.
+func extRest(seed [32]byte, name string, key []byte) string {
+	var k [32]byte
+	blake3.DeriveKey("hanzoai/vfs extension names", seed[:], k[:])
+	h, _ := blake3.NewKeyed(k[:])
+	_, _ = h.Write(binary.AppendUvarint(nil, uint64(len(name))))
+	_, _ = h.WriteString(name)
+	_, _ = h.Write(key)
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // extObjectKey is the store key of an extension object.
@@ -62,6 +79,19 @@ func extAAD(id volumeID, name, rest string) []byte {
 	return bind("ext", id[:], []byte(name), []byte(rest))
 }
 
+// ExtKey is where the object that the extension name keeps under key is in the store, from
+// the prefix of the Volume: ext/<name>/<64 hex digits>, the digits of a hash keyed from
+// the Volume's Seed, so it is not the name of the same key in another Volume.
+func (v *Volume) ExtKey(name string, key []byte) (string, error) {
+	if err := validExtName(name); err != nil {
+		return "", err
+	}
+	v.mu.RLock()
+	seed := v.head.Seed
+	v.mu.RUnlock()
+	return extObjectKey(name, extRest(seed, name, key)), nil
+}
+
 // GetExt returns what the extension name stored under key. The error wraps fs.ErrNotExist
 // when nothing is stored there, and ErrCorrupt when the object does not open as this
 // Volume's.
@@ -69,7 +99,10 @@ func (v *Volume) GetExt(ctx context.Context, name string, key []byte) ([]byte, e
 	if err := validExtName(name); err != nil {
 		return nil, err
 	}
-	rest := extRest(key)
+	v.mu.RLock()
+	id, seed := v.id, v.head.Seed
+	v.mu.RUnlock()
+	rest := extRest(seed, name, key)
 	sealed, _, err := v.be.Get(ctx, extObjectKey(name, rest), maxExtSealed)
 	if err != nil {
 		if errors.Is(err, backend.ErrNotFound) {
@@ -77,9 +110,6 @@ func (v *Volume) GetExt(ctx context.Context, name string, key []byte) ([]byte, e
 		}
 		return nil, err
 	}
-	v.mu.RLock()
-	id := v.id
-	v.mu.RUnlock()
 	return unseal(v.c, extAAD(id, name, rest), sealed)
 }
 
@@ -95,12 +125,12 @@ func (v *Volume) PutExt(ctx context.Context, name string, key, data []byte) erro
 		return fmt.Errorf("%w: %d bytes in an extension object, at most %d", backend.ErrTooLarge, len(data), maxExt)
 	}
 	v.mu.RLock()
-	id, round := v.id, v.round
+	id, seed, round := v.id, v.head.Seed, v.round
 	v.mu.RUnlock()
 	if round == 0 {
 		return ErrReadOnly
 	}
-	rest := extRest(key)
+	rest := extRest(seed, name, key)
 	sealed, err := seal(v.c, extAAD(id, name, rest), data)
 	if err != nil {
 		return err
