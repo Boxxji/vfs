@@ -326,8 +326,8 @@ func behind(f File, seed uint32, expect uint64, off int64) (Range, error) {
 		if err != nil {
 			return Range{}, err
 		}
-		if _, ok := parseRecord(p, seed); ok && seq != expect {
-			last = seq
+		if _, ok := parseRecord(p, seed); ok {
+			last = seq // the record at expect is damaged, or the scan would not have stopped there
 		}
 		off += recordHeader + n
 	}
@@ -356,4 +356,29 @@ func reach(s *slot) (Range, error) {
 		return Range{s.first, next - 1}, nil
 	}
 	return Range{}, nil
+}
+
+// lastNamed follows the record headers of a segment without trusting any of
+// them: each one's length leads to the next, whose sequence is the previous plus
+// one. It returns the sequence the last of the chain names, or 0 for none. A
+// header torn on its way in has zeros behind it, or the records of an older life,
+// whose sequences stop short of the next one's; the chain ends where they do.
+func lastNamed(f File) (uint64, error) {
+	w := window{f: f}
+	off := int64(dataStart)
+	var last uint64
+	for {
+		b, err := w.view(off, recordHeader)
+		if err != nil {
+			return 0, err
+		}
+		if len(b) < recordHeader {
+			return last, nil
+		}
+		seq, n := binary.LittleEndian.Uint64(b[8:]), length(b)
+		if seq == 0 || (last != 0 && seq != last+1) || n > f.Size()-off-recordHeader {
+			return last, nil
+		}
+		last, off = seq, off+recordHeader+n
+	}
 }

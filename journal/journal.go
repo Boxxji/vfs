@@ -161,10 +161,9 @@ type Report struct {
 	Dropped []Range
 	// Warnings name risks of the directory's file system (a layered or remote
 	// one, where a sync may not reach the media), and every segment whose header
-	// is damaged and whose first record names a sequence above Published: its
-	// records could not be read, and if they were synced they are lost. A header
-	// torn on its way in or out raises none, since what is behind it is new, or
-	// was all published.
+	// is damaged and whose records reach a sequence above Published: they could
+	// not be read, and if they were synced they are lost. A header torn on its way
+	// in or out raises none, since what is behind it is new, or was all published.
 	Warnings []string
 }
 
@@ -214,7 +213,7 @@ type slot struct {
 	file  File
 	err   error
 
-	damagedSeq uint64 // its header fails its checksum: the sequence its first record names, 0 if none follows (see inventory)
+	damagedSeq uint64 // its header fails its checksum: the last sequence its records name, 0 if none (see inventory)
 
 	first uint64 // sequence of the first record; 0 until one is placed
 	last  uint64 // sequence of the last record placed

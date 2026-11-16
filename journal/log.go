@@ -1,7 +1,6 @@
 package journal
 
 import (
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"sort"
@@ -63,15 +62,11 @@ func inventory(disk Disk, want *lineage) (all, live []*slot, err error) {
 				// torn on its way in or a wipe torn on its way through, no record
 				// that the store lacks is behind it: the file is new, or its
 				// records are an older life's and were all published. What is
-				// behind it names the sequence of its first record in the clear,
-				// and a sequence the store does not hold is a record that is
-				// lost with the header: it is said.
-				rec := make([]byte, min(recordHeader, s.size-dataStart))
-				if _, err := f.ReadAt(rec, dataStart); err != nil {
+				// behind it names the sequence of each record in the clear, and a
+				// sequence the store does not hold is a record that is lost with the
+				// header: it is said.
+				if s.damagedSeq, err = lastNamed(f); err != nil {
 					return all, nil, err
-				}
-				if len(rec) >= 16 {
-					s.damagedSeq = binary.LittleEndian.Uint64(rec[8:])
 				}
 			}
 			continue
@@ -213,7 +208,7 @@ func (j *Journal) recover(published uint64) error {
 	}
 	for _, s := range all {
 		if s.damagedSeq > published {
-			j.report.Warnings = append(j.report.Warnings, fmt.Sprintf("%s (%d bytes): its header is damaged and its first record names sequence %d, which the store does not hold; its records could not be read", s.name, s.size, s.damagedSeq))
+			j.report.Warnings = append(j.report.Warnings, fmt.Sprintf("%s (%d bytes): its header is damaged and its records go as far as sequence %d, which the store does not hold; they could not be read", s.name, s.size, s.damagedSeq))
 		}
 	}
 	if n := len(chain); n > 0 {

@@ -289,3 +289,31 @@ func TestNoWarningInSectorGranularCrashStates(t *testing.T) {
 		}
 	}
 }
+
+// A segment that is only partly published holds records the store lacks: with its
+// header damaged they are lost, and the warning says so although its first record
+// is the store's. (Here the segment before it is wiped, and the one after it is
+// given up; the lost records 5 and 6 are in neither list.)
+func TestDamagedHeaderOfAPartlyPublishedSegmentIsReported(t *testing.T) {
+	d := closedJournal(t, 9)
+	j := open(t, small(d, newClock(), 0))
+	if err := j.Publish(4); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Reclaim(); err != nil { // the first segment goes; the second anchors the floor
+		t.Fatal(err)
+	}
+	closeWithin(t, j)
+	f, _ := d.Open("000001.seg")
+	b := make([]byte, 1)
+	f.ReadAt(b, 20)
+	b[0] ^= 1
+	f.WriteAt(b, 20) // the life of the segment of 4 to 6
+	forgetMarks(t, d)
+	j = open(t, small(d, newClock(), 4))
+	defer closeWithin(t, j)
+	w := j.Recovery().Warnings
+	if len(w) != 1 || !strings.Contains(w[0], "000001.seg") || !strings.Contains(w[0], "sequence 6") {
+		t.Fatalf("Warnings %q: want the segment of 4 to 6 named, with the 6 the store does not hold", w)
+	}
+}
