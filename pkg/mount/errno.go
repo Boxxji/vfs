@@ -10,6 +10,7 @@ import (
 	"os"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/hanzoai/vfs"
 )
@@ -73,19 +74,54 @@ func errno(err error) error {
 //
 // So every handler runs on a context its request cannot end (context.WithoutCancel),
 // and the work of a read runs on the mount's own context. A caller is always answered
-// with the result of its call.
+// with the result of its call. The exception is three calls that change nothing, a
+// lookup, a getattr and a readdir: an interrupt ends them after a grace (patient below).
 //
 // The cost is that a call waits for the store. There are no deadlines on the store yet,
-// so a store that stops answering stops every call that needs it, and killing a caller
-// does not free it: the kernel keeps a request that reached the daemon until the daemon
-// answers it, so read, stat, readdir, create, mkdir, unlink, truncate, write and fsync
-// stayed in state D after SIGKILL until the store answered (an interrupt honoured
-// with EINTR is what freed lookups and fsync before), while the daemon holds
-// every abandoned request: the FUSE library holds a message buffer of about 128 KiB for
-// each until its handler returns, whatever the handler does (3,000 stalled lookups held
-// 386 MB and 1,600 stalled reads 225 MB, and limiting what a read allocates itself did
-// not change that). Only answering the abandoned requests frees them, which is what a
-// deadline on the store does: it is the next change (docs/SPECIFICATION.md, section 11).
+// so a store that stops answering stops every call that needs it. The kernel keeps a
+// request that reached the daemon until the daemon answers it, and a killed caller is
+// freed only by an answer. Measured with the store stopped: a cold lookup (a store fetch,
+// no commit running) is freed 3 s after the kill, by the grace; anything behind a stalled
+// commit (stat, a lookup of an absent name, readdir, mkdir, unlink, truncate by path, fsync
+// of a read-only descriptor) is not, because the Volume's lock is held across the commit
+// and a lock does not honour a request's context; read, create, truncate, write and fsync
+// on a descriptor are not either, and nor are close and exit behind a stalled commit (the
+// exit closes the descriptor, which flushes, which waits for the commit). Killing the
+// daemon frees every caller in 20 ms. The daemon holds about 134 KiB of the FUSE library's
+// message buffer for each abandoned request until its handler returns, whatever the
+// handler does (1,600 reads, 1,600 more through the page cache and 3,000 lookups took it
+// from 16.8 MB to 831 MB). Only answering them frees them, which is what a deadline on the
+// store does, and the lock needs a context for that: the next change
+// (docs/SPECIFICATION.md, section 11.2).
+
+// interruptGrace is how long a request that changes nothing keeps waiting for the store
+// after its caller was interrupted, before it is answered EINTR.
+const interruptGrace = 3 * time.Second
+
+// patient returns the context a lookup, a getattr or a readdir runs on. Those three change
+// nothing, so answering one EINTR cannot leave a half-done change, and a caller that does
+// not restart it (a C caller of stat) loses only a call that waited longer than the grace
+// for the store: an interrupt ends the context only after interruptGrace. A caller that
+// was killed is then freed by the answer, where it would stay in the kernel until the
+// store answered. Anything that reads, writes or commits does not use this: its answer
+// is its own result (the comment above).
+func patient(req context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.WithoutCancel(req))
+	go func() {
+		select {
+		case <-req.Done():
+			t := time.NewTimer(interruptGrace)
+			defer t.Stop()
+			select {
+			case <-t.C:
+				cancel()
+			case <-ctx.Done():
+			}
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, cancel
+}
 
 // session is what every node and handle of one mount shares: the Volume, the mount's
 // own context, and the committer. It is built only by newSession, which refuses a

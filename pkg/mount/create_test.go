@@ -12,9 +12,8 @@ import (
 )
 
 // TestCreateOfAnExistingFileOpensIt: open(O_CREAT) of a file that exists opens it, and
-// only O_EXCL makes that an error. A kernel that does not look the name up first (a
-// sandbox's, or one whose lookup was interrupted and not repeated) asks for the
-// creation anyway.
+// only O_EXCL makes that an error. A kernel that does not look the name up first, or one
+// whose lookup was interrupted and not repeated, asks for the creation anyway.
 func TestCreateOfAnExistingFileOpensIt(t *testing.T) {
 	_, v, _, _ := testVolume(t)
 	bg := context.Background()

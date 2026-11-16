@@ -17,12 +17,14 @@
 package mount
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"os"
+	"os/exec"
 	"syscall"
 
 	"bazil.org/fuse"
@@ -32,7 +34,9 @@ import (
 )
 
 // Mount mounts vol at mountpoint and serves until ctx is cancelled or the kernel
-// unmounts it, then flushes the Volume. The caller owns vol and closes it.
+// unmounts it, then flushes the Volume. The caller owns vol and closes it. When ctx is
+// cancelled the mount commits, is unmounted, and if something holds it open is detached
+// after a few seconds, so that Mount returns within a bounded time (stop.go).
 func Mount(ctx context.Context, vol *vfs.Volume, mountpoint string) error {
 	if vol == nil {
 		return errors.New("mount: Volume required")
@@ -48,18 +52,41 @@ func Mount(ctx context.Context, vol *vfs.Volume, mountpoint string) error {
 	if err != nil {
 		return fmt.Errorf("fuse.Mount %q: %w", mountpoint, err)
 	}
-	defer conn.Close()
 
-	go func() {
-		<-ctx.Done()
-		_ = fuse.Unmount(mountpoint)
-	}()
-
+	// The mount's own context is not ctx: a read of a file still held open runs on it, and
+	// must go on while the end of the mount waits for its holders.
+	base, end := context.WithCancel(context.WithoutCancel(ctx))
+	defer end()
+	sess := newSession(base, vol)
+	served := make(chan error, 1)
+	go func() { served <- bzfs.New(conn, nil).Serve(&root{s: sess}) }()
 	var serveErr error
-	if err := bzfs.New(conn, nil).Serve(&root{s: newSession(ctx, vol)}); err != nil {
-		serveErr = fmt.Errorf("fuse.Serve: %w", err)
+	select {
+	case serveErr = <-served:
+		_ = conn.Close()
+	case <-ctx.Done():
+		var ended bool
+		serveErr, ended = sess.group.stop(mountpoint, fuse.Unmount, detach, served)
+		// A holder that outlived the grace keeps Serve reading, and closing the connection
+		// waits for that read: it is left to end with the process.
+		if ended {
+			_ = conn.Close()
+		}
+	}
+	if serveErr != nil {
+		serveErr = fmt.Errorf("fuse.Serve: %w", serveErr)
 	}
 	return finish(vol, serveErr)
+}
+
+// detach takes the mount off the directory now and lets what holds it finish: fusermount
+// -u -z. Nothing new can reach it, and the kernel drops the connection when the last
+// holder lets go.
+func detach(mountpoint string) error {
+	if out, err := exec.Command("fusermount3", "-u", "-z", mountpoint).CombinedOutput(); err != nil {
+		return fmt.Errorf("%w: %s", err, bytes.TrimSpace(out))
+	}
+	return nil
 }
 
 // root is the file system.
@@ -115,7 +142,8 @@ func attr(a *fuse.Attr, in vfs.Inode) {
 }
 
 func (n *node) Attr(ctx context.Context, a *fuse.Attr) error {
-	ctx = context.WithoutCancel(ctx) // no request is answered EINTR: see errno.go
+	ctx, done := patient(ctx)
+	defer done()
 	in, err := n.s.vol.Stat(ctx, n.ino)
 	if err != nil {
 		return errno(err)
@@ -125,7 +153,8 @@ func (n *node) Attr(ctx context.Context, a *fuse.Attr) error {
 }
 
 func (n *node) Lookup(ctx context.Context, name string) (bzfs.Node, error) {
-	ctx = context.WithoutCancel(ctx) // no request is answered EINTR: see errno.go
+	ctx, done := patient(ctx)
+	defer done()
 	in, err := n.s.vol.Lookup(ctx, n.ino, name)
 	if err != nil {
 		return nil, errno(err)
@@ -134,7 +163,8 @@ func (n *node) Lookup(ctx context.Context, name string) (bzfs.Node, error) {
 }
 
 func (n *node) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
-	ctx = context.WithoutCancel(ctx) // no request is answered EINTR: see errno.go
+	ctx, done := patient(ctx)
+	defer done()
 	ents, err := n.s.vol.ReadDir(ctx, n.ino)
 	if err != nil {
 		return nil, errno(err)
@@ -187,8 +217,8 @@ var errRemoved = errors.New("mount: the name was removed while it was being crea
 
 // create makes the file, or opens the one that exists: open(O_CREAT) of a file that
 // exists opens it, and only O_EXCL makes that an error. A kernel that does not look the
-// name up first (a sandbox's, or one whose lookup was interrupted and not repeated)
-// asks for the creation anyway.
+// name up first, or one whose lookup was interrupted and not repeated, asks for the
+// creation anyway.
 func (n *node) create(ctx context.Context, req *fuse.CreateRequest) (vfs.Inode, *vfs.File, error) {
 	in, err := n.s.vol.Create(ctx, n.ino, req.Name, req.Mode.Perm())
 	if errors.Is(err, fs.ErrExist) && req.Flags&fuse.OpenFlags(os.O_EXCL) == 0 {

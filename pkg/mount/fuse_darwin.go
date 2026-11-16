@@ -14,11 +14,13 @@
 package mount
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"sync"
 	"syscall"
 	"time"
@@ -39,7 +41,8 @@ func Mount(ctx context.Context, vol *vfs.Volume, mountpoint string) error {
 	if mountpoint == "" {
 		return errors.New("mount: mountpoint required")
 	}
-	mfs, err := fuse.Mount(mountpoint, fuseutil.NewFileSystemServer(newServer(vol)), &fuse.MountConfig{
+	srv := newServer(vol)
+	mfs, err := fuse.Mount(mountpoint, fuseutil.NewFileSystemServer(srv), &fuse.MountConfig{
 		FSName:                    "vfs",
 		Subtype:                   "hanzovfs",
 		ReadOnly:                  false,
@@ -50,11 +53,23 @@ func Mount(ctx context.Context, vol *vfs.Volume, mountpoint string) error {
 	if err != nil {
 		return fmt.Errorf("fuse.Mount %q: %w", mountpoint, err)
 	}
-	go func() {
-		<-ctx.Done()
-		_ = fuse.Unmount(mountpoint)
-	}()
-	return finish(vol, mfs.Join(context.Background()))
+	joined := make(chan error, 1)
+	go func() { joined <- mfs.Join(context.Background()) }()
+	var serveErr error
+	select {
+	case serveErr = <-joined:
+	case <-ctx.Done():
+		serveErr, _ = srv.group.stop(mountpoint, fuse.Unmount, detach, joined)
+	}
+	return finish(vol, serveErr)
+}
+
+// detach takes the mount off the directory by force, so that what holds it open sees it go.
+func detach(mountpoint string) error {
+	if out, err := exec.Command("umount", "-f", mountpoint).CombinedOutput(); err != nil {
+		return fmt.Errorf("%w: %s", err, bytes.TrimSpace(out))
+	}
+	return nil
 }
 
 // server maps FUSE inode numbers straight onto Volume inodes; both start the
@@ -90,7 +105,8 @@ func entry(in vfs.Inode) fuseops.ChildInodeEntry {
 }
 
 func (s *server) LookUpInode(ctx context.Context, op *fuseops.LookUpInodeOp) error {
-	ctx = context.WithoutCancel(ctx) // no request is answered EINTR: see errno.go
+	ctx, done := patient(ctx)
+	defer done()
 	in, err := s.vol.Lookup(ctx, vfs.InodeID(op.Parent), op.Name)
 	if err != nil {
 		return errno(err)
@@ -100,7 +116,8 @@ func (s *server) LookUpInode(ctx context.Context, op *fuseops.LookUpInodeOp) err
 }
 
 func (s *server) GetInodeAttributes(ctx context.Context, op *fuseops.GetInodeAttributesOp) error {
-	ctx = context.WithoutCancel(ctx) // no request is answered EINTR: see errno.go
+	ctx, done := patient(ctx)
+	defer done()
 	in, err := s.vol.Stat(ctx, vfs.InodeID(op.Inode))
 	if err != nil {
 		return errno(err)
@@ -197,7 +214,8 @@ func (s *server) OpenDir(_ context.Context, op *fuseops.OpenDirOp) error {
 }
 
 func (s *server) ReadDir(ctx context.Context, op *fuseops.ReadDirOp) error {
-	ctx = context.WithoutCancel(ctx) // no request is answered EINTR: see errno.go
+	ctx, done := patient(ctx)
+	defer done()
 	ents, err := s.vol.ReadDir(ctx, vfs.InodeID(op.Inode))
 	if err != nil {
 		return errno(err)
@@ -266,7 +284,6 @@ func (s *server) WriteFile(ctx context.Context, op *fuseops.WriteFileOp) error {
 // A commit is not abandoned halfway because the kernel interrupted the call: it is
 // repeatable and safe to finish, so it runs to its end.
 func (s *server) SyncFile(ctx context.Context, _ *fuseops.SyncFileOp) error {
-	ctx = context.WithoutCancel(ctx) // no request is answered EINTR: see errno.go
 	return errno(s.group.commit())
 }
 

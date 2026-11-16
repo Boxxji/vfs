@@ -57,48 +57,63 @@ func TestNodesAreBuiltOnlyByTheirConstructors(t *testing.T) {
 }
 
 // TestEveryHandlerOutlivesItsRequest: no request is answered EINTR, so no handler (an
-// exported method the FUSE library calls) may run on its request's context: each that
-// uses its ctx first replaces it with one the request cannot end. What a handler calls
-// is passed that context.
+// exported method the FUSE library calls) may run on its request's context: each that uses
+// its ctx first replaces it with one the request cannot end, and what a handler calls is
+// passed that context. Exactly three do it with patient, which ends the context three seconds
+// after an interrupt: the ones that change nothing and are only read, a lookup, a getattr
+// and a readdir. A read, a write, a commit or a close is never one of them.
 func TestEveryHandlerOutlivesItsRequest(t *testing.T) {
-	fset := token.NewFileSet()
-	f := parse(t, fset, "fuse_unix.go")
-	handlers := 0
-	for _, d := range f.Decls {
-		fn, ok := d.(*ast.FuncDecl)
-		if !ok || fn.Recv == nil || !fn.Name.IsExported() || len(fn.Type.Params.List) == 0 {
-			continue
-		}
-		first := fn.Type.Params.List[0]
-		if len(first.Names) == 0 || first.Names[0].Name != "ctx" {
-			continue
-		}
-		handlers++
-		detached, uses := false, false
-		ast.Inspect(fn.Body, func(n ast.Node) bool {
-			switch n := n.(type) {
-			case *ast.AssignStmt:
-				if len(n.Lhs) == 1 && len(n.Rhs) == 1 {
-					if l, ok := n.Lhs[0].(*ast.Ident); ok && l.Name == "ctx" {
+	patientOK := map[string]bool{"Attr": true, "Lookup": true, "ReadDirAll": true}
+	for _, file := range []string{"fuse_unix.go"} {
+		fset := token.NewFileSet()
+		f := parse(t, fset, file)
+		handlers := 0
+		for _, d := range f.Decls {
+			fn, ok := d.(*ast.FuncDecl)
+			if !ok || fn.Recv == nil || !fn.Name.IsExported() || len(fn.Type.Params.List) == 0 {
+				continue
+			}
+			first := fn.Type.Params.List[0]
+			if len(first.Names) == 0 || first.Names[0].Name != "ctx" {
+				continue
+			}
+			handlers++
+			detached, patient, uses := false, false, false
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				switch n := n.(type) {
+				case *ast.AssignStmt:
+					if len(n.Rhs) == 1 {
 						if call, ok := n.Rhs[0].(*ast.CallExpr); ok {
-							if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "WithoutCancel" {
-								detached = true
+							switch fun := call.Fun.(type) {
+							case *ast.SelectorExpr:
+								if l, ok := n.Lhs[0].(*ast.Ident); ok && l.Name == "ctx" && fun.Sel.Name == "WithoutCancel" {
+									detached = true
+								}
+							case *ast.Ident:
+								if l, ok := n.Lhs[0].(*ast.Ident); ok && l.Name == "ctx" && fun.Name == "patient" {
+									patient = true
+								}
 							}
 						}
 					}
+				case *ast.Ident:
+					if n.Name == "ctx" {
+						uses = true
+					}
 				}
-			case *ast.Ident:
-				if n.Name == "ctx" {
-					uses = true
-				}
+				return true
+			})
+			switch {
+			case patient && !patientOK[fn.Name.Name]:
+				t.Errorf("%s: %s waits for the store with patient: only Attr, Lookup and ReadDirAll may", fset.Position(fn.Pos()), fn.Name.Name)
+			case uses && !detached && !patient:
+				t.Errorf("%s: %s uses its request's context; a request is never answered EINTR, so it must run on context.WithoutCancel(ctx)", fset.Position(fn.Pos()), fn.Name.Name)
+			case patientOK[fn.Name.Name] && !patient:
+				t.Errorf("%s: %s is read-only and waits for the store: it takes patient, so that a killed caller is freed", fset.Position(fn.Pos()), fn.Name.Name)
 			}
-			return true
-		})
-		if uses && !detached {
-			t.Errorf("%s: %s uses its request's context; a request is never answered EINTR, so it must run on context.WithoutCancel(ctx)", fset.Position(fn.Pos()), fn.Name.Name)
 		}
-	}
-	if handlers < 10 {
-		t.Fatalf("found only %d handlers: the check looks at the wrong thing", handlers)
+		if handlers < 10 {
+			t.Fatalf("found only %d handlers in %s: the check looks at the wrong thing", handlers, file)
+		}
 	}
 }

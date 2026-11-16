@@ -687,3 +687,41 @@ func TestFUSEFsyncSurvivesKill(t *testing.T) {
 		}
 	}
 }
+
+// TestFUSETermStopsAMountInUse: SIGTERM commits what the mount holds, asks for the unmount,
+// and when a process still has a file open on the mount (the unmount is refused as busy)
+// detaches it after a few seconds and ends, instead of staying mounted and alive for ever. A
+// write that was never synced or closed is in the store, and the directory is free.
+func TestFUSETermStopsAMountInUse(t *testing.T) {
+	needFUSE(t)
+	store, mp := newMountpoint(t)
+	key, _ := age.GenerateHybridIdentity()
+	m := mountAt(t, store, mp, key, 1)
+	f, err := os.OpenFile(filepath.Join(mp, "held"), os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	want := rnd(7, 123_457)
+	if _, err := f.Write(want); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	_ = m.Cmd.Process.Signal(syscall.SIGTERM)
+	select {
+	case err := <-m.Done:
+		if err != nil {
+			t.Errorf("the server exited with %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("SIGTERM did not end a mount that a file is open on")
+	}
+	t.Logf("a mount with an open file ended %v after SIGTERM", time.Since(start).Round(100*time.Millisecond))
+	if out, _ := os.ReadFile("/proc/self/mountinfo"); bytes.Contains(out, []byte(" "+mp+" ")) {
+		t.Error("the directory is still a mount point")
+	}
+	got, err := storeBytes(t, storeView(t, store, key), "/held")
+	if err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("a file written and never synced is not in the store after SIGTERM: %d bytes of %d, %v", len(got), len(want), err)
+	}
+}

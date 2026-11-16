@@ -61,8 +61,7 @@ func (s *signaler) close() { s.stop.Store(true); s.wg.Wait() }
 
 // restart runs a system call again while it answers EINTR, as every C library and
 // the Go runtime do for every call but close; it counts how many times the caller
-// really saw EINTR. (A sandboxed kernel, where this runs in CI, hands a lookup the
-// server abandoned to the caller as EINTR; a Linux kernel restarts it itself.)
+// really saw EINTR, which a mount that answers no request EINTR never shows.
 func restart(eintr *atomic.Int64, call func() error) error {
 	for {
 		err := call()
@@ -74,12 +73,15 @@ func restart(eintr *atomic.Int64, call func() error) error {
 	}
 }
 
-// How much work the signal test does, and how long it may take. The work is bounded
-// by count and by the clock, whichever comes first, so it is fast on a disk that is
-// busy and on a sandbox whose system calls are slow; what it must have done by then
-// is the least that says anything (hundreds of interrupted calls of each kind).
+// How much work the signal test does, and how long it may take. The work is bounded by
+// count, and by the clock once it has done the least that says anything (hundreds of
+// interrupted calls of each kind): a host that is loaded runs it longer and does not
+// fail it for being slow. The test fails for a call that failed, and for nothing that
+// takes only time; the hard cap is there so that a mount that hangs is a failure and not a
+// wait.
 const (
-	signalPhase     = 45 * time.Second // the most each of the two phases may take
+	signalPhase     = 45 * time.Second // after this, a phase ends as soon as it has done its least
+	signalHard      = 6 * time.Minute  // the most a phase may take
 	signalMinFsyncs = 300
 	signalMinBytes  = 512 << 20
 )
@@ -115,7 +117,7 @@ func TestFUSEInterruptsAreNotErrors(t *testing.T) {
 			defer wg.Done()
 			sig.work(w, func() {
 				for i := range fsyncs / 2 {
-					if time.Since(start) > signalPhase {
+					if took := time.Since(start); took > signalHard || took > signalPhase && synced.Load() >= signalMinFsyncs {
 						return
 					}
 					path := filepath.Join(mp, fmt.Sprintf("s%d-%05d", w, i))
@@ -136,10 +138,10 @@ func TestFUSEInterruptsAreNotErrors(t *testing.T) {
 						t.Errorf("fsync %d: %v", i, err)
 					}
 					// close is not restarted, and a Linux kernel waits for the mount's answer to
-					// it however many signals arrive. A sandboxed kernel (the CI runner's) ends
-					// the wait itself and returns EINTR from close: the server's commit goes on
-					// and the file is fsynced, so the caller loses nothing, and it is not a
-					// fault of the mount. Any other error is.
+					// it however many signals arrive. A kernel that ends the wait itself and
+					// returns EINTR from close leaves the commit going on and the file fsynced, so
+					// the caller loses nothing and it is not a fault of the mount. Any other error
+					// is.
 					if err := syscall.Close(fd); err != nil && err != syscall.EINTR {
 						bad.Add(1)
 						t.Errorf("close %d: %v", i, err)
@@ -158,7 +160,7 @@ func TestFUSEInterruptsAreNotErrors(t *testing.T) {
 		t.FailNow()
 	}
 	if synced.Load() < signalMinFsyncs {
-		t.Fatalf("only %d fsyncs in %v: too few to say that signals do no harm", synced.Load(), signalPhase)
+		t.Fatalf("only %d fsyncs in %v: the mount hangs, or is too slow to say that signals do no harm", synced.Load(), signalHard)
 	}
 
 	// What was acknowledged is in the store, read from outside the mount.
@@ -208,7 +210,7 @@ func TestFUSEInterruptsAreNotErrors(t *testing.T) {
 				buf := make([]byte, block)
 				for p := range passes / 2 {
 					for b := range blocks {
-						if time.Since(start) > signalPhase {
+						if took := time.Since(start); took > signalHard || took > signalPhase && read.Load() >= signalMinBytes {
 							return
 						}
 						off := int64(b) * block
@@ -244,7 +246,7 @@ func TestFUSEInterruptsAreNotErrors(t *testing.T) {
 		t.FailNow()
 	}
 	if read.Load() < signalMinBytes {
-		t.Fatalf("only %d MiB read in %v: too little to say that signals do no harm", read.Load()>>20, signalPhase)
+		t.Fatalf("only %d MiB read in %v: the mount hangs, or is too slow to say that signals do no harm", read.Load()>>20, signalHard)
 	}
 	sig.close()
 	m.Stop(t)

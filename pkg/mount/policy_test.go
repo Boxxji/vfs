@@ -30,7 +30,10 @@ type holdsMeta struct {
 func (h *holdsMeta) Get(ctx context.Context, key string, max int64) ([]byte, backend.Version, error) {
 	if h.armed.Load() && len(key) > 5 && key[:5] == "meta/" && h.once.CompareAndSwap(false, true) {
 		close(h.reached)
-		<-h.release
+		select {
+		case <-h.release:
+		case <-ctx.Done(): // a store client gives up when its request's context ends
+		}
 		if err := ctx.Err(); err != nil {
 			return nil, "", err
 		}
@@ -162,5 +165,52 @@ func TestCreateIsNotAnsweredEINTR(t *testing.T) {
 	})
 	if err != nil {
 		t.Errorf("Create interrupted mid-read = %v, want its own result", err)
+	}
+}
+
+// A caller that was killed while its lookup waits for the store is freed: the kernel keeps a
+// request that reached the daemon until the daemon answers it, so a lookup, a getattr or a
+// readdir that changes nothing is answered EINTR when the store has not answered within the
+// grace of its interrupt. Not before it: one the store answers within the grace is answered
+// by its own result (TestLookupIsNotAnsweredEINTR).
+func TestKilledColdLookupIsFreedAfterTheGrace(t *testing.T) {
+	for name, call := range map[string]func(context.Context, *node) error{
+		"Lookup":     func(ctx context.Context, n *node) error { _, err := n.Lookup(ctx, "b"); return err },
+		"Attr":       func(ctx context.Context, n *node) error { var a fuse.Attr; return n.Attr(ctx, &a) },
+		"ReadDirAll": func(ctx context.Context, n *node) error { _, err := n.ReadDirAll(ctx); return err },
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			h, v := coldWriter(t)
+			n := newSession(context.Background(), v).node(vfs.RootInode, vfs.RootInode)
+			h.armed.Store(true)
+			req, kill := context.WithCancel(context.Background())
+			res := make(chan error, 1)
+			go func() { res <- call(req, n) }()
+			select {
+			case <-h.reached:
+			case <-time.After(20 * time.Second):
+				t.Fatal("the call never reached the store")
+			}
+			start := time.Now()
+			kill()
+			select {
+			case err := <-res:
+				t.Fatalf("answered %v after %v, before the grace", err, time.Since(start))
+			case <-time.After(interruptGrace - 700*time.Millisecond):
+			}
+			select {
+			case err := <-res:
+				if err != syscall.EINTR {
+					t.Fatalf("answered %v, want EINTR", err)
+				}
+				if took := time.Since(start); took < interruptGrace-time.Second {
+					t.Fatalf("answered after %v, before the grace", took)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("still waiting for the store after the grace: a killed caller is not freed")
+			}
+			close(h.release)
+		})
 	}
 }
