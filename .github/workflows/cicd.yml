@@ -2,10 +2,8 @@
 # each as a job of its own (`gates:`), so they run in parallel and none runs five
 # minutes. The last entry takes every gate the others do not name (`!`), so a gate
 # added to hanzo.yml is run by default. (Seven separate calls of the reusable
-# workflow in one file are refused at startup; a matrix of calls is not.) Runs on
-# the git-runner fleet at git.hanzo.ai, the only pool serving these labels.
-# github.com resolves only .github/workflows and has no runner for them, so a
-# caller placed there is a gate that cannot be scheduled.
+# workflow in one file are refused at startup; a matrix of calls is not.) The caller
+# sits at .github/workflows, which is where the platform resolves it.
 name: CI/CD
 on:
   push:
@@ -17,7 +15,7 @@ jobs:
   gate:
     strategy:
       fail-fast: false
-      max-parallel: 3 # the runners share a node: more at once only makes each slower, and the first three are the slowest
+      max-parallel: 3 # the gates share the machine: more at once only makes each slower
       matrix:
         gates:
           - 'realserver'
@@ -26,11 +24,12 @@ jobs:
           - 'unit'
           - 'race'
           - 'model'
+          - 'sparse'
           - 'sqlite'
           - 'scale-a'
           - 'scale-b'
           - 'scale-c'
-          - '!realserver,realserver-kill,check,unit,race,model,sqlite,scale-a,scale-b,scale-c'
+          - '!realserver,realserver-kill,check,unit,race,model,sparse,sqlite,scale-a,scale-b,scale-c'
     uses: hanzoai/ci/.github/workflows/build.yml@v2
     with:
       gates: ${{ matrix.gates }}

@@ -348,7 +348,7 @@ func TestSparseCanonicalRuns(t *testing.T) {
 		n = 3
 	}
 	for seed := range n {
-		t.Run(fmt.Sprint("canon", seed), func(t *testing.T) { runsRun(t, uint64(seed), true) })
+		t.Run(fmt.Sprint("canon", seed), func(t *testing.T) { t.Parallel(); runsRun(t, uint64(seed), true) })
 	}
 }
 
@@ -358,7 +358,7 @@ func TestSparseTinyBounds(t *testing.T) {
 		n = 3
 	}
 	for seed := range n {
-		t.Run(fmt.Sprint("tiny", seed), func(t *testing.T) { runsRun(t, uint64(1000+seed), false) })
+		t.Run(fmt.Sprint("tiny", seed), func(t *testing.T) { t.Parallel(); runsRun(t, uint64(1000+seed), false) })
 	}
 }
 

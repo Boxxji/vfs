@@ -2,7 +2,7 @@
 
 ## Reporting a vulnerability
 
-Email security@hanzo.ai with details. Encrypt with our PGP key (fingerprint TBD).
+Email security@hanzo.ai with details.
 
 We respond within 48 hours. Critical issues receive same-day acknowledgment.
 

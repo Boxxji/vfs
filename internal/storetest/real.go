@@ -10,8 +10,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -77,6 +79,19 @@ func StopReal() {
 	_ = os.RemoveAll(real.dir)
 }
 
+// outlive stops the server when this process ends however it ends: a test binary killed
+// by a timeout or a signal runs no cleanup, and the server it started would run on. A
+// watcher in a session of its own notices that the process is gone and kills the
+// server. It is best effort: without a shell there is no watcher, and StopReal is all.
+func outlive(server int) {
+	const watch = `while kill -0 "$1" 2>/dev/null; do sleep 1; done; kill -9 "$2" 2>/dev/null`
+	w := exec.Command("sh", "-c", watch, "watch", strconv.Itoa(os.Getpid()), strconv.Itoa(server))
+	w.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if w.Start() == nil {
+		go func() { _ = w.Wait() }()
+	}
+}
+
 func randHex(n int) string {
 	b := make([]byte, n)
 	_, _ = rand.Read(b)
@@ -140,6 +155,7 @@ func startReal(bin string) (*Real, error) {
 	if err := r.cmd.Start(); err != nil {
 		return nil, err
 	}
+	outlive(r.cmd.Process.Pid)
 
 	cli, err := hs3.New(r.Endpoint, &hs3.Options{Creds: credentials.NewStaticV4(r.AccessKey, r.SecretKey, ""), Region: "us-east-1"})
 	if err != nil {

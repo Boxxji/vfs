@@ -248,11 +248,6 @@ func TestSigkill(t *testing.T) {
 	}{
 		{"pack", one}, {"packed", one}, {"shard", one}, {"sharded", one}, {"head", one}, {"landed", two},
 	} {
-		// Under -short the three stages that differ in kind: before anything, the Head
-		// not yet written, and the Head written. The rest run without it.
-		if testing.Short() && (tc.stage == "packed" || tc.stage == "shard" || tc.stage == "sharded") {
-			continue
-		}
 		t.Run(tc.stage, func(t *testing.T) {
 			dir := t.TempDir()
 			key := newKey(t)

@@ -14,6 +14,7 @@
 #   model            the tests that run random operations against a plain model, in
 #                    -short size: no goroutines, so no race detector, which would
 #                    multiply the hashing and sealing they do tenfold
+#   sparse           the randomised tests of holes at full size (not -short)
 #   sqlite           the packages that run a real SQLite engine on a Volume
 #   realserver       the engine, its store client and the fence against a real Hanzo S3 server
 #   realserver-kill  a writer killed at random moments, against the real server
@@ -26,16 +27,15 @@
 # v1.0.41, pinned by digest (tools/ci/s3server.sh); tests find it as `s3` on PATH, and
 # there is no environment switch.
 #
-# The tests on a kernel mount are not gates here. The runner's kernel is a sandbox
-# (gVisor) whose FUSE is not Linux's: its user can mount only inside a user namespace,
-# where tools/fusemount stands in for the setuid helper (tools/ci/mount.sh), and
-# there the mount works but answers differently (truncate is refused, chmod is EPERM
-# and not ENOSYS, close is interrupted by the kernel, and an unmount does not end
-# the server), so a test of what Linux does would test the sandbox. They run on a
-# Linux kernel: `go test -tags fuse ./pkg/mount ./internal/sqlitecheck`, or
-# tools/ci/mount.sh where there is no fusermount3. What the mount does that needs no
-# kernel (the commits, the interrupts, the context every read runs on) is tested by
-# calling its handlers, in the `race` gate.
+# The tests on a kernel mount are not gates here. They assert what Linux's FUSE does
+# (a close is not interrupted by the kernel, truncate and chmod answer as Linux's do,
+# an unmount ends the server), and need /dev/fuse and a fusermount3 that mounts for an
+# unprivileged user, or a user namespace with tools/fusemount in its place
+# (tools/ci/mount.sh). On a runner whose kernel answers FUSE differently they would test
+# that kernel. They run on a Linux host: `go test -tags fuse ./pkg/mount
+# ./internal/sqlitecheck`. What the mount does that needs no kernel (the commits, the
+# interrupts, the context every read runs on) is tested by calling its handlers, in the
+# `race` gate.
 test:
   - name: realserver
     run: |
@@ -70,6 +70,7 @@ test:
       go build $pkgs
       go vet $pkgs
       go vet -tags fuse ./pkg/mount ./internal/mounttest
+      GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build . ./cmd/... ./pkg/... ./tools/...
       GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go vet -tags fuse ./pkg/mount
       test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
   - name: unit
@@ -79,9 +80,11 @@ test:
       set -euo pipefail
       go test -race -short -count=1 ./pkg/...
       go test -race -short -count=1 -run '^Test(ConcurrentWorkers|NoGoroutineLeak|SameRoundRace|RacingClaims|TakeoverLosesNoAcknowledgedCommit|FenceRefusesOlderRound|AttachNeedsAHigherRound|AttachLostAckIsNotStale|StalledCommitHonoursItsDeadline|DeposedWriterIsToldAtItsNextCommit|LostAckNoLostUpdateNoDuplicate|LostAckThenTakeoverIsNotReportedLost|VolumeOnEveryStore)$' .
-      go test -race -tags fuse -short -count=1 -run '^Test(InterruptIsEINTR|CommitSurvivesItsCaller|CloseWaitsForItsCommit|ReadWaitsForItsData|InterruptedFsyncRetriesDoNotPileUp|SessionRefusesANilContext|LookedUpFileReadsOnTheMountContext|CreateOfAnExistingFileOpensIt)$' ./pkg/mount
+      go test -race -tags fuse -short -count=1 -run '^Test(InterruptIsEINTR|FsyncWaitsForItsCommit|CloseWaitsForItsCommit|ReadWaitsForItsData|FsyncCallersShareTwoCommits|StalledReadsHoldBoundedMemory|SessionRefusesANilContext|LookedUpFileReadsOnTheMountContext|CreateOfAnExistingFileOpensIt|LookupIsNotAnsweredEINTR|AttrIsNotAnsweredEINTR|ReaddirIsNotAnsweredEINTR|MkdirIsNotAnsweredEINTR|RemoveIsNotAnsweredEINTR|CreateIsNotAnsweredEINTR|NodesAreBuiltOnlyByTheirConstructors|EveryHandlerOutlivesItsRequest)$' ./pkg/mount
   - name: model
     run: go test -short -count=1 -run '^Test(Sparse|Model|TreeForced)' .
+  - name: sparse
+    run: go test -count=1 -timeout 4m -run '^TestSparse(Exact|Random|CanonicalRuns|TinyBounds)$' .
   - name: sqlite
     run: |
       set -euo pipefail
