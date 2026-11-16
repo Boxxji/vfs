@@ -105,7 +105,7 @@ test:
       set -euo pipefail
       go test -race -short -count=1 ./pkg/...
       go test -race -short -count=1 -run '^Test(ConcurrentWorkers|NoGoroutineLeak|SameRoundRace|RacingClaims|TakeoverLosesNoAcknowledgedCommit|FenceRefusesOlderRound|AttachNeedsAHigherRound|AttachLostAckIsNotStale|StalledCommitHonoursItsDeadline|DeposedWriterIsToldAtItsNextCommit|LostAckNoLostUpdateNoDuplicate|LostAckThenTakeoverIsNotReportedLost|VolumeOnEveryStore)$' .
-      go test -race -tags fuse -short -count=1 -run '^Test(InterruptIsEINTR|FsyncWaitsForItsCommit|CloseWaitsForItsCommit|ReadWaitsForItsData|FsyncCallersShareTwoCommits|SessionRefusesANilContext|LookedUpFileReadsOnTheMountContext|CreateOfAnExistingFileOpensIt|LookupIsNotAnsweredEINTR|AttrIsNotAnsweredEINTR|ReaddirIsNotAnsweredEINTR|MkdirIsNotAnsweredEINTR|RemoveIsNotAnsweredEINTR|CreateIsNotAnsweredEINTR|NodesAreBuiltOnlyByTheirConstructors|EveryHandlerOutlivesItsRequest)$' ./pkg/mount
+      go test -race -tags fuse -short -count=1 -run '^Test(InterruptIsEINTR|FsyncWaitsForItsCommit|CloseWaitsForItsCommit|ReadWaitsForItsData|FsyncCallersShareTwoCommits|SessionRefusesANilContext|LookedUpFileReadsOnTheMountContext|CreateOfAnExistingFileOpensIt|LookupIsNotAnsweredEINTR|AttrIsNotAnsweredEINTR|ReaddirIsNotAnsweredEINTR|MkdirIsNotAnsweredEINTR|RemoveIsNotAnsweredEINTR|CreateIsNotAnsweredEINTR|NodesAreBuiltOnlyByTheirConstructors|EveryHandlerOutlivesItsRequest|FinishCommitsWhatTheMountWrote|FinishReportsWhatWentWrong|FinishOfAReadOnlyVolumeCommitsNothing)$' ./pkg/mount
   - name: model
     run: go test -short -count=1 -run '^Test(Sparse|Model|TreeForced)' .
   - name: sparse

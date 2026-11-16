@@ -1129,5 +1129,14 @@
   "pkg": "./pkg/mount",
   "run": "^TestCreateOfAnExistingFileOpensIt$",
   "tags": "fuse"
+ },
+ {
+  "name": "mount: the end of a mount does not flush",
+  "file": "pkg/mount/errno.go",
+  "old": "if err := vol.Flush(context.Background()); err != nil && serveErr == nil {",
+  "new": "if err := error(nil); err != nil && serveErr == nil {",
+  "pkg": "./pkg/mount",
+  "run": "^TestFinish",
+  "tags": "fuse"
  }
 ]
