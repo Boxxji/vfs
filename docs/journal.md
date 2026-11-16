@@ -17,25 +17,39 @@ admits them, with no gaps. A record moves through three watermarks.
 | Watermark | Means | Reached by |
 |---|---|---|
 | `Visible` | the record exists; Replay in this run returns it | `Append` returning |
-| `Durable` | the record is on the local disk's media, or in the store | `Sync(seq)` returning |
+| `Durable` | the record is on the local disk's media | `Sync(seq)` returning |
 | `Published` | the store holds the record | `Publish(seq)` |
 
-`Published <= Durable <= Visible`, and each only moves forward. `Durable` is the
-larger of what a completed disk sync covered and what is published: a record the
-store holds needs no local sync to be safe.
+`Published <= Durable <= Visible`, and each only moves forward. The publisher may
+only publish what is durable: `Publish` refuses a sequence no local sync has
+covered. The store therefore never holds a record the journal's disk could still
+lose, and the sequence the store reports is a fact `Open` can rely on.
 
 | Call | Guarantees |
 |---|---|
-| `Open(dir, Options)` | Recovers the longest valid prefix of the log (see [Crash outcomes](#crash-outcomes)), makes it durable, discards everything after the first damaged byte, and starts a fresh segment for new records. `Options.Published` is the highest sequence the store holds (the Head's journal sequence, 0 for a store with none). It is the truth: records at or below it are not replayed, numbering continues after it even if the disk lost the tail, and a log that does not begin at or before `Published + 1` is missing the records in between and is discarded. |
-| `Append(ctx, p) (seq, err)` | The record is **visible** when it returns, in order, with `seq = previous + 1`. It is **not durable**. Near capacity it slows; at capacity it returns `ErrFull` and changes nothing. A payload larger than a segment gives `ErrTooLarge`. |
+| `Open(dir, Options)` | Takes an exclusive lock on the directory (`ErrLocked`), refuses a directory on memory (`ErrVolatile`), recovers the longest valid prefix of the log, makes it durable, and starts a fresh segment for new records. `Options.Published` is the highest sequence the store holds (the Head's journal sequence, 0 for a store with none): it is the truth, and Open **refuses**, and writes nothing, when it does not fit: `ErrMismatch` (the store is behind what the journal reclaimed, behind its first record, or ahead of its last), `ErrLineage` (the directory belongs to another identity), `ErrCorrupt` (records that were made durable are gone or damaged). See [Recovery](#recovery). |
+| `Recovery()` | What Open kept (`First`..`Last`), what a surviving mark proves was durable (`Proven`), the intact segments it dropped because they follow a gap (`Dropped`), and warnings about the file system. Nothing Open discards is silent. |
+| `Discard(dir, Options, first, last)` | The only way to give records up. It removes the journal's records if and only if they are exactly `first` through `last`, and returns `ErrRange`, changing nothing, otherwise. It does not check the lineage: it exists to remove what `Open` refused. |
+| `Append(ctx, p) (seq, err)` | The record is **visible** when it returns, in order, with `seq = previous + 1`. It is **not durable**. Near capacity it slows; at capacity, or when no segment file can be made, it returns `ErrFull` and changes nothing. A payload larger than a segment less 76 bytes gives `ErrTooLarge`. |
 | `Sync(ctx, seq)` | Returns `nil` only when record `seq` and every record before it are durable. Concurrent calls share one fsync. A call is released only by an fsync that **began after** its record was written; an fsync already in flight never releases it. After a failed write or sync it returns the error for anything not yet durable, forever. |
 | `Marks()` | The three watermarks. |
-| `Publish(seq)` | Records that the store holds `seq` and everything before it. Monotonic (a lower value is ignored); `seq` must have been appended. Releases `Sync` calls it satisfies and moves the `Due` deadline to the next unpublished record. Does no I/O. |
+| `Publish(seq)` | Records that the store holds `seq` and everything before it. Monotonic (a lower value is ignored). `seq` must be durable: otherwise `ErrAhead` and nothing changes. Moves the `Due` deadline to the next unpublished record. Does no I/O. |
 | `Replay(fn)` | Calls `fn` for every record after `Published`, in order, with no gaps, then returns. It changes nothing: replaying twice yields the same records. Records of the current run are included. It blocks `Reclaim` while it runs. |
 | `Reclaim()` | Makes the space of fully published segments available again. Does file I/O, so the publisher calls it after `Publish`, off the path of `Append` and `Sync`. Never touches an unpublished record or the tail segment. |
-| `State()` | `Backlog` (bytes acknowledged and unpublished), `Age` (how long the oldest unpublished record has been acknowledged; later writes never reset it), `Degraded`, and the `Err` that stopped the journal, if any. |
-| `Due(age)` | A channel closed when the oldest unpublished record has been acknowledged for `age`. One timer set for the exact deadline; no polling. See below. |
-| `Close()` | Makes everything appended durable, then stops. |
+| `State()` | `Backlog` (bytes acknowledged and unpublished), `Age` (how long the oldest unpublished record has been acknowledged; later writes never reset it, and a restart never lengthens it), `Degraded`, and the `Err` that stopped the journal, if any. |
+| `Due(ctx, age)` | A channel closed when the oldest unpublished record has been acknowledged for `age`. One timer set for the exact deadline; no polling. Cancelling `ctx` releases it. Two firings are at least `Options.Retry` apart. It also closes when the journal closes or fails. See below. |
+| `Close()` | Makes everything appended durable, writes the final mark, releases the directory, then stops. |
+
+### Lineage
+
+Sequence numbers mean something only inside one history of a volume. A node that
+lost a takeover still holds acknowledged, unpublished records 9 and 10 of its
+own; the new owner's Head says 8. `Options.Lineage` is an opaque identity the
+caller supplies (a volume and its fencing round). It is written into every
+segment header and mixed into every record and mark checksum. `Open` refuses a
+directory whose segments carry another identity, so the old owner's records are
+never replayed over a newer Head; the operator gives them up with `Discard`, or
+keeps them for forensics.
 
 ### Generation ordering
 
@@ -49,26 +63,40 @@ while the previous one is being synced.
 
 ### The 5 s bound is per record
 
-`Due(age)` fires when the oldest unpublished record, measured from **its own**
-acknowledgement, is `age` old. It is never reset by later writes. When `Publish`
-retires the oldest record the deadline moves to the next one; with nothing
-unpublished there is no timer, and the deadline starts with the next `Append`.
-The publisher loop is
+`Due(ctx, age)` fires when the oldest unpublished record, measured from **its
+own** acknowledgement, is `age` old. It is never reset by later writes. When
+`Publish` retires the oldest record the deadline moves to the next one; with
+nothing unpublished there is no timer, and the deadline starts with the next
+`Append`. The publisher loop is
 
 ```go
 for {
-    <-j.Due(bound - margin)        // or earlier: dirty bytes, Flush, Detach
-    seq := <the generation the publisher is about to commit>
+    c, cancel := context.WithCancel(ctx)
+    select {
+    case <-j.Due(c, bound-margin):   // the deadline
+    case <-dirtyBytesOrFlush:        // an earlier trigger
+    }
+    cancel()                         // releases the timer if Due did not fire
+    seq := <the durable generation the publisher is about to commit>
     commit the Head containing seq
     j.Publish(seq)
     j.Reclaim()
 }
 ```
 
-Acknowledgement times come from the injected `Clock`, so tests drive the bound
-with a clock they control. Times are kept to a millisecond: records acknowledged
-within a millisecond of each other share a deadline, which can make `Due` fire up
-to a millisecond early, never late.
+If the commit fails, the next `Due` for the same overdue record fires `Retry`
+(default 100 ms) after the last firing, not at once, so the loop backs off
+without a sleep of its own. `Due` closes when the journal fails, so the publisher
+learns of it at once.
+
+Acknowledgement times come from the injected `Clock`. In the process they are
+read from the clock's monotonic reading, so a step of the wall clock does not
+change an age. On disk they are wall-clock nanoseconds, because that is all that
+survives a restart; a restarted journal clamps a record that appears to be from
+the future (the clock is behind what it was) to the time of the restart, so a
+restart can shorten the time a record has left but never lengthen it. Times are
+kept to a millisecond: records acknowledged within a millisecond of each other
+share a deadline, which can make `Due` fire up to a millisecond early, never late.
 
 ### Backpressure and the degraded state
 
@@ -80,7 +108,8 @@ NVMe budget. Disk use never exceeds it.
   unrestricted to 64 MiB/s, so the writers settle where their rate matches the
   drain. The delay is a timer wait; it ends early if the caller's context does.
 * At 100 % `Append` returns `ErrFull`. Nothing was appended and nothing is
-  dropped. The caller maps it to `ENOSPC`/`EAGAIN`.
+  dropped. The caller maps it to `ENOSPC`/`EAGAIN`. A segment file that cannot be
+  made (the disk is full) is the same `ErrFull`, not a dead journal.
 * Recovery drains in order: once the publisher publishes and reclaims, `Append`
   succeeds again and `Replay` returns the old records first.
 
@@ -96,9 +125,10 @@ journal keeps accepting writes within its capacity, `Degraded` is true, and
 |---|---|
 | Process crash (SIGKILL), disk and OS intact | Every record the writer had written to the file, which includes every record whose `Sync` returned. Records still in memory, appended but not yet written, are lost; none of them was durable. |
 | OS crash or power loss | A **prefix** of the appended records that contains every record whose `Sync` returned. Which unsynced records survive is up to the disk; they survive as a prefix, never with a gap. |
-| Torn write (partial sector) | The valid prefix before the damaged record. The damaged record and everything after it are discarded, for good. |
-| Permanent disk loss | Nothing. The unpublished tail is lost. The journal cannot know what it lost; the caller knows the last published sequence and the acknowledgement time it had recorded, and must report that an unpublished tail may be missing. A takeover must not report those writes as durable. |
-| Published ahead of the disk | The store holds records the disk lost (the publisher published records that had not been synced). `Open` with `Options.Published` set to the store's sequence continues numbering after it and replays nothing it already holds. |
+| Torn write (partial sector) | The valid prefix before the damaged record. The damaged record and everything after it are dropped, and `Recovery` says what was. |
+| Damage to a record a mark proves durable | `ErrCorrupt`; nothing is dropped. The disk lost something that was acknowledged; the Volume falls back to the store, as for a lost disk. |
+| Permanent disk loss | Nothing. The unpublished tail is lost. The journal cannot know what it lost; the caller knows the last published sequence and must report that an unpublished tail may be missing. A takeover must not report those writes as durable. |
+| A new disk for a volume with history | `Open` on an empty directory with `Published` set to the store's sequence numbers on from it. |
 
 Replay is idempotent: it is a read, and a record is identified by its sequence.
 A consumer that applies records must tolerate seeing a record again after a crash
@@ -106,13 +136,40 @@ that happened between applying it and publishing it.
 
 ### Recovery
 
-A segment file is *live* if its header checksum is valid. Live segments are ordered
-by the sequence of their first record and kept while each begins exactly where the
-one before ended and holds at least one valid record. The valid records of a
-segment are the run, from its first, in which each record's checksum (seeded by
-the segment's life) is valid and its sequence is the previous plus one. The first
-byte that fails ends the log: after a torn or lost write nothing past it can be
-trusted, and nothing past it was ever reported durable.
+`Open` reads the preamble of every segment file (header and marks) and decides
+before it writes anything.
+
+| Finding | `Open` |
+|---|---|
+| a segment of another lineage | `ErrLineage`; nothing written |
+| the store holds less than the *floor* (a mark records that the store held it when segments were reclaimed) | `ErrMismatch`: a stale Head, or a Head of another volume |
+| the store holds more than the log's last record, and the log is not empty | `ErrMismatch`: the disk lost synced records, or the Head is not this volume's |
+| a surviving *through* mark proves records durable that the log no longer holds, and the store does not | `ErrCorrupt` |
+| the log begins after the store, with a proof of a finished sync past it | `ErrCorrupt` |
+| the log begins after the store, with no such proof | the start of the log was lost with the tail in a power cut; nothing in it was acknowledged. Open drops it and reports it |
+| a hole in the log, with intact segments after it, with no proof past the hole | those segments follow a gap and nothing there was acknowledged. Open wipes them (`Recovery().Dropped`) |
+| an empty directory | a fresh journal; numbering continues after `Published` |
+
+A segment file is *live* if its header checksum is valid. Live segments are
+ordered by the sequence of their first record, then by name, and kept while each
+begins exactly where the one before ended and holds at least one valid record.
+The valid records of a segment are the run, from its first, in which each
+record's checksum (seeded by the segment's life and the lineage) is valid and its
+sequence is the previous plus one. The first byte that fails ends the log.
+
+What is *proven* comes from the marks. A **through** mark says every record up to
+a sequence had been made durable by a completed sync. It is written after the
+sync it describes, at the start of a later sync round, so that round's `fdatasync`
+carries it, and at `Close`; so wherever one survives, everything it claims is on
+the media. A mark is a second block to flush, which doubled a lone writer's fsync on
+a SATA SSD when it was written every round, so it is written every sixteenth round or
+after a megabyte of synced records, whichever comes first. A **floor** says the store held every record up to a sequence;
+`Reclaim` makes it durable in the oldest segment that stays before it wipes any
+header, so a log that begins after the store always says why. The lag is real:
+the records of the last sync rounds of a journal that was killed are covered by no
+surviving mark, and damage to them is indistinguishable from a torn tail. They are
+dropped and reported (`Recovery().Proven < Recovery().Last`); a clean `Close`
+leaves no such window.
 
 The segments after the end of the log are wiped (their header zeroed) and the wipe
 is made durable **before** any new record is written. New records always go to a
@@ -125,55 +182,52 @@ checksum of every record in it, so records of its earlier uses never validate.
 may lose the newest wipes but never an older one while keeping a newer, which would
 leave a gap.
 
-The store's sequence is what ties the log to the object store. If every segment
-has been reclaimed and the machine then loses the newest unsynced records,
-`Open(Published: h)` numbers on from `h`. If the store is *behind* the log's first
-record (a rolled-back Head, or a start of the log lost in a power cut), the
-records between are missing; the log is discarded rather than replayed across the
-gap.
-
 ## How it writes
 
 How should a write be made durable? `bench -what strategy` times the options on a
 file of 1 GiB: `pwrite` then `fdatasync`, `O_DSYNC`, `O_DIRECT` with `fdatasync`,
 `O_DIRECT|O_DSYNC`, each on a file whose every byte is written and on one that was
-only `fallocate`d. Median of the p50 latency of five interleaved 1.2 s runs, ext4,
-shared machines (load average beside each table):
+only `fallocate`d. Median of the p50 latency of five interleaved 1.2 s runs, ext4, on
+shared machines (the one-minute load average is given with each table):
 
-NVMe, load average 39 (a shared development node; the numbers carry that noise):
-
-| Strategy | 4 KiB | 64 KiB | 1 MiB |
-|---|---|---|---|
-| buffered write + `fdatasync`, fully written file | 1.09 ms | 1.10 ms | 2.37 ms |
-| buffered write + `fdatasync`, `fallocate`d file | 1.41 ms | 1.46 ms | 4.59 ms |
-| `O_DSYNC`, fully written | 1.08 ms | 1.07 ms | 2.62 ms |
-| `O_DIRECT` + `fdatasync`, fully written | 1.05 ms | 1.03 ms | 2.27 ms |
-| `O_DIRECT` with `O_DSYNC`, fully written | 1.66 ms | 0.61 ms | 3.39 ms |
-
-SATA SSD, load average 11:
+NVMe, load average 8.78 at the start of the run:
 
 | Strategy | 4 KiB | 64 KiB | 1 MiB |
 |---|---|---|---|
-| buffered write + `fdatasync`, fully written file | 0.78 ms | 0.98 ms | 12.8 ms |
-| buffered write + `fdatasync`, `fallocate`d file | 0.81 ms | 1.01 ms | 12.5 ms |
-| `O_DSYNC`, fully written | 0.77 ms | 0.99 ms | 12.5 ms |
-| `O_DIRECT` + `fdatasync`, fully written | 0.79 ms | 0.93 ms | 11.7 ms |
-| `O_DIRECT` with `O_DSYNC`, fully written | 0.77 ms | 0.95 ms | 11.7 ms |
+| buffered write + `fdatasync`, fully written file | 1.21 ms | 1.22 ms | 1.39 ms |
+| buffered write + `fdatasync`, `fallocate`d file | 1.32 ms | 1.33 ms | 1.54 ms |
+| `O_DSYNC`, fully written | 1.24 ms | 1.18 ms | 1.36 ms |
+| `O_DIRECT` + `fdatasync`, fully written | 1.22 ms | 894 µs | 1.17 ms |
+| `O_DIRECT` with `O_DSYNC`, fully written | 1.74 ms | 725 µs | 1.24 ms |
+
+SATA SSD, load average 11.88 at the start of the run:
+
+| Strategy | 4 KiB | 64 KiB | 1 MiB |
+|---|---|---|---|
+| buffered write + `fdatasync`, fully written file | 815 µs | 1.01 ms | 12.64 ms |
+| buffered write + `fdatasync`, `fallocate`d file | 844 µs | 1.04 ms | 12.58 ms |
+| `O_DSYNC`, fully written | 796 µs | 1.01 ms | 12.31 ms |
+| `O_DIRECT` + `fdatasync`, fully written | 785 µs | 939 µs | 11.50 ms |
+| `O_DIRECT` with `O_DSYNC`, fully written | 779 µs | 924 µs | 11.30 ms |
 
 What decides the design:
 
-1. **Overwriting blocks that are already written is as cheap as anything and
-   sometimes much cheaper than writing into `fallocate`d space** (1.3 times at
-   4 KiB and 64 KiB, 1.9 times at 1 MiB on the NVMe; no difference on the SATA SSD).
-   An `fdatasync` into unwritten extents must commit the extent conversion through the
-   filesystem journal; an overwrite needs only the data and one device flush. So
-   segments are *fully written* files, and they are **recycled** instead of deleted and
-   recreated: writing zeros again for every segment would double the write traffic.
-   A new file is written once, off the append path and ahead of need; after that the
-   same files are overwritten for good.
+1. **Overwriting blocks that are already written is a little cheaper than writing
+   into `fallocate`d space**: 1.08 to 1.11 times as fast on the NVMe disk, 1.00 to
+   1.04 times on the SATA SSD, which is no difference. An earlier run on a
+   node at load 39 showed 1.3 to 1.9 times on the NVMe disk; it did not repeat at
+   load 8.78, and is not the reason for the design. An `fdatasync` into unwritten extents
+   must commit the extent conversion through the filesystem journal; an overwrite needs
+   only the data and one device flush, and that is the whole of the gain. The other
+   reasons to write the segments fully, once, ahead of need are that the disk-full error
+   shows up when a segment is made, off the append path (`ErrFull`, not a dead
+   journal), and that a segment file is then recycled for good instead of deleted and
+   made again, so the write traffic is the data and one pass of zeros per file.
 2. **`O_DIRECT` and `O_DSYNC` are not consistently better than buffered writes plus
-   one `fdatasync`.** `O_DIRECT|O_DSYNC` wins at 64 KiB and loses at 4 KiB; `O_DIRECT`
-   with `fdatasync` is within noise of the buffered path. They cost alignment and padding
+   one `fdatasync`.** `O_DIRECT|O_DSYNC` wins at 64 KiB on the NVMe disk (725 µs against
+   1.22 ms) and loses at 4 KiB (1.74 ms against 1.21 ms); on the SATA SSD
+   all five are within a few percent at 4 KiB and 64 KiB. `O_DIRECT` with `fdatasync`
+   is within 1 % of the buffered path at 4 KiB. They cost alignment and padding
    in the record format and cannot share a page cache. The journal uses buffered
    `pwrite` and `fdatasync`; the group-sync queue makes one `fdatasync` serve every
    waiter.
@@ -182,150 +236,238 @@ Two more rules keep the cost of a sync bounded:
 
 * Data is handed to the system for writeback (`sync_file_range`, a hint) as soon as
   1 MiB has been written to a segment, so a later `fdatasync` finds it already on its
-  way. Without the hint, two bulk writers beside eight fsync writers raised the fsync
-  writers' median from 1.6 ms to 37 ms; with it, to 6.2 ms (the plain loop: 4.9 ms).
+  way. Its effect is measured under [The writeback hint](#the-writeback-hint).
 * An `fdatasync` is started every 8 MiB with nobody waiting, and the writer waits
   when 16 MiB are written and not yet synced. A sync is therefore never asked to
-  flush more than a few megabytes, and the next `Sync` call never waits behind
-  gigabytes.
+  flush more than about 16 MiB, and the next `Sync` call never waits behind
+  gigabytes. On a disk that flushes 80 MB/s that is still 200 ms; see the SATA
+  measurement under [A bulk writer beside fsync writers](#a-bulk-writer-beside-fsync-writers).
 
 ## Measurements
 
-`bench` (in `journal/bench`) runs the journal and a plain loop on the same disk, same
-sizes, same concurrency. Plain means each writer does `pwrite` then `fdatasync` on its
-own fully written, preallocated file (a variant with one shared file is in the
-output and is no better). The journal runs with a publisher that publishes and
-reclaims as fast as `Due(5 ms)` says. A journal run first cycles every segment once, so
-the measured run finds recycled files. The fdatasync count is taken **inside the file
-layer**, per 1,000 `Sync` calls; it includes the syncs of `Reclaim` and the background
-syncs, which is why one writer shows 915 to 983 and not 1,000.
+`bench` (in `journal/bench`) runs three programs on the same disk, one directory,
+ext4. **Journal** is `Append` + `Sync` of a 4 KiB record by N goroutines. **Plain**
+is what a writer does without a journal: each goroutine writes its own file and
+calls `fdatasync` on it. **Group** is the loop one writes by hand to get the same
+batching: the goroutines write to one shared file and wait for one shared
+`fdatasync`, run by a dedicated goroutine that wakes exactly the waiters whose write
+finished before the call began (`bench -what group`, about 60 lines). Each row is a
+5 s run. Both machines are shared with other work, so a run starts only when the
+one-minute load average is below 20, and the load average seen by each run is
+recorded in `journal/bench`'s output; the range over each table is given with it.
+The latency tables are single runs; the bulk and sequential tables give every
+round. Runs on these machines vary by several percent.
 
-Both machines were shared with other work, so every line carries its load average and
-single runs vary a great deal (on the NVMe node, one sequential run measured at load 91
-gave 126 MB/s, the same run at load 17 gave 4,162 MB/s). Only comparisons made
-back to back mean anything.
+### Small synchronous writes
 
-### 4 KiB Append + Sync, 5 s per run
+**NVMe, one-minute load average 9 to 24 over the table:**
 
-NVMe node (arm64, 20 cores, PCIe NVMe, ext4). Rows 1, 8 and 32 ran at load 6 to 7;
-64 and 128 at 26 to 50.
+| Writers | Journal ops/s | p50 | `fdatasync` per 1,000 syncs | Group ops/s | p50 | Plain ops/s | p50 | Journal / group | Journal / plain |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 790 | 1.20 ms | 1000 | 751 | 1.30 ms | 757 | 1.29 ms | 1.05 | 1.0 |
+| 8 | 3,196 | 2.49 ms | 248 | 3,082 | 2.57 ms | 1,610 | 4.83 ms | 1.04 | 2.0 |
+| 32 | 12,729 | 2.51 ms | 62 | 12,460 | 2.53 ms | 2,645 | 12.4 ms | 1.02 | 4.8 |
+| 64 | 24,611 | 2.57 ms | 32 | 24,421 | 2.59 ms | 4,726 | 13.8 ms | 1.01 | 5.2 |
+| 128 | 47,764 | 2.64 ms | 16 | 47,432 | 2.69 ms | 8,881 | 14.2 ms | 1.01 | 5.4 |
 
-| Writers | Journal ops/s | Journal p50 | Journal fsyncs per 1,000 Sync | Plain ops/s | Plain p50 | Journal p50 / plain p50 |
+* With one writer the three programs are the same: one `fdatasync` per write.
+* Against plain `fdatasync` per file the journal does 2.0 times the operations per second
+  at 8 writers and 5.4 times at 128, because it makes one `fdatasync` serve many
+  waiters (the `fdatasync` column: 248 per 1,000 syncs at 8 writers, 16 at 128).
+* **Against a hand-written group commit the journal is not faster**: 1.01 to 1.05 times
+  the operations per second, the same latency to within a few percent. It is the
+  same algorithm. What the journal adds is listed under
+  [What the journal adds](#what-the-journal-adds).
+
+**SATA SSD, one-minute load average 11 to 23 over the table:**
+
+| Writers | Journal ops/s | p50 | `fdatasync` per 1,000 syncs | Group ops/s | p50 | Plain ops/s | p50 | Journal / group | Journal / plain |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 923 | 819 µs | 1000 | 1,065 | 777 µs | 1,054 | 782 µs | 0.87 | 0.9 |
+| 8 | 3,865 | 1.64 ms | 249 | 4,261 | 1.65 ms | 1,236 | 5.60 ms | 0.91 | 3.1 |
+| 32 | 9,938 | 2.49 ms | 63 | 11,050 | 2.39 ms | 1,228 | 25.3 ms | 0.90 | 8.1 |
+| 64 | 13,478 | 3.88 ms | 32 | 15,217 | 3.65 ms | 1,184 | 51.8 ms | 0.89 | 11.4 |
+| 128 | 15,937 | 7.06 ms | 16 | 18,826 | 6.28 ms | 1,201 | 99.3 ms | 0.85 | 13.3 |
+
+* One writer: the journal is 0.88 times plain (819 µs against 782 µs p50).
+* 8 to 128 writers: 3.1 to 13.3 times plain; 0.85 to 0.91 times the group loop. Where one
+  `fdatasync` costs a device flush of about a millisecond, batching matters more in
+  absolute terms and still comes from the batching, not from the journal.
+
+### A bulk writer beside fsync writers
+
+Two goroutines stream 1 MiB writes without waiting for durability while N goroutines
+do 4 KiB write + fsync. In the plain and group programs the bulk goes to separate
+files; in the journal it is appended to the same log, because the journal is one
+ordered log: a `Sync` covers everything before it, bulk included. Median of three
+rounds (load noted per table).
+
+NVMe, load 12 to 17:
+
+| Fsync writers | Plain p50 | Group p50 | Journal p50 | Journal / plain (p50) | Journal ops/s | Plain ops/s |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 | 279 | 1.44 ms | 915 | 232 | 1.16 ms | 1.25 |
-| 8 | 2,044 | 1.55 ms | 125 | 1,133 | 4.31 ms | 0.36 |
-| 32 | 7,676 | 1.67 ms | 32 | 1,884 | 8.52 ms | 0.20 |
-| 64 | 14,035 | 1.73 ms | 17 | 2,829 | 12.1 ms | 0.14 |
-| 128 | 23,258 | 2.14 ms | 8.8 | 3,559 | 17.9 ms | 0.12 |
+| 8 | 4.42 ms | 2.60 ms | 10.0 ms | 2.3 | 768 | 1,754 |
+| 32 | 9.69 ms | 2.66 ms | 10.3 ms | 1.1 | 3,014 | 3,325 |
 
-An earlier full matrix on the same node (load 33 to 40) gave 389, 3,121, 8,442, 18,819
-and 39,653 ops/s for the journal against 403, 1,209, 1,397, 3,521 and 6,742 for plain.
-At 128 writers the journal released about 128 waiters per `fdatasync`; the group-size
-histogram is in the raw output. The p99 of both is 40 to 60 ms at that load: a periodic
-stall of the shared disk that the plain loop shows too.
+SATA SSD, load 13 to 16:
 
-SATA SSD node (amd64, 56 threads, ext4 on LVM; load 11 to 30):
-
-| Writers | Journal ops/s | Journal p50 | Journal fsyncs per 1,000 Sync | Plain ops/s | Plain p50 | Journal p50 / plain p50 |
+| Fsync writers | Plain p50 | Group p50 | Journal p50 | Journal / plain (p50) | Journal ops/s | Plain ops/s |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 | 905 | 0.82 ms | 946 | 1,080 | 0.77 ms | 1.06 |
-| 8 | 5,374 | 1.02 ms | 143 | 1,156 | 5.64 ms | 0.18 |
-| 32 | 10,262 | 2.62 ms | 32 | 1,175 | 26.3 ms | 0.10 |
-| 64 | 13,939 | 5.29 ms | 13 | 1,083 | 55.1 ms | 0.10 |
-| 128 | 18,599 | 5.56 ms | 0.7 | 1,193 | 102 ms | 0.05 |
+| 8 | 5.64 ms | 1.63 ms | 285.8 ms | 50.7 | 28 | 201 |
+| 32 | 25.9 ms | 2.37 ms | 276.9 ms | 10.7 | 113 | 1,150 |
 
-tmpfs, where `fdatasync` costs nothing (so this is the pipeline's own cost): one writer
-3.6 us p50 against 1.0 us plain, about 190,000 Append+Sync per second; 238,000 to
-282,000 per second with 8 to 128 writers.
+This is the journal's known cost and the reason for the
+[payload split](#integration-with-the-volume): the small fsyncs wait 2.3 times as long
+as plain at 8 writers on the NVMe disk and 51 times as long on the SATA SSD, where a
+megabyte takes about 12 ms to flush. The journal bounds what is written ahead of a
+sync (a sync every 8 MiB, at most 16 MiB unsynced), which keeps the NVMe factor small and
+stops the wait growing with the amount of bulk data. On a disk that flushes 80 MB/s
+16 MiB is 200 ms, and no bound that lets bulk data into the same ordered log
+makes that small.
 
-**Target: 4 KiB Sync latency at most 1.5 times plain `fdatasync` at matched load.**
-Met on both disks at one writer (1.25 and 1.06 times), and from eight writers up the
-journal is 3 to 20 times faster, because one `fdatasync` serves the whole group. The
-0.2 to 0.3 ms the journal adds at one writer is the hops between the appender, the
-writer, the syncer and back (CPU profile: 10 % busy, nothing else on the path).
+### Sequential throughput
 
-### 1 MiB sequential Append
+One writer, 1 MiB `Append`s back to back, then `Sync` of the last: burst is 1.5 GiB,
+sustained is 8 GiB on the NVMe disk and 4 GiB on the SATA SSD. The plain loop
+writes the same amount to one file and calls `fdatasync` every N bytes. Three rounds,
+interleaved on the NVMe disk. On the SATA SSD the first three rounds were
+disturbed (the one-minute load average of that shared node went above 60 in two of
+them and one run fell to 8 MB/s) and were repeated: its table is five fresh rounds.
 
-Back-to-back comparisons on the NVMe node, 4 GiB per run, one writer, journal
-capacity 2 GiB with the publisher publishing instantly, against a plain loop of 1 MiB
-`pwrite` calls with `fdatasync` every 8 MiB (the same sync granularity the journal
-uses). Durable MB/s, three rounds, load 15 to 25:
+NVMe, load 9 to 15:
 
-| Round | Journal | Plain, sync every 8 MiB | Ratio |
-|---:|---:|---:|---:|
-| 1 | 2,870 | 3,461 | 0.83 |
-| 2 | 4,162 | 2,996 | 1.39 |
-| 3 (disturbed) | 398 | 405 | 0.98 |
+| Run | MB/s, round by round | Median |
+|---|---|---:|
+| journal, burst (1.5 GiB) | 2,782, 2,694, 2,563 | 2,694 |
+| journal, sustained | 2,592, 2,634, 2,678 | 2,634 |
+| plain `pwrite`, `fdatasync` every 1 MiB | 736, 748, 744 | 744 |
+| plain `pwrite`, `fdatasync` every 8 MiB | 2,619, 2,596, 2,462 | 2,596 |
+| plain `pwrite`, `fdatasync` every 32 MiB | 3,756, 3,889, 3,768 | 3,768 |
 
-The median is 0.98 of plain. The strict plain loop, `fdatasync` after every 1 MiB, ran at
-280 to 340 MB/s. Without the writeback hint the journal ran at 2,348, 3,610 and 301.
-A journal run of 1.5 GiB, which fits the capacity (the burst), appended and was durable
-at 1,905 to 2,575 MB/s when the node was not saturated; at load 91 it measured 126 MB/s.
-tmpfs: 3,000 to 4,600 MB/s against 5,000 to 7,600 plain, the cost of the extra copy
-and the checksum.
+SATA SSD, load 12 to 15:
 
-SATA SSD node: the disk sustains about 75 MB/s here and the journal is at its limit.
-Sustained, three runs: 73.5, 68.6 and 73.1 MB/s (median 73.1), and 69.5, 82.7 and
-69.1 with four writers; the plain loop syncing every 8 MiB ran at 77.2, 77.7 and
-69.6 (median 77.2), every 32 MiB at 74.7, 77.5 and 71.0, and after every MiB at 75.7,
-93.2 and 65.3. The 1.5 GiB burst measured 87, 51 and 48 MB/s, bound by the disk because
-the final `Sync` waits for it.
+| Run | MB/s, round by round | Median |
+|---|---|---:|
+| journal, burst (1.5 GiB) | 49, 47, 71, 39, 71 | 49 |
+| journal, sustained | 67, 72, 76, 60, 80 | 72 |
+| plain `pwrite`, `fdatasync` every 1 MiB | 64, 76, 65, 60, 81 | 65 |
+| plain `pwrite`, `fdatasync` every 8 MiB | 90, 87, 69, 67, 94 | 87 |
+| plain `pwrite`, `fdatasync` every 32 MiB | 88, 82, 67, 69, 75 | 75 |
 
-**Target: sequential at least 90 % of plain NVMe write throughput.** Met at the
-median of the back-to-back runs (0.98) and on the SATA disk (0.95 against the plain loop that syncs every 8 MiB); it ranged from
-0.83 to 1.39 across the three rounds on the shared node. The burst figure of 1.1 GB/s
-needs a disk that is not shared with a dozen compile jobs: it was exceeded at 1.9 to
-2.6 GB/s when the node was quiet.
+* The journal, which syncs every 8 MiB in the background and when `Sync` asks, runs at
+  1.01 times the plain loop that syncs every 8 MiB on the NVMe disk (0.70 times the
+  loop that syncs every 32 MiB, 3.5 times the loop that syncs every MiB).
+  On the SATA SSD it is 0.83 times the 8 MiB loop (0.97 of the 32 MiB loop, 1.1 times
+  the 1 MiB loop).
+* So bulk data written through the journal is as fast as a loop with the same
+  `fdatasync` spacing on the NVMe disk, 0.83 times as fast on the SATA SSD (where the
+  journal also writes the zeros of each new segment once), and not faster than a loop
+  that syncs less often. A burst into segments that do not exist yet pays for making
+  them: 49 MB/s against 72 sustained on the SATA SSD. The
+  earlier claim that the journal beat the plain loop on bulk data by 1.27 times
+  compared against the wrong loop and is withdrawn.
 
-### Where the gap is
+### The writeback hint
 
-* **Sequential**: CPU profile of a 4 GiB run, 50 % of one core: `pwrite` 40 %,
-  `fdatasync` 22 %, CRC-32C of the payload 17 %, `memmove` into the batch buffer 14 %.
-  The journal costs one extra copy and one checksum over the plain loop; on a disk that
-  keeps up that is the 0.83 of round 1, and on tmpfs the 0.6 to 0.8.
-* **Small syncs**: at 32 writers 5.9 s of mutex wait in a 6 s run, 90 % of it in `Sync`
-  registering a waiter while the syncer releases a group, about 100 us a call. Splitting
-  the waiter list from the append lock is the next step; at the measured latencies it is
-  5 % of the p50.
-* **A bulk writer beside fsync writers**: one ordered log means a `Sync` covers all the
-  bulk data before it. With two bulk writers beside eight fsync writers the journal's
-  p50 was 6.2 ms against 4.9 ms for the plain loop on the NVMe node (1.3 times), and
-  33.7 ms against 5.6 ms on the SATA SSD, where 16 MiB takes 200 ms to flush. The
-  bounds above (writeback hints, 8 MiB syncs, 16 MiB exposed) keep it from being worse;
-  keeping bulk chunk data out of the journal is the cure and belongs to the Volume.
+The journal asks for writeback (`sync_file_range`) of each megabyte as it is written.
+Measured by building the journal with the hint off (nothing else changed), three
+interleaved rounds each:
+
+NVMe, load 9 to 10:
+
+| | With the hint | Without |
+|---|---:|---:|
+| 1 MiB sequential, sustained: MB/s | 2,614 (2,621, 2,614, 2,510) | 2,392 (2,450, 2,193, 2,392) |
+| 1 MiB sequential, sustained: p95 of a write | 1.60 ms (1.58 ms, 1.62 ms, 1.60 ms) | 2.16 ms (2.16 ms, 2.25 ms, 2.13 ms) |
+| 1 MiB sequential, sustained: p99 of a write | 3.05 ms (2.86 ms, 3.05 ms, 3.06 ms) | 4.21 ms (4.01 ms, 4.80 ms, 4.21 ms) |
+| 8 fsync writers beside 2 bulk writers: p50 | 10.3 ms (10.3 ms, 10.1 ms, 10.7 ms) | 16.7 ms (11.1 ms, 16.7 ms, 17.1 ms) |
+| 8 fsync writers beside 2 bulk writers: ops/s | 745 (745, 754, 719) | 479 (704, 479, 464) |
+
+SATA SSD, load 11 to 14:
+
+| | With the hint | Without |
+|---|---:|---:|
+| 1 MiB sequential, sustained: MB/s | 68 (64, 88, 68) | 78 (78, 101, 72) |
+| 1 MiB sequential, sustained: p95 of a write | 50.9 ms (53.7 ms, 50.9 ms, 50.5 ms) | 88.4 ms (88.4 ms, 84.7 ms, 97.7 ms) |
+| 1 MiB sequential, sustained: p99 of a write | 85.0 ms (85.0 ms, 70.2 ms, 104.5 ms) | 161.1 ms (161.1 ms, 143.5 ms, 178.5 ms) |
+| 8 fsync writers beside 2 bulk writers: p50 | 313.9 ms (349.6 ms, 294.4 ms, 313.9 ms) | 271.3 ms (271.3 ms, 270.7 ms, 301.9 ms) |
+| 8 fsync writers beside 2 bulk writers: ops/s | 27 (23, 27, 27) | 26 (27, 24, 26) |
+
+* On the NVMe disk the hint raises sustained throughput by about 9 percent, cuts the p95 and p99 of
+  a 1 MiB write by about a quarter, and makes small fsyncs beside bulk writers faster.
+* On the SATA SSD it cuts the tail of a 1 MiB write (p95 1.7 times lower, p99 1.9 times)
+  and does not make small fsyncs beside bulk writers faster; throughput and that latency
+  differ by less than the spread between rounds. It is kept because it costs nothing
+  measurable and the tails improve on both disks.
+
+
 
 ## File layout
 
 A directory of segment files `NNNNNN.seg`, all of one size (`Options.Segment`,
-default 64 MiB). Integers are little endian; checksums are CRC-32C (Castagnoli).
+default 64 MiB, at most 4 GiB). Integers are little endian; checksums are CRC-32C
+(Castagnoli).
 
 ```
-segment  header | record | record | ... | (unused)
-header   checksum u32 | first u64 | life u64                    20 bytes
+segment  header | mark | mark | record | record | ... | (unused)
+header   checksum u32 | first u64 | life u64 | lineage [16]byte       36 bytes
+mark     checksum u32 | through u64 | floor u64                       20 bytes, two slots
 record   checksum u32 | length u32 | sequence u64 | acknowledged i64 | payload checksum u32 | payload
 ```
 
 * The header checksum covers `first` (the sequence of the segment's first record,
-  at least 1) and `life` (random, new each time the file is reused). A zero header
-  is a free segment.
-* The record checksum covers the record header after itself and is seeded by the
-  segment's life. The payload checksum is computed before the journal's lock is
-  taken; the record checksum binds it to the sequence and the time.
+  at least 1), `life` (random, new each time the file is reused) and `lineage` (the
+  first 16 bytes of the SHA-256 of `Options.Lineage`). A zero header is a free
+  segment. The records begin at byte 76.
+* The seed of every record and mark checksum is the CRC-32C of `life` followed by
+  `lineage`. The record checksum covers the record header after itself. The payload
+  checksum is computed before the journal's lock is taken; the record checksum binds
+  it to the sequence and the time.
+* The two marks are written alternately, each in one 20-byte write; a torn write
+  damages one and the other still stands. A recovery takes the highest `through`
+  and the highest `floor` of the marks that validate. See [Recovery](#recovery).
 * `acknowledged` is the wall-clock time of the `Append`, in nanoseconds since the
   Unix epoch. It survives a restart, so the age of the oldest unpublished record
-  does too.
+  does too (clamped to the restart, never extended by it).
 * Records do not span segments. Many records are written by one `pwrite` (group
-  commit); the first write into a segment starts at its header.
+  commit); the first write into a segment starts at its header and carries the
+  first mark.
+* The payload is stored as given. **The journal does not encrypt**: every write of
+  the volume is in the clear on the node's disk. The directory is created `0700`
+  and the files `0600`; the Volume seals what it appends.
 
 ## The file layer
 
-The journal writes only through the `Disk` and `File` interfaces. The operating
-system's files are the default. `journal/crash` is a `Disk` in memory that logs every
-write, sync, create and remove, and rebuilds the disk a crash would leave after any
-prefix of that log: nothing persisted, everything persisted, each prefix, every
-subset of a few writes, torn writes inside and across sectors, random scatters. `crash.Disk.Explore` checks every such
-state, in the manner of CrashMonkey and ACE. It is the harness for issue #26 and is
-meant to be reused by the Volume's tests.
+The journal writes only through the `Disk` and `File` interfaces. `Files(dir)` is
+the operating system's: it creates the directory (`0700`) and makes its entry in
+the parent durable; takes an exclusive `flock` on the directory, held until the
+journal closes or the process dies (`ErrLocked` for a second journal on the
+directory); and reads the file system type (`statfs`), refusing tmpfs and ramfs
+(`ErrVolatile`: an fsync there makes nothing durable) and warning about overlay,
+FUSE, 9p and network file systems (`Recovery().Warnings`: a sync reaches the media
+only if the layer below passes it on; check before relying on a journal in a
+sandbox). A `File`'s `WriteAt` writes all of its bytes or returns an error; a short
+write with no error fails the journal. On macOS Go's `File.Sync` is `F_FULLFSYNC`,
+which asks the drive to flush its own cache; it is slower than `fdatasync` on Linux
+and is what durable means there.
+
+Two tests keep this layer honest. The journal's logic runs against `journal/crash`,
+a `Disk` in memory that logs every write, sync, create and remove, and rebuilds the
+disk a crash would leave after any prefix of that log: nothing persisted,
+everything persisted, each prefix, every subset of a few writes, torn writes inside
+and across sectors, random scatters. `crash.Disk.Explore` checks every such state,
+in the manner of CrashMonkey and ACE, and a crash of the recovery itself is
+explored the same way. It models `Create` and `Remove` as durable when they
+return, which is the contract; whether the real layer meets it is what the second
+test checks: the test binary runs again as its own child, traced with `ptrace`
+(a process may trace its child with no privileges, and nothing is installed), and
+reads the system calls the real layer makes. A created file is `fdatasync`ed,
+renamed into place, and the directory `fsync`ed, in that order, before the first
+record is written to it; a removal is followed by a directory `fsync`; the parent of
+the journal's directory is synced; the lock is taken before anything is created; and
+an `EIO` the tracer puts into an `fdatasync` of a segment fails the `Sync` and every
+later `Append`. The tracer reads the registers of `linux/amd64` and `linux/arm64`;
+on another architecture these tests fail, they do not skip.
 
 ## Integration with the Volume
 
@@ -334,23 +476,29 @@ chooses the encoding of a mutation, the journal only orders, stores and numbers 
 The surface the integration change calls:
 
 ```go
-j, err := journal.Open(dir, journal.Options{Capacity: budget, Published: head})
+j, err := journal.Open(dir, journal.Options{Capacity: budget, Published: head, Lineage: volumeAndRound})
 err = j.Replay(func(r journal.Record) error { ... })   // at mount, before serving
 seq, err := j.Append(ctx, mutation)                    // before applying it
 err = j.Sync(ctx, seq)                                 // fsync
-<-j.Due(bound - margin)                                // the publisher's deadline
-err = j.Publish(g); err = j.Reclaim()                  // after the Head carrying g is committed
-st := j.State(); m := j.Marks()                        // what an agent reads
+<-j.Due(c, bound-margin)                               // the publisher's deadline (c: cancel when another trigger wins)
+err = j.Publish(g); err = j.Reclaim()                  // after the Head carrying g, a durable g, is committed
+st := j.State(); m := j.Marks(); r := j.Recovery()     // what an agent reads
 err = j.Close()                                        // Detach, suspend, end
+err = journal.Discard(dir, opt, first, last)           // only on an operator's decision
 ```
 
 The integration change does the following.
 
 1. **Mount.** Read the Head's journal sequence `h` (the last sequence committed
-   into the Head). `journal.Open(dir, Options{Capacity: <NVMe budget>, Published: h})`.
-   `Replay` and apply each record to the Volume's in-memory state, in order; then
-   start the publisher. The Head is the truth: pass it every time, including 0 for a
-   Disk that has never published.
+   into the Head) and its fencing round. `journal.Open(dir, Options{Capacity:
+   <NVMe budget>, Published: h, Lineage: <volume id and round>})`. The Head is the
+   truth: pass it every time, including 0 for a Disk that has never published. An
+   `ErrMismatch`, `ErrLineage` or `ErrCorrupt` is not retried with another Head:
+   it means the node's journal is not this volume's current history, and the
+   Volume falls back to the Head (as after a lost disk) and reports that an
+   unpublished tail may be missing; `Discard` is for an operator who has decided
+   the records are not wanted. `Replay` and apply each record to the Volume's
+   in-memory state, in order; then start the publisher.
 2. **Mutation.** Every Volume mutation (write, truncate, rename, create, unlink,
    setattr) is encoded as one record and `Append`ed before it is applied. A write's
    journal sequence is the Volume's write sequence.
@@ -358,42 +506,103 @@ The integration change does the following.
    depends on. A local fsync is then durable in the node's journal, not in the
    store.
 4. **Publisher.** One serialized publisher per Volume. It takes an immutable
-   generation under a short lock (everything up to sequence `g`), releases the
-   lock, builds and uploads the objects, commits the Head carrying `g`, and calls
-   `Publish(g)` then `Reclaim()`. It loops on `Due(bound - margin)` and also acts
-   early on dirty bytes, an explicit Flush, Detach, suspend or end. A fsync waits
-   for the journal, never for a generation.
+   generation under a short lock (everything up to a durable sequence `g`), releases
+   the lock, builds and uploads the objects, commits the Head carrying `g`, and
+   calls `Publish(g)` then `Reclaim()`. It loops on `Due(c, bound - margin)` and also
+   acts early on dirty bytes, an explicit Flush, Detach, suspend or end. A fsync
+   waits for the journal, never for a generation.
 5. **Bound.** The 5 s bound is `Due`'s argument. `State()` is what the caller or an
    agent reads to learn that it cannot be trusted. `ErrFull` is `ENOSPC`/`EAGAIN`.
 6. **Detach, suspend, end.** Force the kernel to flush its dirty pages for the
    mount first (the journal sees only what reaches the daemon), then publish
    everything, then `Close`.
-7. **Takeover.** The new owner opens its own journal with `Published` set to the
-   Head's sequence. The old owner's unpublished tail is on its disk and is not
-   visible to the new owner; if that disk is gone it is lost, and the takeover
-   must say so rather than report those writes durable.
+7. **Takeover.** The new owner opens its own journal, under its own round, with
+   `Published` set to the Head's sequence. The old owner's unpublished tail is on
+   its disk and is not visible to the new owner; if that disk is gone it is lost,
+   and the takeover must say so rather than report those writes durable. If the old
+   owner comes back, its journal's lineage no longer matches and it is refused.
+8. **Large payloads do not go through the ordered log.** One log means a `Sync`
+   covers all the bulk data before it. Payloads above about 64 KiB (a file's data,
+   as against a metadata mutation) go to a second `Journal` instance, or to a spool
+   of files, whose own `Sync` the fsync of that file waits for; the ordered log
+   carries only the small record that names them. No format change is needed. The
+   [measurements](#a-bulk-writer-beside-fsync-writers) show why: with the bulk in the
+   same log, the p50 of small fsyncs behind two bulk writers was 2.3 times that
+   of plain per-file fsyncs on NVMe and 51 times on a SATA SSD (8 writers). The Volume change must do this, or measure
+   fsync-heavy phases (git, dpkg, SQLite) beside bulk writes first.
+9. **Do not enable the journal on SATA-class disks** without that split and that
+   measurement.
 
 The trap to test in that change: with a writeback page cache the kernel can
 acknowledge a `write(2)` before the daemon sees it, so the 5 s bound is measured
 from the record's entry into the journal, and `fsync` or `syncfs` are the only
 durability promises for buffered writes.
 
+## What the journal adds
+
+A loop that does the fsync part by hand is short: writers `pwrite` to one shared
+file, and one `fdatasync` serves every writer whose write finished before it began
+(`bench -what group` is that loop, 60 lines). Against it, at the same concurrency,
+the journal's group sync is no faster on the NVMe disk and 10 to 15 percent slower
+on the SATA SSD (see [Measurements](#measurements)): it is the same algorithm, plus
+record framing and one more block to flush every sixteenth round. What the journal adds is everything around it, and that is
+what a Volume needs and a loop does not have:
+
+* **Many writers and many files behind one sync queue**, with the barrier rule
+  proven under a crash model, not argued.
+* **Records**: length, checksum, sequence and acknowledgement time, many per
+  write; a torn tail detected, never read as data.
+* **Replay**: the unpublished records in order, idempotently, after any crash,
+  checked by exploring every persistence point, including a crash of the recovery.
+* **The three watermarks** and the rule between them, with a `Publish` that cannot
+  get ahead of the disk.
+* **The bounded deadline**: a timer on the oldest unpublished record's own
+  acknowledgement, correct across restarts and clock steps.
+* **Backpressure and a state an agent can read**: a fixed capacity, a slowdown,
+  `ErrFull`, a degraded flag, the backlog and its age.
+* **Recycling** of fully written segments, so an fdatasync never pays for new
+  extents; **bounded exposure**, so one bulk writer cannot make the next fsync wait
+  for gigabytes; **refusal** of a directory, Head or lineage that does not fit,
+  instead of destroying what is there.
+
+## Limits
+
+* **One ordered log.** A `Sync` covers all the data before it. Bulk data written
+  beside fsync callers delays them (measured below); the cure is to keep the bulk
+  out of the log, in the Volume.
+* **The proof lags.** A mark is written with a later sync round (every sixteenth, or
+  every megabyte, and at `Close`), so damage to the records of the last rounds of a
+  killed journal is treated as a torn tail, and reported.
+* **Plaintext at rest.** The journal does not encrypt. The Volume seals what it
+  appends.
+* **Namespace durability is pinned, not simulated.** The crash harness treats
+  `Create` and `Remove` as durable when they return, which is the contract; the
+  real layer's order of file sync, rename and directory sync is pinned by the
+  system-call tests. A model that loses a directory entry the layer failed to sync
+  is not built.
+* **A failed `Reclaim`** returns its error and changes nothing in memory; the next
+  call repeats the work, and every step of it can be repeated.
+* **One process, one directory.** The lock is advisory and per directory; a platform
+  without `flock` has none.
+
 ## Specification notes
 
-This section is normative. The words MUST, MUST NOT and MAY are used as in RFC 2119.
-A conforming implementation need not be this package; each criterion can be tested
-from outside, with a file layer that can hold, fail and crash.
+This section is normative. The words MUST, MUST NOT, SHOULD and MAY are used as in
+RFC 2119. A conforming implementation need not be this package; each criterion can
+be tested from outside, with a file layer that can hold, fail and crash.
 
 ### Model
 
-A *journal* is a sequence of *records*. A record has a *payload* of 0 to `S - 48`
+A *journal* is a sequence of *records*. A record has a *payload* of 0 to `S - 76 - 28`
 bytes (`S` is the segment size), a *sequence* and an *acknowledgement time*. The
 journal has a fixed *capacity* of at least two segments. It is used by one process
-at a time. The caller supplies a clock and a file layer; the file layer has
-`create` (file of a given size, every byte written, durable on return), `open`,
-`remove` (durable on return), `list`, and per file `read`, `write`, `sync` and
-`size`. A write is volatile until a `sync` that began after it completes; a crash may
-leave any subset of the volatile writes, each possibly torn at any byte.
+at a time. The caller supplies a clock, a file layer, a *lineage* (an opaque
+identity) and the *store's sequence*, the highest sequence the object store
+holds. The file layer has `create` (file of a given size, every byte written,
+durable on return), `open`, `remove` (durable on return), `list`, `close`, and per
+file `read`, `write` (all of the bytes, or an error), `sync` and `size`. A write is
+volatile until a `sync` that began after it completes; a crash may leave any subset
+of the volatile writes, each possibly torn at any byte.
 
 ### Requirements
 
@@ -403,80 +612,120 @@ leave any subset of the volatile writes, each possibly torn at any byte.
    that is told the store holds sequence `h`, the next sequence MUST be greater
    than `h` and greater than every sequence the journal recovers.
 2. **Watermarks.** The journal MUST maintain `published <= durable <= visible`,
-   each non-decreasing. `visible` is the highest appended sequence. `published` is the
-   highest sequence passed to `publish` (monotonic; a lower value is ignored).
-   `durable` is the larger of the highest sequence covered by a completed sync and
-   `published`.
+   each non-decreasing. `visible` is the highest appended sequence. `durable` is
+   the highest sequence covered by a completed sync. `published` is the highest
+   sequence passed to `publish` (monotonic; a lower value is ignored), and
+   `publish(s)` MUST fail, and change nothing, when `s` is greater than `durable`.
 3. **Append.** On return the record MUST be visible: a replay in the same run
-   includes it. A record is not durable on return. When the journal cannot accept the
-   record because its capacity is used by unpublished records, `append` MUST fail
-   with a distinguishable "full" error and MUST leave all state unchanged. A payload
-   that cannot fit in a segment MUST be rejected with a distinguishable error.
+   includes it. A record is not durable on return. When the journal cannot accept
+   the record because its capacity is used by unpublished records, or because a
+   segment file cannot be made, `append` MUST fail with a distinguishable "full"
+   error and MUST leave all state unchanged; a segment file that cannot be made
+   MUST NOT fail the journal. A payload that cannot fit in a segment MUST be
+   rejected with a distinguishable error.
 4. **Sync.** `sync(s)` MUST return success only when record `s` and every record
    before it are durable, and MUST NOT be satisfied by a sync that began before
    record `s` was written. Concurrent `sync` calls MUST share syncs: calls that
    arrive while a sync is in flight are released by the next one. After a failed
-   write or sync, `sync(s)` MUST fail for every `s` not already durable, and every
-   later `append` MUST fail; the journal MUST NOT retry. `sync` of a sequence not
-   yet appended MUST fail with a distinguishable error.
-5. **Publish.** `publish(s)` requires `s <= visible`. It does no file I/O. It MUST
-   release `sync` calls for sequences up to `s`.
+   write or sync (or a write of fewer bytes than asked, with no error),
+   `sync(s)` MUST fail for every `s` not already durable, and every later `append`
+   MUST fail; the journal MUST NOT retry. `sync` of a sequence not yet appended
+   MUST fail with a distinguishable error.
+5. **Publish.** `publish` does no file I/O.
 6. **Replay.** `replay` MUST yield, in order and without gaps, every record with a
    sequence greater than `published`, up to `visible`, each with the payload and
    acknowledgement time it was appended with. It MUST NOT change the journal: two
-   replays with no operation between them yield the same records. It MUST fail rather
-   than skip a record that should be present.
+   replays with no operation between them yield the same records. It MUST fail
+   rather than skip a record that should be present.
 7. **Reclaim.** `reclaim` MUST NOT make any record with a sequence above `published`
-   unavailable, and MUST NOT free the segment new records are being added to. It MUST
-   NOT run concurrently with a `replay` that is reading the segment.
+   unavailable, and MUST NOT free the segment new records are being added to. It
+   MUST make the store's sequence durable in the oldest segment that stays (the
+   *floor*) before it wipes any header, and MUST NOT wipe a header until that
+   segment's own header is on the disk. It MUST wipe oldest first, each durable
+   before the next. It MUST NOT run concurrently with a `replay` that is reading
+   the segment.
 8. **Deadline.** `due(a)` MUST complete when the oldest unpublished record has been
    acknowledged for `a`, measured from that record's own acknowledgement time. Later
    appends MUST NOT move the deadline. When `publish` retires the oldest record, the
-   deadline MUST move to the next unpublished record. With nothing unpublished no timer
-   MAY be pending; the deadline starts with the next append. The implementation MAY
-   fire up to 1 ms early and MUST NOT fire late by more than the clock's resolution.
+   deadline MUST move to the next unpublished record. With nothing unpublished no
+   timer MAY be pending; the deadline starts with the next append. Two firings MUST
+   be at least a configured *retry* apart. `due` MUST complete when the journal
+   closes or fails, and MUST release its timer and its registration when its context
+   ends. Ages within the process MUST be measured on a monotonic clock; a record
+   recovered from disk whose acknowledgement time is later than the time of the
+   restart MUST be treated as acknowledged at the restart, so a restart never
+   lengthens the time a record has left. The implementation MAY fire up to 1 ms
+   early and MUST NOT fire late by more than the clock's resolution.
 9. **State.** `state` MUST report the bytes of unpublished records, the age of the
-   oldest, and the error that stopped the journal. It MUST report `degraded` when that
-   age exceeds the configured bound, when the journal is slowing appends, or when it
-   has failed.
+   oldest, and the error that stopped the journal. It MUST report `degraded` when
+   that age exceeds the configured bound, when the journal is slowing appends, or
+   when it has failed.
 10. **Backpressure.** Disk use MUST NOT exceed the capacity. Below 75 % of the
-    capacity `append` MUST NOT be delayed. Between 75 % and 100 % it MUST be delayed so
-    that the admitted rate falls toward 64 MiB/s as the fill approaches 100 %; a
+    capacity `append` MUST NOT be delayed. Between 75 % and 100 % it MUST be delayed
+    so that the admitted rate falls toward 64 MiB/s as the fill approaches 100 %; a
     delayed append MUST return when its context ends. At 100 % it MUST fail with the
-    "full" error. No record is ever dropped. When the publisher publishes and reclaims,
-    appends MUST succeed again and replay MUST return the older records first.
-11. **Format.** A segment is a file holding a 20-byte header and records back to back.
-    The header is `checksum(4) first(8) life(8)`: the CRC-32C of the last 16 bytes,
-    the sequence of the segment's first record (at least 1), and a random value fresh
-    each time the file is used. A record is `checksum(4) length(4) sequence(8)
-    acknowledged(8) payload checksum(4) payload`: the record checksum is the CRC-32C
-    of the 24 bytes after it, seeded with a 32-bit value derived from the segment's
-    life; the payload checksum is the CRC-32C of the payload; `acknowledged` is Unix
-    nanoseconds. Integers are little endian. Records do not span segments. A header
-    of zeros marks a free segment.
-12. **Recovery.** `open` MUST keep the longest prefix of records in which every
-    record is valid under its segment's life and has the sequence one greater than its
-    predecessor, across segments ordered by `first` and linked only where `first`
-    equals the previous segment's last sequence plus one. It MUST discard everything
-    after the first byte that fails, MUST make the discarded segments free durably
-    before any new record is written, MUST make the records it keeps durable before it
-    returns, and MUST write new records to a segment that holds no kept record.
-    `reclaim` MUST free segments oldest first, each durable before the next. A log
-    that begins after the store's sequence plus one, or ends at or before the store's
-    sequence, MUST be discarded and numbering MUST continue from the store's sequence.
-13. **Bounded exposure.** The memory the journal queues for the file layer MUST be
-    bounded: when the writer cannot keep up, `append` waits for it. The data written but
-    not yet synced SHOULD be bounded too, and the journal SHOULD start syncs without a
-    caller waiting and ask the system to write data out as it is written, so a `sync`
-    never waits behind an unbounded amount of other callers' data. This implementation
-    queues at most 16 MiB, starts a sync every 8 MiB, lets the writer run at most 16 MiB
-    ahead of the last completed sync, and requests writeback for every 1 MiB.
-14. **Crash outcomes.** After a crash of the process with the files intact, the
-    recovered log MUST contain every record whose `sync` returned. After a crash of the
-    machine, the recovered log MUST be a prefix of the appended records that contains
-    every record whose `sync` returned and that is not published. After loss of the
-    disk the journal is empty, the unpublished tail is lost, and the caller MUST NOT
-    report those records durable.
+    "full" error. No record is ever dropped. When the publisher publishes and
+    reclaims, appends MUST succeed again and replay MUST return the older records
+    first.
+11. **Format.** A segment is a file holding a 36-byte header, two 20-byte marks and
+    records back to back. The header is `checksum(4) first(8) life(8) lineage(16)`:
+    the CRC-32C of the last 32 bytes, the sequence of the segment's first record (at
+    least 1), a random value fresh each time the file is used, and the first 16
+    bytes of the SHA-256 of the caller's lineage. A mark is `checksum(4) through(8)
+    floor(8)`, its checksum the CRC-32C of the last 16 bytes seeded with the seed
+    below. A record is `checksum(4) length(4) sequence(8) acknowledged(8) payload
+    checksum(4) payload`: the record checksum is the CRC-32C of the 24 bytes after
+    it seeded with the seed below; the payload checksum is the CRC-32C of the
+    payload; `acknowledged` is Unix nanoseconds. The seed is the CRC-32C of the
+    segment's `life` (8 bytes) followed by its `lineage`. Integers are little endian.
+    Records do not span segments. A header of zeros marks a free segment.
+12. **Marks.** A mark's `through` MUST be a sequence that a completed sync had
+    covered before the mark was written; its `floor` MUST be a sequence the store
+    held. A mark MUST be written after the sync it describes (in a later sync round,
+    so that round's sync carries it) and at close, and MUST NOT cost a sync of its
+    own. Marks MAY be spaced out; the more rounds between them, the more of the end
+    of a killed journal is covered by no surviving mark and is treated as a torn tail
+    (the reference implementation writes one every sixteenth round or megabyte). The two mark slots MUST be written
+    alternately. A reader takes the highest `through` and `floor` of the slots that
+    validate.
+13. **Recovery.** `open` MUST decide before it writes. It MUST fail, and MUST NOT
+    write, when: a segment's lineage is not the caller's; the store's sequence is
+    below the highest floor; the store's sequence is above the last record of a
+    non-empty log; or a `through` is above both the last record and the store's
+    sequence (records that were made durable are gone); or the log begins after the
+    store's sequence with a `through` above it. Otherwise it MUST keep the longest
+    prefix of records in which every record is valid under its segment's life and
+    lineage and has the sequence one greater than its predecessor, across segments
+    ordered by `first` then name and linked only where `first` equals the previous
+    segment's last sequence plus one. It MAY drop what follows the first byte that
+    fails, and a log that begins after the store's sequence when no `through`
+    proves a sync past it; it MUST report what it dropped, MUST make the dropped
+    segments free durably before any new record is written, MUST make the records it
+    keeps durable before it returns, and MUST write new records to a segment that
+    holds no kept record.
+14. **Discard.** The only operation that gives records up is a separate one that
+    names the first and last sequence; it MUST do nothing, and fail, unless the
+    journal holds exactly that range.
+15. **Exclusion and placement.** The journal MUST hold an exclusive lock on its
+    directory for as long as it is open and MUST refuse a second journal on the
+    directory. It MUST refuse a directory on volatile memory. It SHOULD create the
+    directory readable by its owner alone, the files likewise, and warn about
+    layered and remote file systems. The segment size MUST NOT exceed 4 GiB.
+16. **Bounded exposure.** The memory the journal queues for the file layer MUST be
+    bounded: when the writer cannot keep up, `append` waits for it. The data written
+    but not yet synced SHOULD be bounded too, and the journal SHOULD start syncs
+    without a caller waiting and ask the system to write data out as it is written,
+    so a `sync` never waits behind an unbounded amount of other callers' data. This
+    implementation queues at most 16 MiB, starts a sync every 8 MiB, lets the writer
+    run at most 16 MiB ahead of the last completed sync, and requests writeback for
+    every 1 MiB.
+17. **Crash outcomes.** After a crash of the process with the files intact, the
+    recovered log MUST contain every record whose `sync` returned. After a crash of
+    the machine, the recovered log MUST be a prefix of the appended records that
+    contains every record whose `sync` returned and that is not published, and
+    `open`, told the store's sequence, MUST NOT fail. After loss of the disk the
+    journal is empty, the unpublished tail is lost, and the caller MUST NOT report
+    those records durable.
 
 ### Acceptance criteria
 
@@ -491,27 +740,32 @@ Each criterion is a test that fails if the requirement is removed.
   syncs are issued.
 * **A4 crash exploration**: run a mixed workload (append, sync, publish, reclaim,
   several writers) on a file layer that logs writes and syncs. For every prefix of
-  the log and for each of: no volatile write kept, all kept, each prefix kept, the last
-  volatile writes torn at 1, 100, 512 and 612 bytes, at half the write rounded down to a
-  sector, and one byte short, random per-sector subsets: recovery succeeds, told the
-  store's sequence; the replay is contiguous after it; its payloads
-  equal those appended; it reaches every record whose `sync` returned unless the store
-  holds it; a second replay and a second `open` return the same.
-* **A5 no resurrection**: in every state of A4, append four new records with different
-  payloads and sync them, keep only synced data, recover: the replay is the earlier
-  records followed by exactly the four, never a record of the lost tail. A direct case:
-  reuse a segment so that the new records end where a stale record with the next
-  expected sequence begins; the stale record is not replayed.
-* **A6 reclaim window**: append 12 records (9 synced), publish 9 and reclaim; at every
-  crash point, with the wipes persisted in any order, recovery with the store at 9
-  yields a log that is a prefix, numbers on from 10, and loses no record above 9 that
-  was synced.
+  the log and for each of: no volatile write kept, all kept, each prefix kept, every
+  subset of up to six volatile writes, the last volatile writes torn at 1, 100, 512
+  and 612 bytes, at half the write rounded down to a sector, and one byte short,
+  random per-sector subsets: recovery, told the store's sequence, succeeds; the
+  replay is contiguous after it; its payloads equal those appended; it reaches every
+  record whose `sync` returned unless the store holds it; a second replay and a
+  second `open` return the same; and the same holds for every crash state of the
+  recovery itself.
+* **A5 no resurrection**: in every state of A4, append four new records with
+  different payloads and sync them, keep only synced data, recover: the replay is
+  the earlier records followed by exactly the four, never a record of the lost
+  tail. A direct case: reuse a segment so that the new records end where a stale
+  record with the next expected sequence begins; the stale record is not replayed.
+* **A6 reclaim window**: append 12 records (9 synced), publish 6 and reclaim; at
+  every crash point, with the wipes persisted in any order, recovery with the store
+  at the sequence it held yields a log that is a prefix and loses no record above 6
+  that was synced.
 * **A7 reclaim safety**: while a replay is paused inside its callback, `reclaim` does
-  not modify any segment.
-* **A8 deadline**: with a controlled clock, append at `t`, `due(5 s)` closes at `t + 5 s`
-  and not 1 ms before; ten appends in between do not move it; with records at `t` and
-  `t + 3 s`, publishing the first moves the deadline to `t + 8 s`; with nothing
-  unpublished no timer is pending, and after 1,000 appends one timer is.
+  not modify any segment; with the next segment's first record still queued behind
+  the writer, `reclaim` wipes nothing.
+* **A8 deadline**: with a controlled clock, append at `t`, `due(5 s)` closes at
+  `t + 5 s` and not 1 ms before; ten appends in between do not move it; with records
+  at `t` and `t + 3 s`, publishing the first moves the deadline to `t + 8 s`; with
+  nothing unpublished no timer is pending, and after 1,000 appends one timer is;
+  1,000 abandoned calls leave none; an overdue record fires again `retry` after the
+  last firing, not before; the channel closes when the journal fails.
 * **A9 bound**: a writer appending every 10 ms and a publisher that publishes when
   `due(5 s)` closes keep `state.age` at or below 5 s for a minute; stopping the
   publisher for 20 s makes `degraded` true with `age` above 20 s and a growing
@@ -519,23 +773,42 @@ Each criterion is a test that fails if the requirement is removed.
 * **A10 backpressure**: with no publisher, appends are delayed before the first
   `full` error and no acknowledged record is lost; after publishing half and
   reclaiming, appends succeed, the next sequence continues, and replay starts after
-  the published mark.
-* **A11 failure**: after an injected write or sync error, `sync` of a non-durable
-  sequence and every `append` fail with that error; `sync` of a durable sequence
-  succeeds.
-* **A12 damage**: flipping a byte inside record `k` leaves a replay of exactly
-  `1..k-1`, and later appends continue at `k`; with the damage in the second of three
-  segments the third is discarded and its sequences are reused.
-* **A13 store ahead and behind**: after records 1..5 are synced and the journal is opened
-  with the store at 9, the marks are 9/9/9, the replay is empty and the next sequence is
-  10. With nine records synced, six published and the oldest segments reclaimed, opening
-  with the store at 2 discards the log: marks 2/2/2, empty replay, next sequence 3, and
-  the discarded records do not return.
-* **A14 capacity**: the files never occupy more than the capacity.
-* **A15 exposure**: with the first sync held in the file layer, a stream of 1 MiB
-  appends is written no further than 28 MiB; with the writer held in its first write,
-  at most 20 MiB are admitted. Appending 6 MiB in 1 MiB records requests writeback for
-  5 to 7 MiB, and 3 KiB of small records requests none.
+  the published mark. A file layer that cannot make a segment gives `full`, not a
+  failed journal.
+* **A11 failure**: after an injected write or sync error, or a short write, `sync` of
+  a non-durable sequence and every `append` fail with that error; `sync` of a durable
+  sequence succeeds.
+* **A12 damage**: after a clean close, flipping a byte inside record `k` makes `open`
+  fail as corrupt, twice, changing nothing; with the marks zeroed (a crash that
+  lost them) it leaves a replay of exactly `1..k-1`, later appends continue at `k`,
+  and `recovery` lists the intact segments it dropped.
+* **A13 the store**: with records 7 to 9 synced and 1 to 6 published and reclaimed,
+  `open` with the store at 0, 2 or 5 fails as a mismatch and a mount with 6 still
+  replays 7 to 9. With records 1 to 5 and the store at 9, `open` fails as a mismatch;
+  on an empty directory with the store at 9 the marks are 9/9/9 and the next sequence
+  is 10.
+* **A14 lineage**: records written under one lineage are not opened under another or
+  under none; `discard` of the exact range removes them and the new lineage starts
+  after the store's sequence; `discard` of any other range fails and changes nothing.
+* **A15 exclusion**: a second `open` on a directory with a live journal fails; it
+  succeeds after the first closes.
+* **A16 placement**: `open` on a tmpfs directory fails as volatile; the file system
+  types tmpfs and ramfs are refused and overlay, FUSE, 9p and network ones warned
+  about; directory and files are not accessible to group and others.
+* **A17 capacity**: the files never occupy more than the capacity, on the real file
+  layer, across restarts.
+* **A18 exposure**: with the first sync held in the file layer, a stream of 1 MiB
+  appends is written no further than 28 MiB; with the writer held in its first
+  write, at most 20 MiB are admitted. Appending 6 MiB in 1 MiB records requests
+  writeback for 5 to 7 MiB, and 3 KiB of small records requests none.
+* **A19 clock**: reopening with a clock an hour behind makes a record count as just
+  acknowledged and `due` fires `age` after the restart; with the clock right the
+  age carries across the restart.
+* **A20 system calls** (under a tracer, with no strace or root): `create` issues `fdatasync` of the new
+  file, then the rename, then `fsync` of the directory; `remove` is followed by
+  `fsync` of the directory; the parent of the journal's directory is synced and the
+  lock taken before the first segment; `sync` issues `fdatasync` of the segment; an
+  injected `EIO` on that `fdatasync` fails the `sync` and the next `append`.
 
 ## References
 
