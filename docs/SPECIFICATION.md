@@ -533,7 +533,7 @@ reference implementation (all in the repository root unless a package is named):
 | holes and truncation, byte for byte against a plain model | `TestSparseExact`, `TestSparseRandom`, `TestSparsePetabyte`, `TestModelFuzz` |
 | bounded reads | `TestHeadBound`, `TestShardBound`, `TestBackendBodyIsBounded`, `TestReadIsBounded` |
 | prefixes | `TestValidPrefix`, `TestPrefixConfinement` |
-| durability and interrupts on a mount | `TestFUSEFsyncSurvivesKill`, `TestFUSEInterruptsAreNotErrors`, `TestFsyncWaitsForItsCommit`, `TestCloseWaitsForItsCommit`, `TestReadWaitsForItsData`, `TestLookupIsNotAnsweredEINTR`, `TestAttrIsNotAnsweredEINTR`, `TestReaddirIsNotAnsweredEINTR`, `TestMkdirIsNotAnsweredEINTR`, `TestRemoveIsNotAnsweredEINTR`, `TestCreateIsNotAnsweredEINTR`, `TestEveryHandlerOutlivesItsRequest`, `TestFsyncCallersShareTwoCommits`, `TestStalledReadsHoldBoundedMemory`, `TestFUSEReadsExistingFilesOverS3`, and `TestFUSESQLite` (`internal/sqlitecheck`) on a Linux kernel |
+| durability and interrupts on a mount | `TestFUSEFsyncSurvivesKill`, `TestFUSEInterruptsAreNotErrors`, `TestFsyncWaitsForItsCommit`, `TestCloseWaitsForItsCommit`, `TestReadWaitsForItsData`, `TestLookupIsNotAnsweredEINTR`, `TestAttrIsNotAnsweredEINTR`, `TestReaddirIsNotAnsweredEINTR`, `TestMkdirIsNotAnsweredEINTR`, `TestRemoveIsNotAnsweredEINTR`, `TestCreateIsNotAnsweredEINTR`, `TestEveryHandlerOutlivesItsRequest`, `TestFsyncCallersShareTwoCommits`, `TestFUSEReadsExistingFilesOverS3`, and `TestFUSESQLite` (`internal/sqlitecheck`) on a Linux kernel |
 | full-size randomised runs | `TestSparseExact`, `TestSparseRandom`, `TestSparseCanonicalRuns`, `TestSparseTinyBounds` (the `sparse` gate, not `-short`) |
 
 ## 11. Not specified, and known limits
@@ -551,9 +551,10 @@ Known limits of the reference implementation. None changes the layout.
   that is killed leaves its read, write, create, truncate or exit in the kernel until the
   store resumes, and the daemon holds every abandoned request. Measured with the store
   stopped: 1,600 reads at distinct offsets grew the daemon by about 225 MB and 3,000
-  distinct lookups by about 386 MB, about 128 KiB for each request. Reads now hold a
-  buffer only while one of 64 slots is theirs, which bounds what a read allocates; the
-  request itself is held by the FUSE library and is not bounded here. A flush holds the
+  distinct lookups by about 386 MB, about 128 KiB for each request, which the FUSE
+  library holds until the handler returns; limiting what a handler allocates does not
+  change it (it was tried for reads: 245 MB for 1,600 reads with and without). A flush
+  holds the
   Volume's lock while it commits, so one stalled commit stalls every call behind it.
   Deadlines on store requests, and giving the lock up to a call that is waiting, are
   the next change and are not part of this layout.

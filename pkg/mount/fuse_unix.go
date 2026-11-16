@@ -289,10 +289,7 @@ var (
 )
 
 func (h *handle) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse) error {
-	// The work of a read is the mount's, not the request's, and a stalled store holds at
-	// most readSlots buffers.
-	h.s.reads <- struct{}{}
-	defer func() { <-h.s.reads }()
+	// The work of a read is the mount's, not the request's (errno.go).
 	buf := make([]byte, req.Size)
 	n, err := h.file.ReadAt(h.s.base, buf, req.Offset)
 	if err != nil && !errors.Is(err, io.EOF) {

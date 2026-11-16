@@ -44,10 +44,12 @@ commit or a fetch.
 The cost is that a call waits for the store, and there are no deadlines on store
 requests yet. With the store stopped, a caller that is killed stays in the kernel
 until the store resumes, and the daemon holds every abandoned request: 1,600 reads at
-distinct offsets grew it by about 225 MB before reads were bounded, and 3,000 distinct
-lookups by about 386 MB (about 128 KiB for each request, held by the FUSE library).
-Reads now hold a buffer only while one of 64 slots is theirs. Deadlines are the next
-change (section 11 of the specification).
+distinct offsets grew it by about 225 MB, and 3,000 distinct lookups by about 386 MB
+(about 128 KiB for each request, held by the FUSE library until its handler returns).
+Bounding what a read allocates itself changed nothing (245 MB for 1,600 reads either
+way), so the memory is freed only by answering the abandoned requests, which is what a
+deadline on the store will do. Deadlines are the next change (section 11 of the
+specification).
 
 What a failed `Flush` tells the caller. `nil`: committed. Any other error: the outcome
 of that attempt is unknown (a reply can be lost after the write landed) and the
@@ -103,7 +105,6 @@ the last committed tree, whole, and a retry commits the next.
 | A guest who picks file names cannot multiply the metadata | pass | `TestGroundNamesDoNotBloatTheTree`: names ground against another key write as many shards as ordinary ones (6 and 6; 2,007 and 4 before the boundaries were keyed from the Volume's seed) |
 | Every spelling of one place is one place; a moved Volume is resealed | pass | `TestPlaceSpellings`, `TestResealMovesAVolume` |
 | Callers of fsync do not pile up commits | pass | `TestFsyncCallersShareTwoCommits`: 3,000 callers against a stalled store share two commits, one running and one waiting, and the store sees at most four Head writes |
-| A stalled store holds bounded memory for reads | pass | `TestStalledReadsHoldBoundedMemory`: 1,000 reads of 128 KiB against a stalled store hold under 40 MiB |
 | A mount hands the store a context on every path | pass | `TestLookedUpFileReadsOnTheMountContext` (over a store that panics on a nil context), `TestSessionRefusesANilContext`, `TestFUSEReadsExistingFilesOverS3` (a mount over the real server) |
 | A Cipher that hides nothing is refused at configuration | pass | `TestIdentityCipherIsRefused` |
 | Key rotation | pass | `TestRotation`: a Cipher with the new key and the old one reads everything and seals under the new; once the old is dropped, what only it sealed no longer opens |

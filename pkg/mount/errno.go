@@ -79,15 +79,11 @@ func errno(err error) error {
 // so a store that stops answering stops every call that needs it, and killing a caller
 // does not free it: read, write, create, truncate and the exit of a process with an open
 // file were seen to stay in the kernel until the store answered, while the daemon holds
-// every abandoned request (about 128 KiB of the FUSE library's message buffer for each:
-// 3,000 stalled lookups held 386 MB, and 1,600 reads held 225 MB before their buffers
-// were bounded). Reads are bounded now: at most readSlots hold a buffer. The rest is the
-// deadlines' change (docs/SPECIFICATION.md, section 11).
-
-// readSlots bounds the reads that hold a buffer at once. A read is at most 128 KiB, so
-// a stalled store holds at most 8 MiB for reads, and the reads behind them wait for a slot
-// before they allocate.
-const readSlots = 64
+// every abandoned request: the FUSE library holds a message buffer of about 128 KiB for
+// each until its handler returns, whatever the handler does (3,000 stalled lookups held
+// 386 MB and 1,600 stalled reads 225 MB, and limiting what a read allocates itself did
+// not change that). Only answering the abandoned requests frees them, which is what a
+// deadline on the store does: it is the next change (docs/SPECIFICATION.md, section 11).
 
 // session is what every node and handle of one mount shares: the Volume, the mount's
 // own context, and the committer. It is built only by newSession, which refuses a
@@ -97,14 +93,13 @@ type session struct {
 	vol   *vfs.Volume
 	base  context.Context
 	group *committer
-	reads chan struct{} // a slot for each read that holds a buffer
 }
 
 func newSession(base context.Context, vol *vfs.Volume) *session {
 	if base == nil || vol == nil {
 		panic("mount: a session needs a context and a Volume")
 	}
-	return &session{vol: vol, base: base, group: newCommitter(vol), reads: make(chan struct{}, readSlots)}
+	return &session{vol: vol, base: base, group: newCommitter(vol)}
 }
 
 // committer runs the commits of a mount. A commit settles every open file and

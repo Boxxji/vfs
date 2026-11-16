@@ -720,8 +720,8 @@
  {
   "name": "mount: a session without a mount context",
   "file": "pkg/mount/errno.go",
-  "old": "return &session{vol: vol, base: base, group: newCommitter(vol), reads: make(chan struct{}, readSlots)}",
-  "new": "return &session{vol: vol, group: newCommitter(vol), reads: make(chan struct{}, readSlots)}",
+  "old": "return &session{vol: vol, base: base, group: newCommitter(vol)}",
+  "new": "return &session{vol: vol, group: newCommitter(vol)}",
   "pkg": "./pkg/mount",
   "run": "TestLookedUpFileReadsOnTheMountContext|TestReadWaitsForItsData",
   "tags": "fuse"
@@ -977,15 +977,6 @@
   "new": "func (c *committer) commit() error {\n\tf := c.join()\n\tselect {\n\tcase <-f.done:\n\tdefault:\n\t\treturn syscall.EINTR\n\t}\n\treturn f.err\n}",
   "pkg": "./pkg/mount",
   "run": "^Test(FsyncWaitsForItsCommit|CloseWaitsForItsCommit)$",
-  "tags": "fuse"
- },
- {
-  "name": "mount: reads hold a buffer without a slot",
-  "file": "pkg/mount/fuse_unix.go",
-  "old": "\th.s.reads <- struct{}{}\n\tdefer func() { <-h.s.reads }()\n",
-  "new": "",
-  "pkg": "./pkg/mount",
-  "run": "^TestStalledReadsHoldBoundedMemory$",
   "tags": "fuse"
  },
  {
