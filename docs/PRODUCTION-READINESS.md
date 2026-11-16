@@ -128,14 +128,14 @@ Mount tests run only with `-tags fuse`, from a child process that serves the mou
 while the test acts as its client; a process that mounts a Volume and also opens a
 file on that mount deadlocks. The real-server tests need an `s3` binary on `PATH`.
 
-CI (`hanzo.yml`, `.github/workflows/cicd.yml`) runs fourteen gates as jobs, three at a
+CI (`hanzo.yml`, `.github/workflows/cicd.yml`) runs fifteen gates as jobs, three at a
 time, each under five minutes from a cold Go cache. Three at a time because the gates
 share the machine's capacity, and more at once only made each slower. The gates are:
 `check` (build, vet and gofmt of what does not need the SQLite engine, and a vet of
 the mount for macOS); `unit`; `race`, the tests that have goroutines under the race
 detector, with the handlers of the mount; `model`, the random tests against a plain
 model at their short size, without the race detector (they have no goroutines, and the
-detector multiplies their hashing tenfold); `sparse`, the same randomised tests of
+detector multiplies their hashing tenfold); `sparse` and `sparse-tiny`, the same randomised tests of
 holes at full size; `sqlite`, the only gate that builds the SQLite engine; `realserver`,
 `realserver-cas`, `realserver-cas-large` and `realserver-kill`, against the real Hanzo
 S3 server (the conditional-write race on a real server is split in two because its

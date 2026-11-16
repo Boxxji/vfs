@@ -15,6 +15,7 @@
 #                    -short size: no goroutines, so no race detector, which would
 #                    multiply the hashing and sealing they do tenfold
 #   sparse           the randomised tests of holes at full size (not -short)
+#   sparse-tiny      the same with tiny bounds, 40 seeds
 #   sqlite           the packages that run a real SQLite engine on a Volume
 #   realserver       the engine, its store client and the fence against a real Hanzo S3 server
 #   realserver-cas   the conditional-write race on small objects, against the real server
@@ -108,7 +109,9 @@ test:
   - name: model
     run: go test -short -count=1 -run '^Test(Sparse|Model|TreeForced)' .
   - name: sparse
-    run: go test -count=1 -timeout 4m -run '^TestSparse(Exact|Random|CanonicalRuns|TinyBounds)$' .
+    run: go test -count=1 -timeout 4m -run '^TestSparse(Exact|Random|CanonicalRuns)$' .
+  - name: sparse-tiny
+    run: go test -count=1 -timeout 4m -run '^TestSparseTinyBounds$' .
   - name: sqlite
     run: |
       set -euo pipefail
