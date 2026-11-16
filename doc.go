@@ -54,8 +54,8 @@
 //	Volume.Flush                           everything written before the call, committed. It
 //	                                         returns only after the Head advanced.
 //	Fsync (FUSE FSYNC)                     the same as Flush: a full commit. There is no
-//	                                         cheaper durable point. An interrupted caller
-//	                                         gets EINTR and the commit lands or fails on its own terms.
+//	                                         cheaper durable point. A signal that reaches the
+//	                                         caller does not end the wait.
 //	Flush on the FUSE front (every close)  the same as Flush: a full commit.
 //	Release on the FUSE front              nothing.
 //	end of a mount                         one Flush, then the mount returns.
@@ -68,13 +68,14 @@
 //
 // Interrupts on the mount. A signal that reaches a caller while it waits on the mount
 // (Go's runtime sends one every few milliseconds) makes the kernel interrupt the
-// request. fsync(2) stops waiting and is answered EINTR, which libc and Go restart;
-// the commit it asked for goes on by itself, on a context no request owns, and lands
-// or fails on its own terms. close(2), read(2), write(2) and the calls that change
-// the tree are not answered EINTR (a read answered EINTR reaches its caller as EIO,
-// close is never restarted, a restarted create(2) with O_EXCL would meet its own
-// file): they wait and return their own result. Nothing a caller's interrupt does
-// cancels a commit or a fetch.
+// request, and no request is answered EINTR: every call waits and returns its own
+// result. Callers do not restart it: SQLite reports an fsync answered EINTR as an I/O
+// error, a stat answered EINTR is an error to a C caller whether or not it set
+// SA_RESTART, a read answered EINTR reaches its caller as EIO, close is never
+// restarted, and a restarted create(2) with O_EXCL would meet its own file. Nothing a
+// caller's interrupt does cancels a commit or a fetch. The cost is that a call waits
+// as long as the store takes: store requests have no deadline yet (docs/SPECIFICATION.md,
+// section 11).
 //
 // What a failed Flush tells the caller. nil: committed. Any other error: the
 // outcome of that attempt is unknown to the caller (a reply can be lost after the

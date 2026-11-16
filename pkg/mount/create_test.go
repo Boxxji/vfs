@@ -58,3 +58,32 @@ func TestCreateOfAnExistingFileOpensIt(t *testing.T) {
 		t.Fatalf("create of a directory's name = %v, want EISDIR", err)
 	}
 }
+
+// TestCreateOfANameBeingRemoved: a name that exists when the creation is refused and is
+// gone when it is looked up is created again, not answered ENOENT.
+func TestCreateOfANameBeingRemoved(t *testing.T) {
+	_, v, _, _ := testVolume(t)
+	bg := context.Background()
+	root := newSession(bg, v).node(1, 1)
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			_, _ = v.Create(bg, 1, "x", 0o644)
+			_ = v.Remove(bg, 1, "x")
+		}
+	}()
+	defer func() { close(stop); <-done }()
+	for i := range 3000 {
+		_, _, err := root.Create(bg, &fuse.CreateRequest{Name: "x", Mode: 0o644, Flags: fuse.OpenFlags(os.O_CREATE | os.O_WRONLY)}, &fuse.CreateResponse{})
+		if err != nil {
+			t.Fatalf("create %d of a name that is being removed = %v", i, err)
+		}
+	}
+}

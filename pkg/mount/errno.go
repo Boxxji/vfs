@@ -40,8 +40,8 @@ func errno(err error) error {
 	case errors.Is(err, vfs.ErrReadOnly), errors.Is(err, vfs.ErrStaleRound):
 		return syscall.EROFS
 	case errors.Is(err, context.Canceled):
-		// The kernel interrupted the request (a signal reached the caller while it
-		// waited): not a fault. The caller's call is restarted, or it sees EINTR.
+		// Only the end of the mount cancels a context here (see below): nobody is
+		// waiting for the answer.
 		return syscall.EINTR
 	case errors.Is(err, context.DeadlineExceeded):
 		return syscall.ETIMEDOUT
@@ -51,53 +51,40 @@ func errno(err error) error {
 	return syscall.EIO
 }
 
-// What an interrupt does. When a signal reaches a caller that is waiting on the mount
-// (Go's runtime sends one every few milliseconds to preempt), the kernel sends the
-// server FUSE_INTERRUPT and the request's context ends. What that may cost depends on
-// what the caller does with the answer EINTR, which was measured, not assumed:
+// What an interrupt does: nothing. When a signal reaches a caller that is waiting on the
+// mount (Go's runtime sends one every few milliseconds to preempt), the kernel sends the
+// server FUSE_INTERRUPT and the request's context ends. No request is answered EINTR,
+// because what a caller does with that answer was measured, and it is not what C
+// libraries are said to do:
 //
-//   - fsync(2) and the lookups (stat, readdir) are restarted by the callers that matter
-//     (libc, and Go's os package), so they honour the interrupt: the caller stops
-//     waiting and is answered EINTR.
-//   - read(2) answered EINTR reaches the caller as EIO when the kernel's page cache
-//     was filling the pages (20 GiB of Go reads under signals: 2 of 2 workers failed
-//     at the first block), so a read waits for its data, whatever signals arrive.
+//   - fsync(2) answered EINTR is an error to SQLite (its Go port and its C library both
+//     report it as an I/O error): a C caller under SIGALRM saw 246,912 EINTRs over 5,000
+//     fsyncs, and `go test` of a SQLite database on the mount failed 7 times of 7 on an
+//     amd64 kernel. Neither glibc nor the kernel restarts it.
+//   - stat(2) and readdir answered EINTR reached a C caller as an error 1,586 times of
+//     60,000 without SA_RESTART and 2,884 times with it: the kernel does not restart a
+//     FUSE request that was answered EINTR.
+//   - read(2) answered EINTR reaches the caller as EIO when the kernel's page cache was
+//     filling the pages (20 GiB of Go reads under signals failed at the first block).
 //   - close(2) is not restarted at all (Linux has dropped the descriptor; Go's
-//     os.File.Close returns the error as it is), so a close waits for its commit.
-//   - a request that changes the Volume (write, create, mkdir, unlink, truncate) runs
-//     to the end: answered EINTR after it took effect, a restarted create(2) with
-//     O_EXCL would fail with EEXIST on its own file.
+//     os.File.Close returns the error as it is).
+//   - a request that changes the Volume, answered EINTR after it took effect, makes a
+//     restarted create(2) with O_EXCL fail with EEXIST on its own file.
 //
-// In every case the work is not tied to the request's context.
+// So every handler runs on a context its request cannot end (context.WithoutCancel),
+// and the work of a read runs on the mount's own context. A caller is always answered
+// with the result of its call.
+//
+// The cost is that a call waits for the store. There are no deadlines on the store yet,
+// so a store that stops answering stops every call that needs it, and a caller can leave
+// only by SIGKILL, which ends its wait in the kernel while the daemon goes on holding the
+// request (about 128 KiB of the FUSE library's message buffer for each: 3,000 stalled
+// lookups held 386 MB, and reads before the buffers below were bounded, 1,600 held 225 MB).
+// Reads are bounded: at most readSlots hold a buffer. The rest is the deadlines' change.
 
-// own runs work on base, a context no single request owns, and waits for it only as
-// long as the request lives. When the request ends first (an interrupt the call
-// honours) the wait ends with the request's error, which errno turns into EINTR, and
-// the work goes on by itself: it finishes or fails on its own terms, whoever queued
-// behind it still gets its result, and the restarted call finds it done. The work
-// must not touch memory the request owns. A request that must not be answered EINTR
-// passes context.WithoutCancel(ctx) as req and waits to the end.
-func own[T any](req, base context.Context, work func(context.Context) (T, error)) (T, error) {
-	var zero T
-	if err := req.Err(); err != nil {
-		return zero, err
-	}
-	type result struct {
-		v   T
-		err error
-	}
-	done := make(chan result, 1)
-	go func() {
-		v, err := work(base)
-		done <- result{v, err}
-	}()
-	select {
-	case r := <-done:
-		return r.v, r.err
-	case <-req.Done():
-		return zero, req.Err()
-	}
-}
+// readSlots bounds the reads that hold a buffer at once, so a stalled store holds at most
+// readSlots times the largest read, 8 MiB, for reads.
+const readSlots = 64
 
 // session is what every node and handle of one mount shares: the Volume, the mount's
 // own context, and the committer. It is built only by newSession, which refuses a
@@ -107,27 +94,25 @@ type session struct {
 	vol   *vfs.Volume
 	base  context.Context
 	group *committer
+	reads chan struct{} // a slot for each read that holds a buffer
 }
 
 func newSession(base context.Context, vol *vfs.Volume) *session {
 	if base == nil || vol == nil {
 		panic("mount: a session needs a context and a Volume")
 	}
-	return &session{vol: vol, base: base, group: newCommitter(vol)}
+	return &session{vol: vol, base: base, group: newCommitter(vol), reads: make(chan struct{}, readSlots)}
 }
 
 // committer runs the commits of a mount. A commit settles every open file and
 // replaces the Head, and every other caller queues behind it, so it is shared work: it
-// runs on a context nothing cancels, in a goroutine of its own, never half-cancelled
-// and never left with the Head's outcome unknown because one caller was interrupted.
-// A caller waits for it as long as its request lives.
+// runs on a context nothing cancels, in a goroutine of its own, never half-cancelled.
 //
 // Commits do not pile up behind a stalled store: at most two exist, the one running
 // and one waiting to start. A caller that arrives while one is running joins the one
 // waiting, which starts after the caller's writes were made and so covers them; a
-// caller that arrives when none is running starts one. Five thousand interrupted
-// fsyncs retried against a stalled store therefore park two goroutines, not five
-// thousand.
+// caller that arrives when none is running starts one. Five thousand callers of fsync
+// against a stalled store therefore share two commits, not five thousand.
 type committer struct {
 	vol       *vfs.Volume
 	mu        sync.Mutex
@@ -142,20 +127,12 @@ type flight struct {
 
 func newCommitter(vol *vfs.Volume) *committer { return &committer{vol: vol} }
 
-// commit makes everything written before the call durable, or ends with the
-// request: with its error if the request ended first (EINTR), the commit going on
-// by itself.
-func (c *committer) commit(req context.Context) error {
-	if err := req.Err(); err != nil {
-		return err
-	}
+// commit makes everything written before the call durable, and returns the result of
+// the commit that did.
+func (c *committer) commit() error {
 	f := c.join()
-	select {
-	case <-f.done:
-		return f.err
-	case <-req.Done():
-		return req.Err()
-	}
+	<-f.done
+	return f.err
 }
 
 // join returns a flight that starts after now.

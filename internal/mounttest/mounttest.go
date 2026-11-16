@@ -152,10 +152,19 @@ func MountURL(t *testing.T, url string, env []string, mp string, key *age.Hybrid
 		t.Fatal(err)
 	}
 	m := &Mounted{Cmd: cmd, Dir: mp, Done: make(chan error, 1)}
-	go func() { m.Done <- cmd.Wait() }()
+	exited := make(chan struct{})
+	go func() { m.Done <- cmd.Wait(); close(exited) }()
 	t.Cleanup(func() {
+		// A test that failed with a file still open on the mount leaves it busy: the
+		// first unmount is refused, the server is killed, and the mount, now without
+		// a server, is unmounted by the second.
 		Unmount(mp)
 		_ = cmd.Process.Kill()
+		select {
+		case <-exited:
+		case <-time.After(10 * time.Second):
+		}
+		Unmount(mp)
 	})
 	deadline := time.Now().Add(20 * time.Second)
 	for {

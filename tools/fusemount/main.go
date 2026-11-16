@@ -1,3 +1,5 @@
+//go:build linux
+
 // Command fusemount stands in for fusermount3 where there is no setuid helper to
 // mount with. A sandboxed CI runner ignores the setuid bit and gives its user no
 // capability, but lets that user make a user namespace in which it holds every
@@ -12,6 +14,7 @@
 //	fusermount3 -u [-z] DIR           unmount DIR (-z: lazily)
 //
 // It is a tool for the tests' environment and is not used by the Volume or the mount.
+// Linux only: it uses mount(2).
 package main
 
 import (
@@ -59,13 +62,8 @@ func run(args []string) error {
 		if lazy {
 			flags = syscall.MNT_DETACH
 		}
-		err := syscall.Unmount(dir, flags)
-		if err == syscall.EBUSY && !lazy {
-			// A sandboxed kernel keeps a reference a moment after the last file closed.
-			// The real helper would fail; for the tests, detach and let it go.
-			err = syscall.Unmount(dir, syscall.MNT_DETACH)
-		}
-		return err
+		// A busy mount is an error, as it is from the real helper: only -z detaches.
+		return syscall.Unmount(dir, flags)
 	}
 	return mount(dir, options)
 }

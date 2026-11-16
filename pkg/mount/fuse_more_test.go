@@ -636,13 +636,14 @@ func TestFUSEFileTooBig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer f.Close() // an open file keeps the mount busy, and a failed test must not leave it
 	if err := f.Truncate(1<<62 + 1); !errors.Is(err, syscall.EFBIG) {
 		t.Fatalf("truncate past the maximum = %v, want EFBIG", err)
 	}
 	if err := f.Truncate(1 << 62); err != nil {
 		t.Fatalf("truncate to the maximum: %v", err)
 	}
-	f.Close() // an open file keeps the mount busy
+	f.Close()
 	m.Stop(t)
 }
 

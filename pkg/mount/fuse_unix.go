@@ -23,6 +23,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"syscall"
 
 	"bazil.org/fuse"
 	bzfs "bazil.org/fuse/fs"
@@ -114,6 +115,7 @@ func attr(a *fuse.Attr, in vfs.Inode) {
 }
 
 func (n *node) Attr(ctx context.Context, a *fuse.Attr) error {
+	ctx = context.WithoutCancel(ctx) // no request is answered EINTR: see errno.go
 	in, err := n.s.vol.Stat(ctx, n.ino)
 	if err != nil {
 		return errno(err)
@@ -123,6 +125,7 @@ func (n *node) Attr(ctx context.Context, a *fuse.Attr) error {
 }
 
 func (n *node) Lookup(ctx context.Context, name string) (bzfs.Node, error) {
+	ctx = context.WithoutCancel(ctx) // no request is answered EINTR: see errno.go
 	in, err := n.s.vol.Lookup(ctx, n.ino, name)
 	if err != nil {
 		return nil, errno(err)
@@ -131,6 +134,7 @@ func (n *node) Lookup(ctx context.Context, name string) (bzfs.Node, error) {
 }
 
 func (n *node) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
+	ctx = context.WithoutCancel(ctx) // no request is answered EINTR: see errno.go
 	ents, err := n.s.vol.ReadDir(ctx, n.ino)
 	if err != nil {
 		return nil, errno(err)
@@ -152,7 +156,7 @@ func (n *node) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 }
 
 func (n *node) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (bzfs.Node, error) {
-	ctx = context.WithoutCancel(ctx) // not answered EINTR: see errno.go
+	ctx = context.WithoutCancel(ctx) // no request is answered EINTR: see errno.go
 	in, err := n.s.vol.Mkdir(ctx, n.ino, req.Name, req.Mode.Perm())
 	if err != nil {
 		return nil, errno(err)
@@ -161,33 +165,56 @@ func (n *node) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (bzfs.Node, er
 }
 
 func (n *node) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.CreateResponse) (bzfs.Node, bzfs.Handle, error) {
-	ctx = context.WithoutCancel(ctx) // not answered EINTR: see errno.go
+	ctx = context.WithoutCancel(ctx) // no request is answered EINTR: see errno.go
+	// A name that another caller removes while this one is looked up or opened is
+	// created again; a name that is removed every time is not an error of this call.
+	for range 8 {
+		in, f, err := n.create(ctx, req)
+		if errors.Is(err, errRemoved) {
+			continue
+		}
+		if err != nil {
+			return nil, nil, errno(err)
+		}
+		attr(&resp.Attr, in)
+		return n.s.node(in.ID, n.ino), n.s.handle(f), nil
+	}
+	return nil, nil, syscall.EAGAIN
+}
+
+// errRemoved says that the name was removed between two steps of a creation.
+var errRemoved = errors.New("mount: the name was removed while it was being created")
+
+// create makes the file, or opens the one that exists: open(O_CREAT) of a file that
+// exists opens it, and only O_EXCL makes that an error. A kernel that does not look the
+// name up first (a sandbox's, or one whose lookup was interrupted and not repeated)
+// asks for the creation anyway.
+func (n *node) create(ctx context.Context, req *fuse.CreateRequest) (vfs.Inode, *vfs.File, error) {
 	in, err := n.s.vol.Create(ctx, n.ino, req.Name, req.Mode.Perm())
 	if errors.Is(err, fs.ErrExist) && req.Flags&fuse.OpenFlags(os.O_EXCL) == 0 {
-		// open(O_CREAT) of a file that exists opens it. A kernel that does not look the
-		// name up first (a sandbox's, or a lookup that was interrupted and not repeated)
-		// asks for the creation anyway, and only O_EXCL makes that an error.
-		in, err = n.s.vol.Lookup(ctx, n.ino, req.Name)
-		if err == nil && in.IsDir() {
-			err = vfs.ErrIsDir
+		if in, err = n.s.vol.Lookup(ctx, n.ino, req.Name); errors.Is(err, fs.ErrNotExist) {
+			return in, nil, errRemoved
 		}
-		if err == nil && req.Flags&fuse.OpenFlags(os.O_TRUNC) != 0 {
+		switch {
+		case err != nil:
+		case in.IsDir():
+			err = vfs.ErrIsDir
+		case req.Flags&fuse.OpenFlags(os.O_TRUNC) != 0:
 			err = n.s.vol.Truncate(ctx, in.ID, 0)
 		}
 	}
 	if err != nil {
-		return nil, nil, errno(err)
+		return in, nil, err
 	}
 	f, err := n.s.vol.Open(ctx, in.ID)
-	if err != nil {
-		return nil, nil, errno(err)
+	if errors.Is(err, fs.ErrNotExist) {
+		return in, nil, errRemoved
 	}
-	attr(&resp.Attr, in)
-	return n.s.node(in.ID, n.ino), n.s.handle(f), nil
+	return in, f, err
 }
 
 func (n *node) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
-	ctx = context.WithoutCancel(ctx) // not answered EINTR: see errno.go
+	ctx = context.WithoutCancel(ctx) // no request is answered EINTR: see errno.go
 	return errno(n.s.vol.Remove(ctx, n.ino, req.Name))
 }
 
@@ -203,7 +230,7 @@ func (n *node) Symlink(context.Context, *fuse.SymlinkRequest) (bzfs.Node, error)
 }
 
 func (n *node) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse.SetattrResponse) error {
-	ctx = context.WithoutCancel(ctx) // not answered EINTR: see errno.go
+	ctx = context.WithoutCancel(ctx) // no request is answered EINTR: see errno.go
 	// Only the size can be set. chmod, chown and utimens would succeed here without
 	// changing anything, which tar, make and rsync would believe: they are refused.
 	if req.Valid.Mode() || req.Valid.Uid() || req.Valid.Gid() || req.Valid.Atime() || req.Valid.Mtime() {
@@ -223,7 +250,7 @@ func (n *node) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 }
 
 func (n *node) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenResponse) (bzfs.Handle, error) {
-	ctx = context.WithoutCancel(ctx) // not answered EINTR: see errno.go
+	ctx = context.WithoutCancel(ctx) // no request is answered EINTR: see errno.go
 	in, err := n.s.vol.Stat(ctx, n.ino)
 	if err != nil {
 		return nil, errno(err)
@@ -244,7 +271,7 @@ func (n *node) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenR
 }
 
 func (n *node) Fsync(ctx context.Context, _ *fuse.FsyncRequest) error {
-	return errno(n.s.group.commit(ctx))
+	return errno(n.s.group.commit())
 }
 
 // handle is an open file.
@@ -262,24 +289,21 @@ var (
 )
 
 func (h *handle) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse) error {
-	size, off := req.Size, req.Offset
-	data, err := own(context.WithoutCancel(ctx), h.s.base, func(c context.Context) ([]byte, error) {
-		buf := make([]byte, size)
-		n, err := h.file.ReadAt(c, buf, off)
-		if err != nil && !errors.Is(err, io.EOF) {
-			return nil, err
-		}
-		return buf[:n], nil
-	})
-	if err != nil {
+	// The work of a read is the mount's, not the request's, and a stalled store holds at
+	// most readSlots buffers.
+	h.s.reads <- struct{}{}
+	defer func() { <-h.s.reads }()
+	buf := make([]byte, req.Size)
+	n, err := h.file.ReadAt(h.s.base, buf, req.Offset)
+	if err != nil && !errors.Is(err, io.EOF) {
 		return errno(err)
 	}
-	resp.Data = data
+	resp.Data = buf[:n]
 	return nil
 }
 
 func (h *handle) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.WriteResponse) error {
-	ctx = context.WithoutCancel(ctx) // not answered EINTR: see errno.go
+	ctx = context.WithoutCancel(ctx) // no request is answered EINTR: see errno.go
 	n, err := h.file.WriteAt(ctx, req.Data, req.Offset)
 	if err != nil {
 		return errno(err)
@@ -288,15 +312,11 @@ func (h *handle) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.W
 	return nil
 }
 
-// Flush is a commit, and it is the one request that is not answered EINTR when the
-// kernel interrupts it: a signal that lands while the caller is in close(2) reaches
-// here as an interrupt, but nothing restarts close (Linux has already dropped the
-// descriptor, and Go's os.File.Close returns the error as it is). So the caller waits
-// for the commit to end, whatever signals arrive, and sees its result. The commit
-// runs on a context of its own either way. Fsync, which callers do restart, abandons
-// only its wait.
+// Flush is a commit. close(2) is not restarted after EINTR (Linux has already dropped
+// the descriptor), so, like every request of this mount, it waits for the commit and
+// returns its result.
 func (h *handle) Flush(ctx context.Context, _ *fuse.FlushRequest) error {
-	return errno(h.s.group.commit(context.WithoutCancel(ctx)))
+	return errno(h.s.group.commit())
 }
 
 func (h *handle) Release(context.Context, *fuse.ReleaseRequest) error {

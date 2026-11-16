@@ -21,8 +21,9 @@ import (
 	"github.com/hanzoai/vfs/pkg/backend"
 )
 
-// TestInterruptIsEINTR: a request the kernel interrupted ends with EINTR, however
-// deep the Volume wrapped the cancellation, never with EIO.
+// TestInterruptIsEINTR: a cancelled context, however deep the Volume wrapped it, is
+// EINTR and not EIO. (Only the end of the mount cancels one: no request does, see
+// TestEveryHandlerOutlivesItsRequest.)
 func TestInterruptIsEINTR(t *testing.T) {
 	for name, err := range map[string]error{
 		"bare":    context.Canceled,
@@ -115,11 +116,12 @@ func testVolume(t *testing.T) (*gate, *vfs.Volume, vfs.Cipher, *storetest.Mem) {
 	return g, v, c, mem
 }
 
-// TestCommitSurvivesItsCaller: the caller of fsync(2) or close(2) is interrupted
-// while the commit is writing the Head. It stops waiting and is answered EINTR at
-// once; the commit is not cancelled, lands by itself, and the restarted call finds
-// nothing left to commit.
-func TestCommitSurvivesItsCaller(t *testing.T) {
+// TestFsyncWaitsForItsCommit: fsync(2) answered EINTR is an error to SQLite and to C
+// callers, which do not restart it, and the kernel does not restart a FUSE request that
+// was answered EINTR. So an interrupt that reaches a commit asked for by an fsync does
+// not end the wait: the caller gets the commit's own result, and the commit, which runs
+// on a context of its own, lands.
+func TestFsyncWaitsForItsCommit(t *testing.T) {
 	g, v, c, mem := testVolume(t)
 	bg := context.Background()
 	in, err := v.Create(bg, vfs.RootInode, "f", 0o644)
@@ -135,11 +137,12 @@ func TestCommitSurvivesItsCaller(t *testing.T) {
 	if _, err := f.WriteAt(bg, make([]byte, 200_000), 0); err != nil {
 		t.Fatal(err)
 	}
+	n := newSession(bg, v).node(in.ID, vfs.RootInode)
 
 	g.armed.Store(true)
 	req, interrupt := context.WithCancel(bg)
 	result := make(chan error, 1)
-	go func() { result <- errno(newCommitter(v).commit(req)) }()
+	go func() { result <- n.Fsync(req, &fuse.FsyncRequest{}) }()
 	select {
 	case <-g.reached:
 	case <-time.After(20 * time.Second):
@@ -148,20 +151,22 @@ func TestCommitSurvivesItsCaller(t *testing.T) {
 	interrupt() // the kernel's FUSE_INTERRUPT: the request's context ends mid-PUT
 	select {
 	case err := <-result:
-		if err != syscall.EINTR {
-			t.Fatalf("an interrupted commit answered %v, want EINTR", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("an interrupted request kept waiting for the commit")
+		t.Fatalf("fsync was answered (%v) while its commit was still being written", err)
+	case <-time.After(300 * time.Millisecond):
 	}
 	g.free() // the store answers
 	select {
-	case <-g.landed: // the Head was written by the commit the caller walked away from
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("fsync after an interrupt: %v", err)
+		}
 	case <-time.After(20 * time.Second):
-		t.Fatal("the commit did not land once its caller was gone")
+		t.Fatal("fsync never returned")
 	}
-	if err := newCommitter(v).commit(bg); err != nil { // the restarted call: nothing is left to commit
-		t.Fatalf("the restarted commit: %v", err)
+	select {
+	case <-g.landed:
+	default:
+		t.Fatal("fsync returned before the Head landed")
 	}
 	ro, err := vfs.Open(bg, vfs.Config{Backend: mem, Cipher: c})
 	if err != nil {
@@ -169,7 +174,7 @@ func TestCommitSurvivesItsCaller(t *testing.T) {
 	}
 	got, err := ro.Resolve(bg, "/f")
 	if err != nil || got.Size != 200_000 {
-		t.Fatalf("the interrupted commit did not land whole: %+v %v", got, err)
+		t.Fatalf("the commit did not land whole: %+v %v", got, err)
 	}
 }
 
@@ -294,10 +299,12 @@ func TestReadWaitsForItsData(t *testing.T) {
 	}
 }
 
-// TestInterruptedFsyncRetriesDoNotPileUp: a caller retries fsync(2) on every EINTR
-// while the store is stalled. The commits are shared: however many retries arrive,
-// one commit is running and at most one more is waiting to start, never one per retry.
-func TestInterruptedFsyncRetriesDoNotPileUp(t *testing.T) {
+// TestFsyncCallersShareTwoCommits: thousands of callers of fsync against a store that
+// has stopped answering share the commits: one runs and one waits to start, however
+// many callers arrive. When the store answers every caller is told the result of a
+// commit that began after it called, and the store has seen a few Head writes, not one
+// for each caller.
+func TestFsyncCallersShareTwoCommits(t *testing.T) {
 	g, v, c, mem := testVolume(t)
 	bg := context.Background()
 	in, err := v.Create(bg, vfs.RootInode, "f", 0o644)
@@ -314,31 +321,29 @@ func TestInterruptedFsyncRetriesDoNotPileUp(t *testing.T) {
 		t.Fatal(err)
 	}
 	cm := newCommitter(v)
-	base := runtime.NumGoroutine()
 	g.armed.Store(true)
-	first, cancelFirst := context.WithCancel(bg)
-	go func() { _ = cm.commit(first) }()
+	const callers = 3000
+	results := make(chan error, callers)
+	go func() { results <- cm.commit() }()
 	select {
 	case <-g.reached:
 	case <-time.After(20 * time.Second):
 		t.Fatal("the commit never reached the Head")
 	}
-	cancelFirst()
-	const retries = 5000
-	for range retries {
-		req, cancel := context.WithTimeout(bg, time.Microsecond)
-		_ = cm.commit(req) // answered EINTR
-		cancel()
+	for range callers - 1 {
+		go func() { results <- cm.commit() }()
 	}
-	if held := runtime.NumGoroutine() - base; held > 8 {
-		t.Fatalf("%d interrupted retries left %d goroutines running commits: the work is not shared", retries, held)
-	}
-
-	// The store answers: the writes are committed once, by the flights that were
-	// there, and every caller after that finds nothing left.
+	time.Sleep(200 * time.Millisecond) // let them arrive
 	g.free()
-	if err := cm.commit(bg); err != nil {
-		t.Fatalf("a commit after the store answered: %v", err)
+	for range callers {
+		select {
+		case err := <-results:
+			if err != nil {
+				t.Fatalf("a caller of fsync: %v", err)
+			}
+		case <-time.After(60 * time.Second):
+			t.Fatal("a caller never returned")
+		}
 	}
 	ro, err := vfs.Open(bg, vfs.Config{Backend: mem, Cipher: c})
 	if err != nil {
@@ -348,7 +353,74 @@ func TestInterruptedFsyncRetriesDoNotPileUp(t *testing.T) {
 		t.Fatalf("the write is not in the store: %+v %v", got, err)
 	}
 	if heads := mem.Puts()["head"]; heads > 4 {
-		t.Fatalf("%d Head writes for one write and %d retries", heads, retries)
+		t.Fatalf("%d Head writes for %d callers", heads, callers)
+	}
+}
+
+// TestStalledReadsHoldBoundedMemory: a store that has stopped answering holds each read
+// that waits on it, and a read holds a buffer the size of what the kernel asked for
+// (128 KiB). A thousand of them would hold 128 MiB; at most readSlots do.
+func TestStalledReadsHoldBoundedMemory(t *testing.T) {
+	g, v, c, _ := testVolume(t)
+	bg := context.Background()
+	in, err := v.Create(bg, vfs.RootInode, "f", 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := v.Open(bg, in.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt(bg, make([]byte, 300_000), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.Flush(bg); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	cold, err := vfs.Open(bg, vfs.Config{Backend: g, Cipher: c})
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := cold.Open(bg, in.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	defer g.free()
+	h := newSession(bg, cold).handle(file)
+
+	g.armed.Store(true)
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	const reads = 1000
+	done := make(chan error, reads)
+	for range reads {
+		go func() {
+			done <- h.Read(bg, &fuse.ReadRequest{Size: 128 << 10, Offset: 0}, &fuse.ReadResponse{})
+		}()
+	}
+	select {
+	case <-g.reached:
+	case <-time.After(20 * time.Second):
+		t.Fatal("no read reached the store")
+	}
+	time.Sleep(500 * time.Millisecond)
+	runtime.ReadMemStats(&after)
+	if grew := int64(after.HeapAlloc) - int64(before.HeapAlloc); grew > 40<<20 {
+		t.Fatalf("%d stalled reads of 128 KiB hold %d MiB: the buffers are not bounded", reads, grew>>20)
+	}
+	g.free()
+	for range reads {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("a read after the store answered: %v", err)
+			}
+		case <-time.After(60 * time.Second):
+			t.Fatal("a read never returned")
+		}
 	}
 }
 
