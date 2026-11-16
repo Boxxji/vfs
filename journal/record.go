@@ -12,18 +12,20 @@ import (
 // to back until the first byte that does not parse as the next record of this
 // segment:
 //
-//	header  checksum u32 | first u64 | life u64 | lineage [16]byte
+//	header  checksum u32 | magic [4]byte | first u64 | life u64 | lineage [16]byte
 //	mark    checksum u32 | through u64 | floor u64                       (two slots)
 //	record  checksum u32 | length u32 | sequence u64 | acknowledged i64 | payload checksum u32 | payload
 //
-// The header checksum covers first, life and lineage. The lineage is a digest
-// of an identity the caller supplies (a volume and a fencing round): a journal
-// opened under another identity is refused, not read. The record and mark
-// checksums are seeded from the segment's life and the lineage, so a record
-// left in the file by an earlier use of the same file, or by another lineage,
-// never validates in a later one. The payload checksum is computed before the
-// journal takes its lock; the record checksum then binds it to the sequence and
-// the time.
+// The magic is four fixed bytes. It carries no number: there is one layout, and
+// a directory holding a segment that is not in it is refused, not read and not
+// reused. The header checksum covers the magic, first, life and lineage. The
+// lineage is a digest of an identity the caller supplies (a volume and a
+// fencing round): a journal opened under another identity is refused, not read.
+// The record and mark checksums are seeded from the segment's life and the
+// lineage, so a record left in the file by an earlier use of the same file, or
+// by another lineage, never validates in a later one. The payload checksum is
+// computed before the journal takes its lock; the record checksum then binds it
+// to the sequence and the time.
 //
 // A mark says what the journal knew when it was written: through, every record
 // up to this sequence had been made durable by a completed sync; floor, the
@@ -32,13 +34,23 @@ import (
 // survives, everything it claims is on the media. The two slots are written
 // alternately; a torn write damages one and the other still stands, and a
 // recovery takes the highest through and the highest floor of the slots that
-// validate. All integers are little endian. A zero header is a free segment.
+// validate. All integers are little endian. A header whose magic is zero is a
+// free segment, as is one whose magic is ours and whose checksum fails (a header
+// torn by a crash); a header with any other magic is not ours.
+//
+// The records begin at byte 80, which is not a block boundary, and the marks
+// share the first block with the first records. That is chosen: the journal
+// writes through the page cache and flushes with fdatasync, and direct I/O
+// would need aligned records and marks in blocks of their own.
 const (
-	headerSize   = 36
+	headerSize   = 40
 	markSize     = 20
 	dataStart    = headerSize + 2*markSize // where the records begin
 	recordHeader = 28
 )
+
+// magic opens every header, inside its checksum.
+var magic = [4]byte{'J', 'R', 'N', 'L'}
 
 var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 
@@ -62,17 +74,60 @@ func seedOf(life uint64, l lineage) uint32 {
 // appendPreamble encodes the header and the first mark of a segment.
 func appendPreamble(dst []byte, first, life uint64, l lineage, through, floor uint64) []byte {
 	var h [headerSize]byte
-	binary.LittleEndian.PutUint64(h[4:], first)
-	binary.LittleEndian.PutUint64(h[12:], life)
-	copy(h[20:], l[:])
+	copy(h[4:], magic[:])
+	binary.LittleEndian.PutUint64(h[8:], first)
+	binary.LittleEndian.PutUint64(h[16:], life)
+	copy(h[24:], l[:])
 	binary.LittleEndian.PutUint32(h[0:], crc32.Checksum(h[4:], castagnoli))
 	dst = append(dst, h[:]...)
 	dst = appendMark(dst, seedOf(life, l), through, floor)
 	return append(dst, make([]byte, markSize)...) // the other slot
 }
 
+// headerKind is what the first bytes of a segment file say it is.
+type headerKind int
+
+const (
+	headerFree    headerKind = iota // zeroed, never written, or torn: a segment to reuse
+	headerLive                      // ours, and whole
+	headerForeign                   // not ours: some other layout, or not a segment at all
+)
+
+// kindOf classifies the first headerSize bytes of a file. A header torn by a
+// crash is ours and free: its magic is the one it had, or the zeros that were
+// being written over it, and either way its checksum fails. A write of a
+// sector is whole or absent; a tear that leaves part of the magic is not one
+// the media makes.
+func kindOf(b []byte) headerKind {
+	if len(b) < headerSize {
+		if allZero(b) {
+			return headerFree
+		}
+		return headerForeign
+	}
+	switch m := b[4:8]; {
+	case string(m) == string(magic[:]):
+		if _, _, _, ok := parseHeader(b); ok {
+			return headerLive
+		}
+		return headerFree
+	case allZero(m):
+		return headerFree
+	}
+	return headerForeign
+}
+
+func allZero(b []byte) bool {
+	for _, c := range b {
+		if c != 0 {
+			return false
+		}
+	}
+	return true
+}
+
 // parseHeader reports the first sequence, the life and the lineage of a
-// segment, or false when b is not a header (free, torn or foreign).
+// segment, or false when its checksum fails. The caller has seen the magic.
 func parseHeader(b []byte) (first, life uint64, l lineage, ok bool) {
 	if len(b) < headerSize {
 		return 0, 0, l, false
@@ -80,9 +135,9 @@ func parseHeader(b []byte) (first, life uint64, l lineage, ok bool) {
 	if crc32.Checksum(b[4:headerSize], castagnoli) != binary.LittleEndian.Uint32(b) {
 		return 0, 0, l, false
 	}
-	first = binary.LittleEndian.Uint64(b[4:])
-	copy(l[:], b[20:])
-	return first, binary.LittleEndian.Uint64(b[12:]), l, first != 0
+	first = binary.LittleEndian.Uint64(b[8:])
+	copy(l[:], b[24:])
+	return first, binary.LittleEndian.Uint64(b[16:]), l, first != 0
 }
 
 func appendMark(dst []byte, seed uint32, through, floor uint64) []byte {
@@ -125,6 +180,13 @@ type record struct {
 	payload []byte
 }
 
+// headerOK reports whether the first recordHeader bytes of b are the header of
+// a record of the segment whose seed is given. Until it holds, the length in the
+// header is not to be believed.
+func headerOK(b []byte, seed uint32) bool {
+	return crc32.Update(seed, castagnoli, b[4:recordHeader]) == binary.LittleEndian.Uint32(b)
+}
+
 // length reads the payload length from a record header; b must hold at least
 // recordHeader bytes.
 func length(b []byte) int64 { return int64(binary.LittleEndian.Uint32(b[4:])) }
@@ -140,7 +202,7 @@ func parseRecord(b []byte, seed uint32) (record, bool) {
 	if n > int64(len(b)-recordHeader) {
 		return record{}, false
 	}
-	if crc32.Update(seed, castagnoli, b[4:recordHeader]) != binary.LittleEndian.Uint32(b) {
+	if !headerOK(b, seed) {
 		return record{}, false
 	}
 	payload := b[recordHeader : recordHeader+n]
@@ -200,7 +262,7 @@ func scan(f File, seed uint32, expect uint64, fn func(record, int64) error) (uin
 		if err != nil {
 			return expect, off, err
 		}
-		if len(b) < recordHeader {
+		if len(b) < recordHeader || !headerOK(b, seed) {
 			return expect, off, nil
 		}
 		n := length(b)
@@ -221,4 +283,54 @@ func scan(f File, seed uint32, expect uint64, fn func(record, int64) error) (uin
 		}
 		expect++
 	}
+}
+
+// behind finds the records that follow a damaged one at the end of the log of a
+// segment: the record at off whose header is whole, so that its length is to be
+// believed, but whose payload does not match its checksum, and the valid
+// records after it. It returns the range from that record to the last valid one
+// after it, and the zero Range when no valid record follows or the header
+// itself is damaged: a header that fails its checksum cannot be passed.
+func behind(f File, seed uint32, expect uint64, off int64) (Range, error) {
+	w := window{f: f}
+	b, err := w.view(off, recordHeader)
+	if err != nil || len(b) < recordHeader || !headerOK(b, seed) {
+		return Range{}, err
+	}
+	n := length(b)
+	if binary.LittleEndian.Uint64(b[8:]) != expect || n > f.Size()-off-recordHeader {
+		return Range{}, nil
+	}
+	if p, err := w.view(off, recordHeader+n); err != nil {
+		return Range{}, err
+	} else if _, ok := parseRecord(p, seed); ok {
+		return Range{}, nil // not damaged
+	}
+	off += recordHeader + n
+	last := uint64(0)
+	for next := expect + 1; ; next++ {
+		b, err := w.view(off, recordHeader)
+		if err != nil || len(b) < recordHeader || !headerOK(b, seed) {
+			return rangeFrom(expect, last), err
+		}
+		n := length(b)
+		if n > f.Size()-off-recordHeader {
+			return rangeFrom(expect, last), nil
+		}
+		if b, err = w.view(off, recordHeader+n); err != nil {
+			return Range{}, err
+		}
+		if r, ok := parseRecord(b, seed); !ok || r.seq != next {
+			return rangeFrom(expect, last), nil
+		}
+		last = next
+		off += recordHeader + n
+	}
+}
+
+func rangeFrom(first, last uint64) Range {
+	if last == 0 {
+		return Range{}
+	}
+	return Range{first, last}
 }

@@ -14,15 +14,18 @@
 // durable: Publish refuses a sequence a local sync has not covered, so the store
 // never holds a record the journal could still lose.
 //
-// The ideas, studied and implemented independently here: a commit pipeline in
-// which sequence assignment is separate from the write and from a sync queue
-// that merges concurrent waiters into one fsync (CockroachDB Pebble's WAL
-// writer, BSD-3-Clause); a durable-sequence watermark callers wait on, bounded
-// unflushed bytes and admission control when the remote falls behind (SlateDB,
-// Apache-2.0); byte-granularity records, sync absorption and systematic crash
-// testing (NVLog, FAST 2025). Segment recycling follows the log-file recycling
-// that RocksDB and Pebble use for the same reason: fsync into blocks that are
-// already written is much cheaper than fsync into freshly allocated ones.
+// The design follows a commit pipeline in which sequence assignment is separate
+// from the write and from a sync queue that merges concurrent waiters into one
+// fsync; a durable-sequence watermark that callers wait on; bounded unflushed
+// bytes, with admission control when the remote falls behind; and systematic
+// crash testing. Segments are written once, in full, and recycled, because an
+// fsync into blocks that are already written is cheaper than one into freshly
+// allocated blocks. It is written independently of any of them.
+//
+// Its contents are transient: every record is published and then reclaimed. The
+// layout therefore has no version and no upgrade path. A different layout means
+// publishing everything, closing the journal and deleting its directory; Open
+// refuses a directory with a segment it cannot read, and touches nothing in it.
 //
 // See docs/journal.md for the contract and the integration interface.
 package journal
@@ -70,6 +73,11 @@ var (
 	// ErrVolatile is returned by Open for a directory on memory (tmpfs, ramfs),
 	// where a sync makes nothing durable.
 	ErrVolatile = errors.New("journal: directory is on volatile memory")
+	// ErrFormat is returned by Open and Discard when the directory holds a
+	// segment file that is not in this layout (another build's, or not a segment
+	// at all). Nothing was touched: such a file is neither read, nor reused, nor
+	// deleted.
+	ErrFormat = errors.New("journal: directory holds a file that is not a segment of this layout")
 	// ErrRange is returned by Discard when the journal does not hold exactly the
 	// records the caller named.
 	ErrRange = errors.New("journal: records are not the range named")
@@ -143,10 +151,13 @@ type Report struct {
 	// sync before it stopped. Records after it, up to Last, were recovered
 	// but nothing shows their sync had finished; Open synced them.
 	Proven uint64
-	// Dropped lists intact segments Open wiped because they follow a gap in the
-	// log: what follows a gap is not a prefix, and nothing there was proven
-	// durable. Bytes after Last in the last segment that did not parse as records
-	// are never read again; they are not listed.
+	// Dropped lists the valid records Open gave up: the intact segments it wiped
+	// because they follow a gap in the log (what follows a gap is not a prefix,
+	// and nothing there was proven durable), and the records behind a damaged
+	// payload in the last segment, from the damaged record on. Damage to a
+	// record's header ends the log where it stands and is not looked past: the
+	// bytes after Last in the last segment are never read again, and what they
+	// held, if anything, is not listed.
 	Dropped []Range
 	// Warnings name risks of the directory's file system (a layered or remote
 	// one, where a sync may not reach the media).
@@ -245,7 +256,7 @@ type Journal struct {
 
 	rw     sync.RWMutex // Replay holds it shared, Reclaim exclusive: a segment is not recycled while it is read
 	mu     sync.Mutex
-	markmu sync.Mutex // guards the mark fields of every slot, and the writes of marks
+	markmu sync.Mutex // serializes the writes of marks, and guards the mark fields of a slot that holds records
 
 	next      uint64 // next sequence to assign
 	written   uint64 // highest sequence written to a file
@@ -577,10 +588,10 @@ func (j *Journal) open(t *slot, header bool, n int64) *batch {
 	}
 	b.data = getBuffer(int(size))
 	if header {
-		j.markmu.Lock()
-		through, floor := t.through, t.floor
-		j.markmu.Unlock()
-		b.data = appendPreamble(b.data, t.first, t.life, j.lineage, through, floor)
+		// No mark is being written to t: it is the new tail, and no record has
+		// reached a file yet to give a sync a reason to write one. So mu is
+		// enough, and a placement never waits behind the write of a mark.
+		b.data = appendPreamble(b.data, t.first, t.life, j.lineage, t.through, t.floor)
 		j.pending += dataStart
 	}
 	j.queue = append(j.queue, b)
@@ -646,9 +657,7 @@ func (j *Journal) rotate() (<-chan struct{}, error) {
 	s.life = binary.LittleEndian.Uint64(life[:])
 	s.seed = seedOf(s.life, j.lineage)
 	s.first, s.last, s.end = 0, 0, dataStart
-	j.markmu.Lock()
-	s.through, s.floor, s.marks = j.synced, j.published, 0
-	j.markmu.Unlock()
+	s.through, s.floor, s.marks = j.synced, j.published, 0 // see open: no mark is being written to s
 	j.tail = s
 	j.segs = append(j.segs, s)
 	j.held += dataStart
@@ -691,7 +700,9 @@ func (j *Journal) create() *slot {
 
 // writeMark records in s what the journal knew: through is durable, floor is
 // in the store. It writes nothing when s already says as much, and reports
-// whether it wrote.
+// whether it wrote. What s says in memory changes only after the write has
+// succeeded, so a write that failed is made again by the next call, into the
+// same slot: the slot that holds the older mark, the other one standing.
 func (j *Journal) writeMark(s *slot, through, floor uint64) (bool, error) {
 	j.markmu.Lock()
 	defer j.markmu.Unlock()
@@ -699,11 +710,13 @@ func (j *Journal) writeMark(s *slot, through, floor uint64) (bool, error) {
 	if through == s.through && floor == s.floor {
 		return false, nil
 	}
+	m := appendMark(make([]byte, 0, markSize), s.seed, through, floor)
+	if _, err := s.file.WriteAt(m, int64(headerSize)+int64((s.marks+1)&1)*markSize); err != nil {
+		return false, err
+	}
 	s.through, s.floor = through, floor
 	s.marks++
-	m := appendMark(make([]byte, 0, markSize), s.seed, through, floor)
-	_, err := s.file.WriteAt(m, int64(headerSize)+int64(s.marks&1)*markSize)
-	return true, err
+	return true, nil
 }
 
 // Sync returns once the record with sequence seq, and every record before it,

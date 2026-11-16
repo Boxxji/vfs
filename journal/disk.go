@@ -1,7 +1,9 @@
 package journal
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -85,19 +87,34 @@ type directory struct {
 
 // Files returns the Disk over the operating system's files in dir, creating the
 // directory (readable by its owner alone: the journal holds every write of the
-// volume in the clear; the Volume seals what it appends) and the entry of the
-// directory in its parent durably. It takes an exclusive lock on the directory
+// volume in the clear; the Volume seals what it appends) and the entry of each
+// directory it created in its parent durably. A directory that already exists
+// is used as it is, with the mode it has; the files in it are 0600 in any case. It takes an exclusive lock on the directory
 // and returns ErrLocked if another journal has it, and ErrVolatile for a
 // directory on memory, where a sync makes nothing durable. It is what Open uses
 // when Options.Disk is nil; a caller wraps it to observe or count what the
 // journal does to the files.
 func Files(dir string) (Disk, error) {
 	dir = filepath.Clean(dir)
+	// The directories MkdirAll is about to make, innermost first: each one's
+	// entry is in its parent, and a parent's entry is in the next one up.
+	var made []string
+	for d := dir; ; d = filepath.Dir(d) {
+		if _, err := os.Stat(d); err == nil || !errors.Is(err, fs.ErrNotExist) || d == filepath.Dir(d) {
+			break
+		}
+		made = append(made, d)
+	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	if err := syncDirectory(filepath.Dir(dir)); err != nil {
-		return nil, err
+	if len(made) == 0 {
+		made = []string{dir} // it was there; its entry may still be unsynced from a crash
+	}
+	for _, d := range made {
+		if err := syncDirectory(filepath.Dir(d)); err != nil {
+			return nil, err
+		}
 	}
 	warnings, err := inspect(dir)
 	if err != nil {

@@ -1,9 +1,9 @@
 // Package crash is a journal.Disk in memory that logs every persistence point
 // and can rebuild the disk a crash would have left behind after any prefix of
-// that log. It is the harness for systematic crash exploration in the manner
-// of CrashMonkey and ACE (Mohan et al., OSDI 2018; Bornholt et al., ASPLOS
-// 2016): instead of killing a process at random moments, run a workload once,
-// then check the recovery of every crash state the log allows.
+// that log. It is the harness for systematic crash exploration, as in the work
+// of Mohan et al. (OSDI 2018) and Bornholt et al. (ASPLOS 2016): instead of
+// killing a process at random moments, run a workload once, then check the
+// recovery of every crash state the log allows.
 //
 // The model is the weakest disk the contract may assume. A write is volatile
 // until a Sync that began after it completes. At a crash any subset of the

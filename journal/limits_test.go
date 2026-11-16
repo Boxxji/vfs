@@ -11,7 +11,7 @@ import (
 	"github.com/hanzoai/vfs/journal/crash"
 )
 
-// The exact limit of a payload is the segment less its preamble (36 + 40) and the record header (28).
+// The exact limit of a payload is the segment less its preamble (40 + 40) and the record header (28).
 func TestPayloadLimitIsExact(t *testing.T) {
 	j := open(t, small(crash.New(), newClock(), 0))
 	defer j.Close()

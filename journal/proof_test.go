@@ -11,13 +11,13 @@ import (
 	"github.com/hanzoai/vfs/journal/crash"
 )
 
-// The layout the tests reach into is the one the document specifies: a 36-byte
+// The layout the tests reach into is the one the document specifies: a 40-byte
 // header, two 20-byte marks, then records of a 28-byte header and the payload.
 const (
 	headerAt   = 0
-	markAt     = 36
+	markAt     = 40
 	markLen    = 20
-	recordsAt  = 76
+	recordsAt  = 80
 	recordHead = 28
 )
 
@@ -29,7 +29,7 @@ func segmentStarting(t testing.TB, d *crash.Disk, first uint64) string {
 		t.Fatal(err)
 	}
 	for _, name := range names {
-		if binary.LittleEndian.Uint64(peek(t, d, name, 4, 8)) == first {
+		if binary.LittleEndian.Uint64(peek(t, d, name, 8, 8)) == first {
 			return name
 		}
 	}
@@ -134,7 +134,7 @@ func TestALogThatBeginsLateAfterAcknowledgedRecordsIsCorruption(t *testing.T) {
 	}
 	mustSync(t, j, last)
 	j.Close()
-	poke(t, d, segmentStarting(t, d, 1), headerAt, make([]byte, 36))
+	poke(t, d, segmentStarting(t, d, 1), headerAt, make([]byte, 40))
 	if _, err := journal.Open("", small(d, newClock(), 0)); !errors.Is(err, journal.ErrCorrupt) {
 		t.Fatalf("the start of the log gone, records through %d acknowledged: %v", last, err)
 	}

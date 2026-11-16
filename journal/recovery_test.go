@@ -17,10 +17,10 @@ var big = bytes.Repeat([]byte("B"), 1000) // three records to a 4 KiB segment
 
 func bigRecord(i int) []byte { return append([]byte{byte('a' + i%26)}, big[1:]...) }
 
-// The segment layout, as the tests need it: a header of 36 bytes, two marks of
+// The segment layout, as the tests need it: a header of 40 bytes, two marks of
 // 20, then the records.
 const (
-	headerSize = 36
+	headerSize = 40
 	markSize   = 20
 	dataStart  = headerSize + 2*markSize
 )
@@ -60,7 +60,7 @@ func corrupt(t testing.TB, d *crash.Disk, name string, off int64) {
 // A damaged record at the end of what a sync proved is a torn tail: Replay
 // returns the records before it and nothing after it, and new records continue
 // from the damaged one's number without bringing the old ones back. Open says
-// what it kept.
+// what it kept, and the valid records behind the damage that it left unread.
 func TestTornTail(t *testing.T) {
 	d := crash.New()
 	j := open(t, small(d, newClock(), 0))
@@ -75,8 +75,8 @@ func TestTornTail(t *testing.T) {
 	forgetMarks(t, d)                                     // no later sync finished: nothing proves record 6 was durable
 
 	j = open(t, small(d, newClock(), 0))
-	if r := j.Recovery(); r.First != 1 || r.Last != 5 || r.Proven != 0 || len(r.Dropped) != 0 {
-		t.Fatalf("recovery %+v", r)
+	if r := j.Recovery(); r.First != 1 || r.Last != 5 || r.Proven != 0 || !reflect.DeepEqual(r.Dropped, []journal.Range{{First: 6, Last: 10}}) {
+		t.Fatalf("recovery %+v: want 1 through 5 kept and 6 through 10 dropped", r)
 	}
 	got := replayed(t, j)
 	if want := []uint64{1, 2, 3, 4, 5}; !reflect.DeepEqual(seqs(got), want) {
@@ -139,8 +139,8 @@ func TestHoleDiscardsLaterSegments(t *testing.T) {
 	forgetMarks(t, d)
 
 	j = open(t, small(d, newClock(), 0))
-	if r := j.Recovery(); r.Last != 4 || !reflect.DeepEqual(r.Dropped, []journal.Range{{First: 7, Last: 9}}) {
-		t.Fatalf("recovery %+v: want records through 4 and 7 to 9 dropped", r)
+	if r := j.Recovery(); r.Last != 4 || !reflect.DeepEqual(r.Dropped, []journal.Range{{First: 5, Last: 6}, {First: 7, Last: 9}}) {
+		t.Fatalf("recovery %+v: want records through 4 kept, 5 to 6 (behind the damage) and 7 to 9 dropped", r)
 	}
 	got := replayed(t, j)
 	if want := []uint64{1, 2, 3, 4}; !reflect.DeepEqual(seqs(got), want) {

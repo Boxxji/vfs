@@ -1,7 +1,7 @@
 package journal_test
 
 // The tests that read the real file layer's system calls. The test binary runs
-// again as a child of the test, which traces it with ptrace (no root, no strace:
+// again as a child of the test, which traces it with ptrace (no root and no tracer program installed:
 // a process may trace its own child), records the calls the file layer makes, and
 // can fail one. Every other test of the file layer runs on an in-memory double;
 // these are the ones that look at what reaches the kernel.
@@ -29,7 +29,6 @@ func TestMain(m *testing.M) {
 	if *child != "" {
 		os.Exit(runChild(*child))
 	}
-	journal.MarkEvery(1) // a mark every round, so that every crash state has marks in it
 	os.Exit(m.Run())
 }
 
@@ -273,10 +272,10 @@ func TestCreateSyscallOrder(t *testing.T) {
 }
 
 // A removal is durable when it returns: the unlink is followed by an fsync of
-// the directory. (A stale file of the wrong size is dropped by Open.)
+// the directory. (An interrupted Create, a zeroed file of the wrong size, is dropped by Open.)
 func TestRemoveSyncsTheDirectory(t *testing.T) {
 	dir := journalDir(t, func(dir string) {
-		if err := os.WriteFile(filepath.Join(dir, "000099.seg"), []byte("short"), 0o600); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, "000099.seg"), make([]byte, 10), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	})

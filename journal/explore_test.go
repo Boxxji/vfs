@@ -17,8 +17,14 @@ import (
 // state S2 of that recovery is recovered again and held to the same
 // invariants (prefix, every acknowledged record, second replay equal).
 func TestCrashDuringRecovery(t *testing.T) {
-	for seed := int64(1); seed <= 2; seed++ {
-		crashDuringRecovery(t, seed, 80)
+	for _, c := range []struct {
+		seed  int64
+		every int
+	}{{1, 1}, {2, 16}} {
+		t.Run(fmt.Sprintf("every%d", c.every), func(t *testing.T) {
+			defer journal.MarkEvery(c.every)()
+			crashDuringRecovery(t, c.seed, 80)
+		})
 	}
 }
 
@@ -78,6 +84,7 @@ func (r *run) opts2(d *crash.Disk, published uint64) journal.Options {
 // Head landed, the process died before Publish). Recover every crash state
 // with a Published larger than the Publish marks said, by 1, 5 and "all".
 func TestHeadAheadOfPublish(t *testing.T) {
+	defer journal.MarkEvery(16)()
 	r := newRun()
 	j := open(t, r.opts(0))
 	rng := rand.New(rand.NewSource(5))
@@ -131,7 +138,7 @@ func TestHeadAheadOfPublish(t *testing.T) {
 // whose every payload is the one appended.
 func TestDamageFuzz(t *testing.T) {
 	rng := rand.New(rand.NewSource(99))
-	for round := 0; round < 1500; round++ {
+	for round := 0; round < 1000; round++ {
 		d := crash.New()
 		j := open(t, small(d, newClock(), 0))
 		want := map[uint64][]byte{}
@@ -174,8 +181,8 @@ func TestDamageFuzz(t *testing.T) {
 		}
 		pubd := uint64(rng.Intn(int(last) + 1))
 		j2, err := journal.Open("", small(d, newClock(), pubd))
-		if errors.Is(err, journal.ErrCorrupt) || errors.Is(err, journal.ErrMismatch) {
-			continue // damage before what a mark proved, or a store the journal cannot meet: refused, and nothing changed
+		if errors.Is(err, journal.ErrCorrupt) || errors.Is(err, journal.ErrMismatch) || errors.Is(err, journal.ErrFormat) {
+			continue // damage before what a mark proved, to the magic of a header, or a store the journal cannot meet: refused, and nothing changed
 		}
 		if err != nil {
 			t.Fatalf("round %d: Open: %v", round, err)

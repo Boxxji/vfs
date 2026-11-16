@@ -161,11 +161,11 @@ func TestSegmentsClaimingTheSameFirstAreOrdered(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		h := make([]byte, 12)
+		h := make([]byte, 16)
 		if _, err := f.ReadAt(h, 0); err != nil {
 			t.Fatal(err)
 		}
-		if first := binary.LittleEndian.Uint64(h[4:]); first != 1 {
+		if first := binary.LittleEndian.Uint64(h[8:]); first != 1 {
 			t.Fatalf("try %d: the lower name begins at %d, so the other was kept", try, first)
 		}
 	}

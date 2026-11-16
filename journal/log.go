@@ -16,8 +16,11 @@ var ready = func() chan struct{} {
 var errStop = errors.New("stop")
 
 // inventory opens every segment file of disk and reads what each says about
-// itself. A file is live when its header parses; a live file of another lineage
-// than want is an error (want nil accepts any: Discard reads whatever is there).
+// itself. A file is live when its header parses, and free when its header is
+// zero or was torn; a file that is neither is not a segment of this layout, and
+// the directory is refused with ErrFormat before anything is changed. A live
+// file of another lineage than want is an error (want nil accepts any: Discard
+// reads whatever is there).
 // Live files come back ordered by the sequence of their first record, then by
 // name, so two files that claim the same first sequence are ordered the same way
 // every time. The marks a live file carries are in through and floor.
@@ -39,15 +42,26 @@ func inventory(disk Disk, want *lineage) (all, live []*slot, err error) {
 		all = append(all, s)
 		var pre [dataStart]byte
 		if s.size < dataStart {
+			// Shorter than a preamble: an interrupted Create, which is all zeros.
+			short := make([]byte, s.size)
+			if _, err := f.ReadAt(short, 0); err != nil {
+				return all, nil, err
+			}
+			if !allZero(short) {
+				return all, nil, fmt.Errorf("%w: %s", ErrFormat, name)
+			}
 			continue
 		}
 		if _, err := f.ReadAt(pre[:], 0); err != nil {
 			return all, nil, err
 		}
-		first, life, l, ok := parseHeader(pre[:])
-		if !ok {
+		switch kindOf(pre[:]) {
+		case headerFree:
 			continue
+		case headerForeign:
+			return all, nil, fmt.Errorf("%w: %s", ErrFormat, name)
 		}
+		first, life, l, _ := parseHeader(pre[:])
 		if want != nil && l != *want {
 			return all, nil, fmt.Errorf("%w: %s", ErrLineage, name)
 		}
@@ -184,6 +198,18 @@ func (j *Journal) recover(published uint64) error {
 			j.report.Dropped = append(j.report.Dropped, r)
 		}
 	}
+	if n := len(chain); n > 0 {
+		// A record whose payload is damaged ends the log in its segment, and the
+		// valid records behind it are left unread; they are reported.
+		r, err := behind(chain[n-1].file, chain[n-1].seed, last+1, chain[n-1].end)
+		if err != nil {
+			return err
+		}
+		if r != (Range{}) {
+			j.report.Dropped = append(j.report.Dropped, r)
+		}
+	}
+	sort.Slice(j.report.Dropped, func(a, b int) bool { return j.report.Dropped[a].First < j.report.Dropped[b].First })
 
 	// From here on the journal writes. Segments that are not in the log lose
 	// their header, durably, before any new record is written: otherwise a
@@ -306,7 +332,7 @@ func Discard(dir string, opt Options, first, last uint64) (err error) {
 	if err != nil {
 		return err
 	}
-	chain, _, end, err := chainOf(live, nil)
+	chain, orphans, end, err := chainOf(live, nil)
 	if err != nil {
 		return err
 	}
@@ -316,6 +342,18 @@ func Discard(dir string, opt Options, first, last uint64) (err error) {
 	}
 	if held != (Range{first, last}) {
 		return fmt.Errorf("%w: the journal holds %d through %d, not %d through %d", ErrRange, held.First, held.Last, first, last)
+	}
+	// Segments that follow a gap are records too. They go only if the range
+	// named covers them, as the copy of a segment does; any other stays, and
+	// Discard changes nothing.
+	for _, s := range orphans {
+		r, err := rangeOf(s)
+		if err != nil {
+			return err
+		}
+		if r.Last >= r.First && (r.First < first || r.Last > last) {
+			return fmt.Errorf("%w: the journal also holds %d through %d, which the range named does not cover", ErrRange, r.First, r.Last)
+		}
 	}
 	for _, s := range live {
 		if err := wipe(s); err != nil {
@@ -417,10 +455,18 @@ func (j *Journal) Reclaim() error {
 	anchor := j.segs[n]
 	j.mu.Unlock()
 
+	// A failed write is made again by the next call. A failed sync is not safe to
+	// repeat: the system may have given up the pages it could not write, and a
+	// later sync would then succeed without the mark. The journal fails, and the
+	// wipes that depend on the mark do not happen.
 	if _, err := j.writeMark(anchor, 0, old[n-1].last); err != nil {
 		return err
 	}
 	if err := anchor.file.Sync(); err != nil {
+		j.mu.Lock()
+		j.failLocked(err)
+		err = j.err
+		j.mu.Unlock()
 		return err
 	}
 	// Oldest first, each made durable before the next is touched: a crash may

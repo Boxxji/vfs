@@ -37,14 +37,14 @@ func TestRecordsOfAnotherLineageDoNotValidateUnderAForgedHeader(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		h := make([]byte, 36)
+		h := make([]byte, 40)
 		if _, err := f.ReadAt(h, 0); err != nil {
 			t.Fatal(err)
 		}
 		if crc32.Checksum(h[4:], crc32.MakeTable(crc32.Castagnoli)) != binary.LittleEndian.Uint32(h) {
 			continue // a free segment
 		}
-		copy(h[20:], other[:16])
+		copy(h[24:], other[:16])
 		binary.LittleEndian.PutUint32(h, crc32.Checksum(h[4:], crc32.MakeTable(crc32.Castagnoli)))
 		if _, err := f.WriteAt(h, 0); err != nil {
 			t.Fatal(err)
