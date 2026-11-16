@@ -1,6 +1,7 @@
 package journal_test
 
 import (
+	"encoding/binary"
 	"errors"
 	"io"
 	"reflect"
@@ -155,6 +156,18 @@ func TestSegmentsClaimingTheSameFirstAreOrdered(t *testing.T) {
 			t.Fatalf("recovery %+v: the twin was not reported", r)
 		}
 		j.Close()
+		// The log is the lower name's: its header still says it begins at 1.
+		f, err := d.Open("000000.seg")
+		if err != nil {
+			t.Fatal(err)
+		}
+		h := make([]byte, 12)
+		if _, err := f.ReadAt(h, 0); err != nil {
+			t.Fatal(err)
+		}
+		if first := binary.LittleEndian.Uint64(h[4:]); first != 1 {
+			t.Fatalf("try %d: the lower name begins at %d, so the other was kept", try, first)
+		}
 	}
 }
 
