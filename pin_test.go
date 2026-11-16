@@ -93,6 +93,9 @@ func TestTheSizesOfTheText(t *testing.T) {
 			t.Errorf("%s: the code has %d", name, c[0])
 		}
 	}
+	if uint64(MaxSize) != 1<<62 {
+		t.Errorf("file size limit 2^62: the code has %d", uint64(MaxSize))
+	}
 }
 
 // 4.1: the default Cipher opens what luxfi/age at the time of this test sealed. A change of the
