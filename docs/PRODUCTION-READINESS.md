@@ -20,7 +20,7 @@ returned success. This table is also in the package documentation (`doc.go`).
 | `File.WriteAt`, `Truncate`, `Create`, `Mkdir`, `Remove` | nothing. Held in memory and lost if the process dies. Past `Config.Dirty` bytes the data is chunked and uploaded, still unreferenced, still not durable |
 | `File.Close` | nothing. It releases the handle; it is not a flush |
 | `Volume.Flush` | everything written before the call, committed. It returns only after the Head advanced |
-| Fsync on the mount (`FSYNC`) | the same as `Flush`: a full commit. There is no cheaper durable point. A caller interrupted by a signal is answered `EINTR` and the commit still lands |
+| Fsync on the mount (`FSYNC`) | the same as `Flush`: a full commit. There is no cheaper durable point. A signal that reaches the caller does not end the wait: the call returns the commit's own result |
 | Close on the mount (`FLUSH`, every `close(2)`) | the same as `Flush`: a full commit. An interrupted close waits for the commit and returns its result |
 | Release on the mount | nothing |
 | End of a mount | one `Flush`, then the mount returns |
@@ -29,15 +29,25 @@ returned success. This table is also in the package documentation (`doc.go`).
 
 Interrupts on the mount. A signal that reaches a caller while it waits on the mount
 makes the kernel interrupt the request (Go's runtime sends one every few milliseconds
-to preempt). What the answer `EINTR` costs depends on what the caller does with it,
-and it was measured: `fsync(2)` is restarted by libc and by Go, so it stops waiting
-and is answered `EINTR` while the commit runs on by itself on a context no request
-owns; `read(2)` answered `EINTR` reached the caller as `EIO` (20 GiB of Go reads
-under signals failed at the first block), so a read waits for its data; `close(2)` is
-never restarted (Go's `os.File.Close` returns the error), so a close waits for its
-commit; a request that changes the tree runs to the end, since a restarted `create(2)`
-with `O_EXCL` would meet its own file. No caller's interrupt cancels a commit or a
-fetch.
+to preempt), and no request is answered `EINTR`: every call waits for its own result.
+What the answer costs a caller was measured, and C callers do not restart it. `fsync(2)`
+answered `EINTR` is an I/O error to SQLite: a database on the mount failed
+`TestFUSESQLite` 7 times of 7 on an amd64 kernel, and a C caller under a timer saw
+246,912 `EINTR` over 5,000 fsyncs (neither glibc nor the kernel retries it). `stat(2)`
+and directory reads answered `EINTR` reached a C caller as an error 1,586 times in
+60,000 without `SA_RESTART` and 2,884 with it. `read(2)` answered `EINTR` reached the
+caller as `EIO` (20 GiB of Go reads under signals failed at the first block).
+`close(2)` is never restarted (Go's `os.File.Close` returns the error). A restarted
+`create(2)` with `O_EXCL` would meet its own file. No caller's interrupt cancels a
+commit or a fetch.
+
+The cost is that a call waits for the store, and there are no deadlines on store
+requests yet. With the store stopped, a caller that is killed stays in the kernel
+until the store resumes, and the daemon holds every abandoned request: 1,600 reads at
+distinct offsets grew it by about 225 MB before reads were bounded, and 3,000 distinct
+lookups by about 386 MB (about 128 KiB for each request, held by the FUSE library).
+Reads now hold a buffer only while one of 64 slots is theirs. Deadlines are the next
+change (section 11 of the specification).
 
 What a failed `Flush` tells the caller. `nil`: committed. Any other error: the outcome
 of that attempt is unknown (a reply can be lost after the write landed) and the
@@ -92,7 +102,8 @@ the last committed tree, whole, and a retry commits the next.
 | The recipient alone cannot forge an object | pass | `TestRecipientAloneCannotForge`: every sealed object carries a tag keyed from the secret identity, so integrity rests on the identity, not on the (public) recipient |
 | A guest who picks file names cannot multiply the metadata | pass | `TestGroundNamesDoNotBloatTheTree`: names ground against another key write as many shards as ordinary ones (6 and 6; 2,007 and 4 before the boundaries were keyed from the Volume's seed) |
 | Every spelling of one place is one place; a moved Volume is resealed | pass | `TestPlaceSpellings`, `TestResealMovesAVolume` |
-| Interrupted fsync retries do not pile up | pass | `TestInterruptedFsyncRetriesDoNotPileUp`: 5,000 retries against a stalled store leave at most two commits, one running and one waiting |
+| Callers of fsync do not pile up commits | pass | `TestFsyncCallersShareTwoCommits`: 3,000 callers against a stalled store share two commits, one running and one waiting, and the store sees at most four Head writes |
+| A stalled store holds bounded memory for reads | pass | `TestStalledReadsHoldBoundedMemory`: 1,000 reads of 128 KiB against a stalled store hold under 40 MiB |
 | A mount hands the store a context on every path | pass | `TestLookedUpFileReadsOnTheMountContext` (over a store that panics on a nil context), `TestSessionRefusesANilContext`, `TestFUSEReadsExistingFilesOverS3` (a mount over the real server) |
 | A Cipher that hides nothing is refused at configuration | pass | `TestIdentityCipherIsRefused` |
 | Key rotation | pass | `TestRotation`: a Cipher with the new key and the old one reads everything and seals under the new; once the old is dropped, what only it sealed no longer opens |
@@ -106,47 +117,44 @@ the last committed tree, whole, and a retry commits the next.
 | SQLite on the Volume | pass | `TestSQLiteRoundTrip`; over the mount `TestFUSESQLite` (100 rows survive release and remount, `integrity_check` ok) |
 | The mount: Lookup, ReadDir (with `.` and `..`), Mkdir, Create, Remove, Setattr size, Read, Write, Flush, Fsync, Release | pass | `TestFUSEPOSIX`, `TestFUSESemantics`, `TestFUSEHostileNames`, `TestFUSEConcurrentSameFile`, `TestFUSEUnlinkVersusRmdir`; after `fsync(2)` a second read-only view of the store sees the file |
 | The mount says what it cannot do | pass | `TestFUSEUnsupportedIsHonest`: rename, symlink, hard link, chmod and utimens answer ENOSYS (the kernel words link as EPERM), a file too large is EFBIG |
-| A signal reaching a caller is never an `EIO`, and never cancels a commit or a fetch | pass | `TestInterruptIsEINTR`, `TestCommitSurvivesItsCaller` (the caller walks away mid-PUT of the Head; the Head still lands), `TestCloseWaitsForItsCommit`, `TestReadWaitsForItsData`, and through a kernel mount `TestFUSEInterruptsAreNotErrors`: 2,000 fsync+close and 8 GiB of reads, with SIGURG sent to the waiting threads thousands of times a second, zero failures |
+| A signal reaching a caller is never an `EIO` or an `EINTR`, and never cancels a commit or a fetch | pass | `TestInterruptIsEINTR`, `TestFsyncWaitsForItsCommit` (the caller is interrupted mid-PUT of the Head; it waits and gets the commit's result), `TestCloseWaitsForItsCommit`, `TestReadWaitsForItsData`, `TestLookupIsNotAnsweredEINTR`, `TestAttrIsNotAnsweredEINTR`, `TestReaddirIsNotAnsweredEINTR`, `TestMkdirIsNotAnsweredEINTR`, `TestRemoveIsNotAnsweredEINTR`, `TestCreateIsNotAnsweredEINTR`, `TestEveryHandlerOutlivesItsRequest`, and through a kernel mount `TestFUSEInterruptsAreNotErrors`: 2,000 fsync+close and 8 GiB of reads, with SIGURG sent to the waiting threads thousands of times a second, zero failures |
 
 Mount tests run only with `-tags fuse`, from a child process that serves the mount
 while the test acts as its client; a process that mounts a Volume and also opens a
 file on that mount deadlocks. The real-server tests need an `s3` binary on `PATH`.
 
-CI (`hanzo.yml`, `.github/workflows/cicd.yml`) runs eleven gates as jobs, three at a
-time, each under five minutes on the runner. On the run of 13e4705 the longest was
-3 m 21 s (`scale-b`), then `realserver` 3 m 05 s, `race` 2 m 52 s, `scale-a` 2 m 47 s,
-`check` 2 m 41 s, `realserver-kill` 2 m 32 s, `scale-c` 2 m 19 s, `sqlite` 2 m 19 s,
-`fuzz` 2 m 04 s, `model` 2 m 03 s and `unit` 1 m 36 s, all from a cold Go cache. The
-times depend on the node, which other repositories' jobs share: with six gates at
-once the first three took between five and six minutes, which is why it is three.
-The gates are: `check` (build, vet and gofmt of what does
-not need the SQLite engine); `unit`; `race`, the tests that have goroutines under the
-race detector, with the handlers of the mount; `model`, the random tests against a
-plain model, without the race detector (they have no goroutines, and the detector
-multiplies their hashing tenfold); `sqlite`, the only gate that builds the SQLite
-engine; `realserver` and `realserver-kill`, against the real Hanzo S3 server, which
-fail if a test they exist for did not pass; the measurements `scale-a`, `scale-b` and
-`scale-c`; and `fuzz`. The server is the published image of release v1.0.41, pinned by digest and
-read with `crane`, which needs no docker: building it from its source costs five
-minutes of a cold job, and every real-server test passes against the release as it did
-against a build of the main commit cbf3d650.
+CI (`hanzo.yml`, `.github/workflows/cicd.yml`) runs twelve gates as jobs, three at a
+time, each under five minutes from a cold Go cache. Three at a time because the gates
+share the machine's capacity, and more at once only made each slower. The gates are:
+`check` (build, vet and gofmt of what does not need the SQLite engine, and a vet of
+the mount for macOS); `unit`; `race`, the tests that have goroutines under the race
+detector, with the handlers of the mount; `model`, the random tests against a plain
+model at their short size, without the race detector (they have no goroutines, and the
+detector multiplies their hashing tenfold); `sparse`, the same randomised tests of
+holes at full size; `sqlite`, the only gate that builds the SQLite engine; `realserver`
+and `realserver-kill`, against the real Hanzo S3 server, which fail if a test they
+exist for did not pass; the measurements `scale-a`, `scale-b` and `scale-c`; and `fuzz`.
+The server is the published image of release v1.0.41, pinned by digest and read with
+`crane`, which needs no docker: building it from its source costs five minutes of a
+cold job, and every real-server test passes against the release as it did against a
+build of the main commit cbf3d650. `TestSigkill` runs all six kill points in every
+gate that runs it; the `-short` runs skip only the sizes of the randomised tests.
 
-**The tests on a kernel mount are not CI gates, and why.** The runner has `/dev/fuse`
-and no `fusermount3`, and cannot install one: its kernel is a sandbox (gVisor) that
-ignores the setuid bit and gives its user no capability, so `sudo` and a setuid helper
-do not work. An unprivileged user can make a user namespace there, in which it holds
-every capability, and mount a file system, and `tools/fusemount` stands in for the
-helper (`tools/ci/mount.sh` runs the tests that way). The mount then works, but the
-sandbox's FUSE answers differently from Linux's: after `fsync(2)` the file is not yet
-in the store, truncate is refused, chmod and utimes answer EPERM and not ENOSYS, close
-is interrupted by the kernel itself, and an unmount does not end the server (thirteen
-tests were tried one at a time; none passed for a reason that is the mount's). A test of
-what Linux does would test the sandbox, so none is gated there and none skips there.
-They run on a Linux kernel (`go test -tags fuse ./pkg/mount ./internal/sqlitecheck`, 68 s
-on the lab machine this round, all passing), and the proposal is a runner with a real
-kernel for them. What the mount does that needs no kernel is gated: the commits, the
-interrupts, the context every read runs on, and the creation of a file that exists are
-tested by calling the handlers, under the race detector.
+**The tests on a kernel mount are not CI gates, and why.** A gate runs on whatever
+kernel its runner has, and these tests assert what Linux's FUSE does: that after
+`fsync(2)` the file is in the store, that truncate and chmod answer as Linux's do, that
+a close is not interrupted by the kernel itself, and that an unmount ends the server.
+They need `/dev/fuse` and a `fusermount3` that can mount for an unprivileged user (or
+a user namespace, where `tools/fusemount` stands in for it: `tools/ci/mount.sh` runs
+the tests that way). On a runner whose kernel answers FUSE differently, a test of
+what Linux does would test that kernel, so none is gated there and none skips there.
+They run on a Linux host: `go test -tags fuse ./pkg/mount ./internal/sqlitecheck`,
+passing on amd64 and arm64 kernels (the results of the last run are in the pull
+request that changed the mount), and the proposal is a runner with a Linux kernel for
+them. What the mount does that needs no kernel is gated: the commits, the interrupts
+(no request is answered `EINTR`, checked by a test of the source and by calling every
+handler), the context every read runs on, and the creation of a file that exists, all
+by calling the handlers, under the race detector.
 
 ## Measurements
 
@@ -172,14 +180,14 @@ tested by calling the handlers, under the race detector.
 
 ### Under signals, through the mount
 
-Measured on a Linux kernel (the CI runner's kernel cannot run this test; see above). The
+Measured on an arm64 Linux 7.0 kernel (a runner whose kernel is not Linux's cannot run this test; see above). The
 work is bounded by count and by the clock, whichever comes first (2,000 fsyncs and 8 GiB
 of reads, at most 45 s each), so it is fast on a busy disk.
 
 | What | Result | Test |
 |---|---|---|
-| 2,000 small files written, fsynced and closed, two writers, SIGURG at their threads | 28,030 signals in 7.7 s; 0 failures; the callers saw `EINTR` from fsync 7,909 times and restarted it, and none from close | `TestFUSEInterruptsAreNotErrors` |
-| 8 GiB read back in 1 MiB reads of a 256 MiB file, two readers, same signals | 70,861 signals in 11.5 s (744 MB/s); 0 failures | same |
+| 2,000 small files written, fsynced and closed, two writers, SIGURG at their threads | 25,828 signals in 7.6 s; 0 failures; the callers saw `EINTR` from neither fsync nor close (an earlier build answered fsync `EINTR` 7,909 times in one run) | `TestFUSEInterruptsAreNotErrors` |
+| 8 GiB read back in 1 MiB reads of a 256 MiB file, two readers, same signals | 49,526 signals in 6.5 s (1,325 MB/s); 0 failures | same |
 
 ### Holes
 

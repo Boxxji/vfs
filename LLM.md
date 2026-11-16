@@ -99,12 +99,23 @@ loses no acknowledged commit. Objects are written once under hash or random name
 so repeating a write, or one that completes after its caller gave up, is harmless;
 the Head compare-and-swap is the only mutation.
 
-* On the mount an interrupt (a signal reaching a caller that waits) ends only fsync's
-  wait (EINTR; the commit runs on by itself). Read, write, close and the calls that
-  change the tree are never answered EINTR: a read answered EINTR reaches the caller as
-  EIO, close is not restarted, a restarted O_EXCL create would meet its own file. The
-  details are in `pkg/mount/errno.go`; `TestFUSEInterruptsAreNotErrors` hammers the
-  mount with signals.
+* On the mount no request is answered EINTR: an interrupt (a signal reaching a caller
+  that waits) does not end the wait, and every call returns its own result. C callers
+  do not restart EINTR: SQLite reports an fsync answered EINTR as an I/O error, a stat
+  answered EINTR is an error to a C caller, a read answered EINTR reaches the caller
+  as EIO, close is not restarted, a restarted O_EXCL create would meet its own file.
+  Every handler therefore runs on `context.WithoutCancel(ctx)` (`TestEveryHandlerOutlivesItsRequest`
+  reads the source for it). The cost is that a stalled store stalls its callers and a
+  SIGKILL does not free them until it resumes; deadlines are the next change
+  (SPECIFICATION section 11 has the numbers). The details are in `pkg/mount/errno.go`;
+  `TestFUSEInterruptsAreNotErrors` hammers the mount with signals.
+* A moved Volume is `vfs reseal --backend NEW --round N [--from OLD]` after copying its
+  objects; it can be repeated at a higher round, and `--from` can be left out
+  (SPECIFICATION 5.4 says what that trusts).
+* The layout bytes are pinned by `spec_test.go`, which rebuilds each from the
+  specification text. Change a byte and it fails; change the text and the test together.
+* Objects beside the tree (a trace store, say) are extension objects under `ext/`
+  (SPECIFICATION 3.1): readers ignore what they do not know and a collector never deletes it.
 * On error the changes stay in memory for the next Flush and the outcome of that
   attempt is unknown. `ErrStaleRound` means this Volume was fenced; if the store's
   Head is exactly its tree, Flush says nil (the commit landed, the reply was lost).

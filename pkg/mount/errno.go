@@ -76,14 +76,17 @@ func errno(err error) error {
 // with the result of its call.
 //
 // The cost is that a call waits for the store. There are no deadlines on the store yet,
-// so a store that stops answering stops every call that needs it, and a caller can leave
-// only by SIGKILL, which ends its wait in the kernel while the daemon goes on holding the
-// request (about 128 KiB of the FUSE library's message buffer for each: 3,000 stalled
-// lookups held 386 MB, and reads before the buffers below were bounded, 1,600 held 225 MB).
-// Reads are bounded: at most readSlots hold a buffer. The rest is the deadlines' change.
+// so a store that stops answering stops every call that needs it, and killing a caller
+// does not free it: read, write, create, truncate and the exit of a process with an open
+// file were seen to stay in the kernel until the store answered, while the daemon holds
+// every abandoned request (about 128 KiB of the FUSE library's message buffer for each:
+// 3,000 stalled lookups held 386 MB, and 1,600 reads held 225 MB before their buffers
+// were bounded). Reads are bounded now: at most readSlots hold a buffer. The rest is the
+// deadlines' change (docs/SPECIFICATION.md, section 11).
 
-// readSlots bounds the reads that hold a buffer at once, so a stalled store holds at most
-// readSlots times the largest read, 8 MiB, for reads.
+// readSlots bounds the reads that hold a buffer at once. A read is at most 128 KiB, so
+// a stalled store holds at most 8 MiB for reads, and the reads behind them wait for a slot
+// before they allocate.
 const readSlots = 64
 
 // session is what every node and handle of one mount shares: the Volume, the mount's

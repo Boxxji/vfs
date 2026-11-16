@@ -5,7 +5,10 @@ sealing protocols, stated so that a third party can write a compatible reader or
 writer. It describes what the reference implementation does today and what its tests
 hold it to. "MUST", "SHOULD" and "MAY" are used as in RFC 2119. Sections marked
 (informative) explain and bind no one. There is one layout: it carries no version
-number, and nothing here describes any other.
+number, and nothing here describes any other. Every byte this text fixes is pinned by a
+known-answer test that rebuilds it from the text alone, with each constant spelled out
+(`spec_test.go`, section 10): a change to the code that moves a byte of the layout
+fails there, whatever the other tests read back.
 
 ## 1. Conventions
 
@@ -38,6 +41,11 @@ relative to the Volume's prefix, which is joined to them with one `/`.
 | `PutIfAbsent(key, data)` | store `data` only if `key` does not exist, atomically with the check; `Conflict` otherwise; returns the new version |
 | `PutIfVersion(key, data, v)` | store `data` only if `key` exists and its version is `v`, atomically with the check; `Conflict` otherwise; of several calls naming one `v` exactly one succeeds; returns the new version |
 | `Delete(key)` | remove; removing an absent key is not an error |
+| `List(prefix)` | the keys that begin with `prefix` |
+| `Stat(key)` | the size of the object at `key` without its body; absent is `NotFound` |
+
+No read or write of a Volume uses `List` or `Stat`; they are for tools that copy a
+Volume to another place or collect what it no longer reaches.
 
 A version token is opaque and compared only for equality: two reads of an unchanged
 object return the same token, and any write by anyone changes it. A store that cannot
@@ -54,7 +62,8 @@ bytes. A prefix that fails this MUST be refused, not cleaned.
 
 ## 3. Objects
 
-A Volume is three kinds of object. Every object is a sealed frame (section 4).
+A Volume is three kinds of object, and may hold others (3.1). Every object is a sealed
+frame (section 4).
 
 | Key | Object | Mutable | Name |
 |---|---|---|---|
@@ -62,11 +71,53 @@ A Volume is three kinds of object. Every object is a sealed frame (section 4).
 | `meta/<2 hex>/<64 hex>` | a metadata shard (section 6) | no | the hash of the shard's sealed bytes, hex; the 2 hex digits are its first byte |
 | `pack/<2 hex>/<32 hex>` | a pack of chunks (section 7) | no | 128 random bits, hex; the 2 hex digits are its first byte |
 
-Everything but `head` is written once, under a name that is a hash of its bytes or a
-random identifier, and never changes. A writer MAY write an immutable object again,
-or after its caller gave up; the second write puts the same bytes at the same name. A
-reader MUST check a shard against its name (the hash of the sealed bytes) and a chunk
-against its id (section 7), and MUST treat a mismatch as corruption, not retry it.
+Of these three, everything but `head` is written once, under a name that is a hash of
+its bytes or a random identifier, and never changes. A writer MAY write an immutable
+object again, or after its caller gave up; the second write puts the same bytes at the
+same name. A reader MUST check a shard against its name (the hash of the sealed bytes)
+and a chunk against its id (section 7), and MUST treat a mismatch as corruption, not
+retry it.
+
+### 3.1 Objects this text does not define
+
+Something that is not the tree of the Volume, such as a hint that makes the next
+attachment faster, can be stored beside it. Such an object is an extension object, and
+the rules for one are these.
+
+* **Unknown objects are left alone.** A reader MUST ignore every key it does not know
+  and MUST NOT fail because one exists. A collector, or any tool that removes objects,
+  MUST NOT delete an object it does not know: it deletes only an object under `meta/`
+  or `pack/` whose key has exactly the shape in the table above and that no Head it
+  must keep reaches. A tool that finds a key of another shape, under `meta/` or `pack/`
+  or anywhere else, reports it and leaves it.
+* **Naming.** An extension object lives under `ext/<name>/<rest>`. `<name>` is 1 to 32
+  bytes of `a-z`, `0-9` and `-` and names the extension; `<rest>` is one or more
+  segments valid as a prefix (section 2) and is defined by the extension. Nothing but
+  an extension defined this way uses `ext/`.
+* **Sealing.** An extension object is a sealed frame (4.2) whose context has the kind
+  `ext` and the fields: the 16-byte Volume id, the extension's `<name>` as bytes, and
+  `<rest>` as bytes. It is bound to the Volume (it moves with it, as shards do, and
+  needs no reseal) and to its own key, so an object of one Volume, of another
+  extension or of another name does not open.
+* **Fencing.** The Head's Round orders the commits of the tree; it does not cover
+  extension objects. A writer that has been fenced out can still write one. An
+  extension MUST therefore be safe against that: whatever version of one a reader finds,
+  an old one, a stale writer's or none, the contents of the Volume are what its Head
+  says, and the extension is only a hint, or says what a stale write costs and why it
+  is bearable. State the tree depends on is not an extension: it is a change to this
+  text.
+* **Replacement.** A mutable extension object is created with `PutIfAbsent` and
+  replaced with `PutIfVersion`, so a reader finds the old object or the new one, whole,
+  and two writers do not overwrite each other's replacement unseen. An immutable one
+  is named by a hash of its sealed bytes or by a random identifier, as in the table.
+* **Unreachable is not garbage.** The rule that an object no Head reaches is garbage
+  (section 11) applies to the three kinds of the table and to no extension object.
+  An extension that wants reclamation defines it, and a collector applies it only if it
+  implements that extension.
+
+No code in the reference implementation writes an extension object yet; the first
+user is the trace store of `docs/prefetch.md` (S6), which is an extension object by
+this section.
 
 ## 4. Sealing
 
@@ -232,12 +283,28 @@ carried it forward), the commit counts as landed.
 
 Only the Head is bound to the place (4.2). To move a Volume to another place, copy
 every object under its prefix to the new place and then reseal the Head there: read
-`head` through the fence, open its sealed payload under the context of the old place's
-canonical location string, check that it decodes as a Head, seal it again under the
-context of the new place, and write it with the Claim procedure (5.2) at a Round
-strictly greater than the one recorded (neither 0 nor 2^64-1). The reseal fences the
-copy only: a writer still attached at the old place is not told, so it must be
-stopped first. A failed reseal is retried at a higher Round.
+`head` through the fence, open its sealed payload (below), check that it decodes as a
+Head, seal it again under the context of the new place, and write it with the Claim
+procedure (5.2) at a Round strictly greater than the one recorded (neither 0 nor
+2^64-1). The reseal fences the copy only: a writer still attached at the old place is
+not told, so it must be stopped first. A writer that commits without pause can win the
+race for the Head eight times, and the reseal then fails with a lost conditional
+write. A failed reseal is retried at a higher Round.
+
+The payload is opened in one of three ways, tried in this order:
+
+1. under the context of the old place, given as its canonical location string (1);
+2. if that fails because the context differs, under the context of the new place: the
+   Head is already sealed there, a reseal whose reply was lost for instance, and it is
+   left as it is and only the Round is claimed. A reseal can therefore be repeated at
+   a higher Round whatever it is told the old place was;
+3. if the old place is not given, with the key alone, ignoring the context. This
+   trusts the key (only a holder of it can have written a Head that opens, because of
+   the tag in 4.1) and trusts that the Head found is the newest of the Volume the
+   operator means. It checks one thing more: the root shard that the Head names MUST
+   open at the new place under the Volume id the Head carries, which refuses a copy
+   that lacks its objects and a Head of another Volume. It cannot tell a Head from
+   before the newest commit from the newest, as no one can without the place.
 
 ## 6. The metadata tree
 
@@ -382,7 +449,7 @@ end in a pack, with no header and no index: where each lies is the chunk table (
 fetches one chunk with a ranged read of its frame, opens it, and MUST check that the
 hash of the plaintext is the chunk id.
 
-## 8. What is durable when a call returns
+## 8. What is durable when a call returns (today)
 
 The reference implementation's behaviour today, which any change MUST preserve or
 extend. "Commit" is the successful return of the Head's conditional write (5.3).
@@ -393,24 +460,38 @@ extend. "Commit" is the successful return of the Head's conditional write (5.3).
 | close of a file handle | nothing. It releases the handle |
 | flush | everything written before the call, committed. It returns only after the Head advanced |
 | fsync | the same as flush: a full commit. There is no cheaper durable point |
-| flush on a mount (every `close(2)`) | the same as flush |
+| flush on a mount (every `close(2)`) | the same as flush: a full commit, also for a handle that wrote nothing |
 | release on a mount | nothing |
 | end of a mount | one flush |
 | close of the Volume | nothing; it does not flush |
 | attach (takeover) | every commit the previous owner saw acknowledged is in the new owner's tree, and no commit by an older Round lands afterwards |
 
+This table is what the code does now, and it is not the target. The draft HIP for this
+layout (HIP-1342, section 8) states a different behaviour for `close`: a close does not
+commit by itself, and a read-only handle's close does not publish another handle's
+writes. Today every close on a mount is a flush, and a flush commits everything any
+handle wrote, so a read-only close can publish another handle's writes. (A flush with
+nothing to commit already makes no store request: `TestCleanFlushMakesNoStoreRequest`.)
+The change that adds the journal changes the rows for `close` and for a flush on a
+mount, and this section with them; until then the table above binds.
+
 A later change (a node-local journal for fast fsync, group commit) MUST keep: flush
 and the detach sequence return only after the Head advanced in the store; a takeover
 loses no acknowledged commit; objects are written once under names that make
-repeating a write harmless; and the Head's compare-and-swap is the only mutation. A
-journal may make a call cheaper only by making it durable somewhere else first, and
-then flush MUST still be a commit in the store.
+repeating a write harmless; and the Head's compare-and-swap is the only mutation of
+the tree. A journal may make a call cheaper only by making it durable somewhere else
+first, and then flush MUST still be a commit in the store.
 
-On a mounted file system, a signal that reaches a waiting caller interrupts the
-request. `fsync` then stops waiting and is answered "interrupted" while its commit
-goes on by itself; read, write, close and the calls that change the tree are not
-answered "interrupted" and return their own result. No interrupt cancels a commit or
-a fetch. (informative; the reasons are in the implementation's notes.)
+On a mounted file system, a signal that reaches a waiting caller makes the kernel
+interrupt the request, and no request is answered "interrupted": every call waits for
+its own result, and no interrupt cancels a commit or a fetch. (informative) The reason
+is what callers do with the answer, measured on Linux: a C caller does not retry
+`fsync(2)`, so SQLite reported an I/O error from it (a database over a mount failed
+7 runs of 7 on one kernel, and a C caller under a timer saw 246,912 interrupted
+fsyncs in 5,000); `stat(2)` and directory reads answered "interrupted" reached C callers
+as errors 1,586 times in 60,000 calls without `SA_RESTART` and 2,884 with it; `read(2)`
+reached its caller as `EIO`; `close(2)` is never restarted; a restarted create with
+`O_EXCL` meets its own file. The cost is in section 11.
 
 ## 9. Limits
 
@@ -437,12 +518,13 @@ reference implementation (all in the repository root unless a package is named):
 
 | Property | Tests |
 |---|---|
-| objects are written once; crash at any point leaves the last commit | `TestSigkill` (six kill points), `TestFailureAtEveryWrite`, `TestLostAcknowledgementOfHead`, `TestKillOverRealServer` |
+| every byte of the layout | `TestSpecContexts`, `TestSpecFrameAndTag`, `TestSpecHead`, `TestSpecFenceRecord`, `TestSpecRecords`, `TestSpecNodeAndBoundary`, `TestSpecChunker` (each rebuilds the bytes from this text and compares) |
+| objects are written once; crash at any point leaves the last commit | `TestSigkill` (six kill points, every run), `TestFailureAtEveryWrite`, `TestLostAcknowledgementOfHead`, `TestKillOverRealServer` |
 | fence: one winner, older Round refused, takeover loses nothing, lost acknowledgements | `pkg/fence` tests, `TestFenceRefusesOlderRound`, `TestAttachNeedsAHigherRound`, `TestTakeoverLosesNoAcknowledgedCommit`, `TestRacingClaims`, `TestSameRoundRace`, `TestAttachLostAckIsNotStale`, `TestAttachAfterALostClaimNeedsAHigherRound`, `TestRoundMaxIsRefused`, `TestHeadSeqNeverRepeats` |
 | store contract | `internal/storetest` conformance suite, run on every backend; `TestRealServerCAS`, `TestRealServerRaceStress` |
 | sealing context, exact and injective | `TestSealedToItsContext`, `TestHeadContextIsExact`, `TestContextsDoNotCollide`, `TestSwappedHeadIsRefused`, `TestChunkHashIsChecked` |
-| the Cipher: checked at configuration and at every Seal; unforgeable with the recipient alone | `TestIdentityCipherIsRefused`, `TestCipherThatStopsSealingIsCaughtAtEverySeal`, `TestRecipientAloneCannotForge`, `TestWrongKeyFailsClosed`, `TestTamperedObjectsAreRefused`, `TestSwappedChunkIsRefused` |
-| places and moving a Volume | `TestPlaceSpellings`, `TestResealMovesAVolume` |
+| the Cipher: checked at configuration and at every Seal; unforgeable with the recipient alone | `TestIdentityCipherIsRefused`, `TestCipherThatStopsSealingIsCaughtAtEverySeal`, `TestSealCatchesAHeaderedFallback`, `TestNoPublicTagKeyVerifies`, `TestShortForgedPlaintextIsRefusedNotPanicked`, `TestContextIsComparedWhole`, `TestRecipientAloneCannotForge`, `TestWrongKeyFailsClosed`, `TestTamperedObjectsAreRefused`, `TestSwappedChunkIsRefused` |
+| places and moving a Volume | `TestPlaceSpellings`, `TestPlaceStringsAreOneSpelling`, `TestPlacesAreRefusedNotCleaned`, `TestRedactionCases`, `TestRedactionLeaks`, `TestResealMovesAVolume`, `TestResealWrongFromChangesNothing`, `TestResealCrashAtTheWrite`, `TestResealIsRepeatable`, `TestResealWithoutThePlace`, `TestResealOfALiveVolume`, `TestResealRacesAWriter`, `TestResealRefusesTheLastRound`, `TestResealRefusesAGarbageHead`, `TestPartialCopyFailsClosed`, `TestCLIReseal` (`cmd/vfs`) |
 | keyed tree boundaries | `TestGroundNamesDoNotBloatTheTree`, `TestBoundariesDependOnTheSeed` |
 | rotation | `TestRotation` |
 | records and the tagged inode | `TestInodeRecordIsExtensible`, `TestHeadRejectsGarbage` |
@@ -451,11 +533,46 @@ reference implementation (all in the repository root unless a package is named):
 | holes and truncation, byte for byte against a plain model | `TestSparseExact`, `TestSparseRandom`, `TestSparsePetabyte`, `TestModelFuzz` |
 | bounded reads | `TestHeadBound`, `TestShardBound`, `TestBackendBodyIsBounded`, `TestReadIsBounded` |
 | prefixes | `TestValidPrefix`, `TestPrefixConfinement` |
-| durability and interrupts on a mount | `TestFUSEFsyncSurvivesKill`, `TestFUSEInterruptsAreNotErrors`, `TestCommitSurvivesItsCaller`, `TestInterruptedFsyncRetriesDoNotPileUp`, `TestFUSEReadsExistingFilesOverS3` (`pkg/mount`) |
+| durability and interrupts on a mount | `TestFUSEFsyncSurvivesKill`, `TestFUSEInterruptsAreNotErrors`, `TestFsyncWaitsForItsCommit`, `TestCloseWaitsForItsCommit`, `TestReadWaitsForItsData`, `TestLookupIsNotAnsweredEINTR`, `TestAttrIsNotAnsweredEINTR`, `TestReaddirIsNotAnsweredEINTR`, `TestMkdirIsNotAnsweredEINTR`, `TestRemoveIsNotAnsweredEINTR`, `TestCreateIsNotAnsweredEINTR`, `TestEveryHandlerOutlivesItsRequest`, `TestFsyncCallersShareTwoCommits`, `TestStalledReadsHoldBoundedMemory`, `TestFUSEReadsExistingFilesOverS3`, and `TestFUSESQLite` (`internal/sqlitecheck`) on a Linux kernel |
+| full-size randomised runs | `TestSparseExact`, `TestSparseRandom`, `TestSparseCanonicalRuns`, `TestSparseTinyBounds` (the `sparse` gate, not `-short`) |
 
-## 11. Not specified
+## 11. Not specified, and known limits
 
 Rename, links, symbolic links, owner and mode changes, extended attributes, locks and
 file-system statistics have no records yet; a mount answers them "not supported". There
-is no garbage collection of unreferenced objects and no snapshot or clone. Deadlines, retries and back-off are the caller's. Sealed
-sizes depend on the Cipher.
+is no garbage collection of unreferenced objects and no snapshot or clone. Retries and
+back-off are the caller's. Sealed sizes depend on the Cipher.
+
+Known limits of the reference implementation. None changes the layout.
+
+* **A stalled store stalls its callers, and a kill does not free them.** A store request
+  has no deadline. A call that needs the store waits for it, because no call is answered
+  "interrupted" (section 8). With a store that has stopped answering, a caller
+  that is killed leaves its read, write, create, truncate or exit in the kernel until the
+  store resumes, and the daemon holds every abandoned request. Measured with the store
+  stopped: 1,600 reads at distinct offsets grew the daemon by about 225 MB and 3,000
+  distinct lookups by about 386 MB, about 128 KiB for each request. Reads now hold a
+  buffer only while one of 64 slots is theirs, which bounds what a read allocates; the
+  request itself is held by the FUSE library and is not bounded here. A flush holds the
+  Volume's lock while it commits, so one stalled commit stalls every call behind it.
+  Deadlines on store requests, and giving the lock up to a call that is waiting, are
+  the next change and are not part of this layout.
+* **Metadata grows with the number of chunks** of a file: a chunk table is a record of
+  the tree, so the shards a file costs grow in proportion to its chunks.
+* **A chunk is read whole to be authenticated.** Its tag covers all of it, so a read of
+  a few bytes fetches the chunk; sub-chunk reads cannot be added without a different
+  sealing.
+* **The Round in the fence header is not authenticated.** It is checked against the
+  recorded Round by conditional writes, not by the Cipher: whoever can write the store
+  can set it, as they can delete the Head. The store is trusted with availability, not
+  with confidentiality or with ordering a hostile writer.
+* **A retired key stays trusted** for as long as it is in the Cipher: it opens, and
+  its holder can seal. Dropping it makes what only it sealed unreadable (rotation).
+* **Keyed boundaries stop a guest, not an observer.** The boundaries are keyed from the
+  Volume's seed so that a guest who picks names cannot grind them to bloat the tree
+  (6.3). They do not hide from an observer of the store how many shards each commit
+  writes.
+* **A reseal can lose the race** against a writer that commits without pause (5.4);
+  stop the writer first.
+* The `replica/` package keeps a SQLite replica current by a ticker; it is not part
+  of this layout and is not specified.
