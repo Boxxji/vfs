@@ -292,6 +292,39 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer) 
 		},
 	}
 
+	var from string
+	reseal := &cobra.Command{
+		Use:   "reseal",
+		Short: "Seal the Head of a Volume that was copied to --backend to that place, and claim it at --round",
+		Long: `A Head is sealed to the place it was written at. After the objects of a Volume were
+copied to another bucket or prefix, reseal makes the copy open there. The old place is
+--from, the URL the Volume was last used at; leave it out if it is not remembered, and the
+Head is opened with the key alone: that trusts the key, and that the Head in the copy is
+the newest one, and it refuses a copy whose root shard is missing. Stop any writer at the
+old place first: reseal fences the copy only. It can be repeated at a higher --round.`,
+		Args: cobra.NoArgs,
+		RunE: func(*cobra.Command, []string) error {
+			if round == 0 {
+				return errors.New("--round is required: the Round to claim the Volume at, above the last one used")
+			}
+			cfg, err := config(round)
+			if err != nil {
+				return err
+			}
+			defer cfg.Backend.Close()
+			if from != "" {
+				old, err := backend.Open(ctx, from)
+				if err != nil {
+					return err
+				}
+				from = old.String() // the canonical place, whatever spelling the URL had
+				old.Close()
+			}
+			return vfs.Reseal(ctx, cfg, from)
+		},
+	}
+	reseal.Flags().StringVar(&from, "from", "", "the URL the Volume was last used at")
+
 	mountCmd := &cobra.Command{
 		Use:   "mount <mountpoint>",
 		Short: "Mount the Volume as a FUSE filesystem (needs a build with -tags fuse)",
@@ -306,10 +339,10 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer) 
 		},
 	}
 
-	for _, c := range []*cobra.Command{put, mountCmd} {
+	for _, c := range []*cobra.Command{put, mountCmd, reseal} {
 		c.Flags().Uint64Var(&round, "round", 0, "the Round to claim the Volume at; must exceed the last one used")
 	}
-	root.AddCommand(keygen, initCmd, put, get, ls, stats, mountCmd)
+	root.AddCommand(keygen, initCmd, put, get, ls, stats, reseal, mountCmd)
 	return root.ExecuteContext(ctx)
 }
 

@@ -96,3 +96,47 @@ func errString(err error) string {
 	}
 	return err.Error()
 }
+
+// A Volume copied to another directory opens there after `vfs reseal`, whether or not the
+// old place is remembered, and a repeat at a higher round is not an error.
+func TestCLIReseal(t *testing.T) {
+	dir := t.TempDir()
+	old := "file://" + filepath.Join(dir, "old")
+	key, _ := vfsRun(t, "", "keygen")
+	if _, err := vfsRun(t, key, "init", "--backend="+old); err != nil {
+		t.Fatal(err)
+	}
+	src := filepath.Join(dir, "in")
+	if err := os.WriteFile(src, []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := vfsRun(t, key, "put", "--backend="+old, "--round=1", src, "/f"); err != nil {
+		t.Fatal(err)
+	}
+	for i, from := range []string{old, ""} {
+		to := "file://" + filepath.Join(dir, "new"+string(rune('a'+i)))
+		if err := os.CopyFS(filepath.Join(dir, "new"+string(rune('a'+i))), os.DirFS(filepath.Join(dir, "old"))); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := vfsRun(t, key, "get", "--backend="+to, "/f"); err == nil || !strings.Contains(err.Error(), "vfs reseal") {
+			t.Fatalf("get at the copy before reseal = %v, want the hint to reseal", err)
+		}
+		args := []string{"reseal", "--backend=" + to, "--round=5"}
+		if from != "" {
+			args = append(args, "--from="+from)
+		}
+		if _, err := vfsRun(t, key, args...); err != nil {
+			t.Fatalf("reseal from %q: %v", from, err)
+		}
+		if got, err := vfsRun(t, key, "get", "--backend="+to, "/f"); err != nil || got != "hello" {
+			t.Fatalf("get after reseal = %q, %v", got, err)
+		}
+		args[2] = "--round=6"
+		if _, err := vfsRun(t, key, args...); err != nil {
+			t.Fatalf("repeat of reseal from %q: %v", from, err)
+		}
+	}
+	if _, err := vfsRun(t, key, "reseal", "--backend="+old); err == nil {
+		t.Fatal("reseal without a round succeeded")
+	}
+}

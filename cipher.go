@@ -116,6 +116,29 @@ func unseal(c Cipher, aad, frame []byte) ([]byte, error) {
 	if len(aad) != bindLen {
 		return nil, fmt.Errorf("vfs: unseal: context of %d bytes, want %d", len(aad), bindLen)
 	}
+	plain, err := open(c, frame)
+	if err != nil {
+		return nil, err
+	}
+	if subtle.ConstantTimeCompare(plain[:bindLen], aad) != 1 {
+		return nil, errContext
+	}
+	return plain[bindLen:], nil
+}
+
+// unsealAny opens an object without asking what it was sealed to. It proves only that
+// the Cipher's key sealed it, not for which Volume, kind or place: the one caller is
+// Reseal without a place, which checks the rest itself.
+func unsealAny(c Cipher, frame []byte) ([]byte, error) {
+	plain, err := open(c, frame)
+	if err != nil {
+		return nil, err
+	}
+	return plain[bindLen:], nil
+}
+
+// open reverses the Cipher and returns the context followed by the plaintext.
+func open(c Cipher, frame []byte) ([]byte, error) {
 	if len(frame) < 1 || len(frame) < 1+int(frame[0]) {
 		return nil, fmt.Errorf("%w: truncated frame", ErrCorrupt)
 	}
@@ -124,10 +147,10 @@ func unseal(c Cipher, aad, frame []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(plain) < bindLen || subtle.ConstantTimeCompare(plain[:bindLen], aad) != 1 {
+	if len(plain) < bindLen {
 		return nil, errContext
 	}
-	return plain[bindLen:], nil
+	return plain, nil
 }
 
 // ageCipher is the default Cipher: every object is an age file sealed to a
@@ -148,6 +171,11 @@ type ageCipher struct {
 }
 
 const tagLen = 32
+
+// errOlder is what a tag that is missing or wrong most often means: this layout has no
+// version to read, so a Volume written by an earlier build, which sealed its objects
+// another way, fails here and nowhere sooner.
+const errOlder = "the object was altered, or the Volume was written by an earlier build whose layout this one does not read"
 
 // tagKey derives the tag key of an identity from its secret.
 func tagKey(k *age.HybridIdentity) (key [32]byte) {
@@ -214,11 +242,11 @@ func (c *ageCipher) Open(sealed []byte, keyID string) ([]byte, error) {
 		return nil, fmt.Errorf("%w: %v", ErrCorrupt, err)
 	}
 	if len(plain) < tagLen {
-		return nil, fmt.Errorf("%w: no tag", ErrCorrupt)
+		return nil, fmt.Errorf("%w: no tag (%s)", ErrCorrupt, errOlder)
 	}
 	body, got := plain[:len(plain)-tagLen], plain[len(plain)-tagLen:]
 	if subtle.ConstantTimeCompare(got, tag(c.tags[keyID], body)) != 1 {
-		return nil, fmt.Errorf("%w: the tag does not verify", ErrCorrupt)
+		return nil, fmt.Errorf("%w: the tag does not verify (%s)", ErrCorrupt, errOlder)
 	}
 	return body, nil
 }

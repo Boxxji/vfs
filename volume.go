@@ -220,12 +220,25 @@ func Attach(ctx context.Context, cfg Config) (*Volume, error) {
 
 // Reseal rewrites the Head of the Volume at cfg.Backend so that it is sealed to
 // that place, and claims the Volume there at cfg.Round, which must exceed the
-// recorded Round and be above 0 and below 2^64-1. from is the place the Head is
-// sealed to now: the String of the Backend it was last written through. A Head is
-// bound to its place, and every other object to the Volume, so moving a Volume to
-// another bucket or prefix is: copy every object, then Reseal. It fences the copy
-// only; a writer still attached at the old place is not told, so stop it first. A
-// failed Reseal is retried at a higher Round.
+// recorded Round and be above 0 and below 2^64-1. A Head is bound to its place, and
+// every other object to the Volume, so moving a Volume to another bucket or prefix
+// is: copy every object, then Reseal. It fences the copy only; a writer still
+// attached at the old place is not told, so stop it first (a writer that commits
+// without pause can also make Reseal lose the race for the Head, which is then
+// retried at a higher Round).
+//
+// from is the place the Head is sealed to now: the String of the Backend it was last
+// written through. If the Head is already sealed to cfg.Backend, a Reseal whose
+// reply was lost for instance, it is left as it is and only the Round is claimed, so
+// a Reseal can always be repeated at a higher Round.
+//
+// from may be empty when the old place is not remembered. The Head is then opened
+// with the key alone, whatever place it was sealed to. That trusts the key (only a
+// holder can have written a Head that opens) and that the Head at cfg.Backend is the
+// newest Head of the Volume the caller means: it refuses a Head whose root shard is
+// not at cfg.Backend sealed to the Volume the Head names, which is a copy that is
+// missing objects or a Head of another Volume, but it cannot tell a Head from before
+// the newest commit from the newest, as no one can without the place.
 func Reseal(ctx context.Context, cfg Config, from string) error {
 	cfg, err := cfg.valid()
 	if err != nil {
@@ -235,6 +248,7 @@ func Reseal(ctx context.Context, cfg Config, from string) error {
 		return fmt.Errorf("%w: Reseal needs a Round above 0 and below 2^64-1", fs.ErrInvalid)
 	}
 	v := newVolume(cfg)
+	here := cfg.Backend.String()
 	return v.fence.Rewrite(ctx, headKey, cfg.Round, func(payload []byte, recorded uint64) ([]byte, error) {
 		if payload == nil {
 			return nil, fmt.Errorf("vfs: no volume at %s: %w", cfg.Backend, fs.ErrNotExist)
@@ -242,14 +256,31 @@ func Reseal(ctx context.Context, cfg Config, from string) error {
 		if cfg.Round <= recorded {
 			return nil, fmt.Errorf("%w: round %d does not exceed the recorded %d", ErrStaleRound, cfg.Round, recorded)
 		}
-		plain, err := unseal(cfg.Cipher, headAAD(from), payload)
+		var plain []byte
+		var err error
+		if from == "" {
+			plain, err = unsealAny(cfg.Cipher, payload)
+		} else if plain, err = unseal(cfg.Cipher, headAAD(from), payload); errors.Is(err, errContext) {
+			if plain, err = unseal(cfg.Cipher, headAAD(here), payload); err == nil {
+				return payload, nil // already sealed to this place
+			}
+			err = fmt.Errorf("%w (from %s)", errContext, from)
+		}
 		if err != nil {
-			return nil, fmt.Errorf("vfs: open head sealed for %s: %w", from, err)
+			return nil, fmt.Errorf("vfs: open head: %w", err)
 		}
-		if _, err := unmarshalHead(plain); err != nil {
-			return nil, fmt.Errorf("vfs: head sealed for %s: %w", from, err)
+		h, err := unmarshalHead(plain)
+		if err != nil {
+			return nil, fmt.Errorf("vfs: head: %w", err)
 		}
-		return seal(cfg.Cipher, headAAD(cfg.Backend.String()), plain)
+		if from == "" {
+			w := newVolume(cfg)
+			w.adopt(h)
+			if _, err := w.t.sh.load(ctx, h.Root); err != nil {
+				return nil, fmt.Errorf("vfs: the Head names a root that %s does not hold: %w", here, err)
+			}
+		}
+		return seal(cfg.Cipher, headAAD(here), plain)
 	})
 }
 

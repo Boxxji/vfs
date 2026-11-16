@@ -92,7 +92,7 @@ func chunkAAD(id volumeID, c chunkID) []byte { return bind("chunk", id[:], c[:])
 func (v *Volume) readHead(payload []byte) (Head, error) {
 	plain, err := unseal(v.c, headAAD(v.be.String()), payload)
 	if errors.Is(err, errContext) {
-		return Head{}, fmt.Errorf("vfs: open head at %s: %w (a Head is sealed to the place it was written at: if the Volume was moved, Reseal it)", v.be, err)
+		return Head{}, fmt.Errorf("vfs: open head at %s: %w (a Head is sealed to the place it was written at: if the Volume was moved, `vfs reseal` it)", v.be, err)
 	}
 	if err != nil {
 		return Head{}, fmt.Errorf("vfs: open head: %w", err)
