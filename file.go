@@ -1,308 +1,517 @@
 package vfs
 
 import (
+	"cmp"
 	"context"
-	"errors"
 	"fmt"
 	"io"
+	"io/fs"
+	"slices"
+	"sort"
 	"time"
-
-	"github.com/hanzoai/vfs/pkg/backend"
 )
 
-// File is a multi-block file handle. Reads/writes are byte-addressed;
-// the implementation transparently fetches, modifies, and re-encrypts
-// 4 KiB blocks. Dirty blocks are buffered in a per-handle write set
-// until Sync flushes them to the backend (and updates the inode's
-// block list in the FS metadata tree).
-//
-// Concurrency: a File is owned by a single goroutine. Concurrent FS
-// access across multiple Files is supported by FS's RWMutex.
+// small is the largest file stored whole in a metadata record. Larger files are
+// chunked. A file's form is a function of its size alone, so a given content has
+// exactly one representation.
+const small = 16 << 10
+
+// MaxSize is the largest a file can be: 4 EiB, far past anything a store holds,
+// chosen so offsets and lengths never overflow a signed 64-bit integer. A file
+// may be declared much larger than the bytes written to it. What it costs follows
+// the runs of bytes written, not its size: a hole has no chunks, no records and no
+// memory.
+const MaxSize = 1 << 62
+
+// spanCost is what each separate unsettled write is charged beyond its bytes: the
+// slice header, the list slot and the allocation it occupies. Without it a million
+// one-byte writes would be accounted as a megabyte and cost a hundred.
+const spanCost = 64
+
+// fileState is one file's content as the Volume holds it: the settled bytes
+// (inline, or a list of chunks) plus the writes made since, which are chunked,
+// sealed and uploaded together at the next settle. All handles to a file share
+// one fileState, so every handle sees every write at once.
+type fileState struct {
+	ino  InodeID
+	refs int  // open handles
+	gone bool // removed; handles fail
+
+	// The settled content: inline bytes, or chunks sorted by offset. Chunks need
+	// not touch: where none covers a byte, the byte is a hole and reads as zero.
+	inline []byte
+	ext    []extent
+	base   uint64
+
+	// Writes since. size is the file's length now. limit is how much of the
+	// settled content still counts: truncating below it voids the rest, so a
+	// later extension reads zeros, not the old bytes. Bytes in [limit, size)
+	// that no write covers are a hole too.
+	size    uint64
+	limit   uint64
+	mtime   time.Time
+	changed bool
+	dirty   []span // sorted, disjoint, never touching
+	dirtyN  int64  // bytes plus spanCost per span
+}
+
+// span is a run of bytes written at an offset.
+type span struct {
+	off  uint64
+	data []byte
+}
+
+func (s span) end() uint64 { return s.off + uint64(len(s.data)) }
+
+// File is an open file. Its methods are safe for concurrent use.
 type File struct {
-	fs      *FS
-	ctx     context.Context
-	inodeID InodeID
-
-	// dirty maps block index → fresh plaintext (BlockSize-padded). Reads
-	// hit dirty first, then the inode's block list. Sync materialises
-	// dirty entries via vfs.PutBlock and atomically swaps inode.Blocks.
-	dirty map[int][]byte
+	v *Volume
+	f *fileState
 }
 
-// Stat returns a snapshot of the file's inode metadata.
-func (f *File) Stat() (*Inode, error) {
-	f.fs.mu.RLock()
-	defer f.fs.mu.RUnlock()
-	in := f.fs.inodeByID(f.inodeID)
-	if in == nil {
-		return nil, fmt.Errorf("vfs.File.Stat: inode %d gone", f.inodeID)
-	}
-	return cloneInode(in), nil
-}
-
-// ReadAt reads len(p) bytes at the given offset. Returns io.EOF when
-// reading past the end of the file (matching os.File semantics: when
-// fewer bytes than requested are available, returns those bytes plus
-// io.EOF).
-func (f *File) ReadAt(p []byte, off int64) (int, error) {
-	if off < 0 {
-		return 0, fmt.Errorf("vfs.File.ReadAt: negative offset %d", off)
-	}
-	stat, err := f.Stat()
+// Open opens a regular file for reading and writing. Writes are visible to every
+// handle at once and durable at the next Flush.
+func (v *Volume) Open(ctx context.Context, ino InodeID) (*File, error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	f, err := v.state(ctx, ino)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	if uint64(off) >= stat.Size {
+	f.refs++
+	return &File{v: v, f: f}, nil
+}
+
+// state returns the file's state, loading it from the tree on first use.
+func (v *Volume) state(ctx context.Context, ino InodeID) (*fileState, error) {
+	if f := v.files[ino]; f != nil {
+		return f, nil
+	}
+	in, err := v.stat(ctx, ino)
+	if err != nil {
+		return nil, err
+	}
+	if in.IsDir() {
+		return nil, fmt.Errorf("%w: inode %d", ErrIsDir, ino)
+	}
+	recs, err := v.scan(ctx, key(tData, uint64(ino)))
+	if err != nil {
+		return nil, err
+	}
+	f := &fileState{ino: ino, base: in.Size, size: in.Size, limit: in.Size, mtime: in.Mtime}
+	for _, r := range recs {
+		if len(r.key) == prefixLen {
+			f.inline = r.val
+			continue
+		}
+		e, err := decodeExtent(offsetOf(r.key), r.val)
+		if err != nil {
+			return nil, err
+		}
+		f.ext = append(f.ext, e)
+	}
+	v.files[ino] = f
+	return f, nil
+}
+
+// Stat returns the file's attributes, including writes not yet flushed.
+func (h *File) Stat(ctx context.Context) (Inode, error) {
+	h.v.mu.RLock()
+	defer h.v.mu.RUnlock()
+	if h.f.gone {
+		return Inode{}, fs.ErrNotExist
+	}
+	return h.v.stat(ctx, h.f.ino)
+}
+
+// ReadAt reads up to len(p) bytes at off. Like io.ReaderAt it returns io.EOF
+// with the bytes it has when the file ends inside the range.
+func (h *File) ReadAt(ctx context.Context, p []byte, off int64) (int, error) {
+	if off < 0 {
+		return 0, fmt.Errorf("%w: negative offset %d", fs.ErrInvalid, off)
+	}
+	h.v.mu.RLock()
+	defer h.v.mu.RUnlock()
+	if h.f.gone {
+		return 0, fs.ErrNotExist
+	}
+	return h.v.read(ctx, h.f, p, uint64(off))
+}
+
+// read fills p from the file at off: settled content below limit, zeros above
+// it, then the unsettled writes over both. v.mu is held.
+func (v *Volume) read(ctx context.Context, f *fileState, p []byte, off uint64) (int, error) {
+	if off >= f.size {
 		return 0, io.EOF
 	}
-	want := len(p)
-	end := uint64(off) + uint64(want)
-	if end > stat.Size {
-		end = stat.Size
-		want = int(end - uint64(off))
-	}
-
-	written := 0
-	cur := uint64(off)
-	for cur < end {
-		blockIdx := int(cur / BlockSize)
-		blockOff := int(cur % BlockSize)
-		blockBytes, err := f.readBlock(blockIdx, stat)
-		if err != nil {
-			return written, err
+	n := min(uint64(len(p)), f.size-off)
+	end := off + n
+	if lim := min(f.limit, end); off < lim {
+		if err := v.readBase(ctx, f, p[:lim-off], off); err != nil {
+			return 0, err
 		}
-		copyEnd := BlockSize
-		remainingInFile := int(end - cur)
-		if remainingInFile < BlockSize-blockOff {
-			copyEnd = blockOff + remainingInFile
-		}
-		n := copy(p[written:want], blockBytes[blockOff:copyEnd])
-		written += n
-		cur += uint64(n)
+		clear(p[lim-off : n])
+	} else {
+		clear(p[:n])
 	}
-	if uint64(off)+uint64(written) >= stat.Size {
-		return written, io.EOF
+	for i := sort.Search(len(f.dirty), func(i int) bool { return f.dirty[i].end() > off }); i < len(f.dirty) && f.dirty[i].off < end; i++ {
+		s := f.dirty[i]
+		lo, hi := max(s.off, off), min(s.end(), end)
+		copy(p[lo-off:hi-off], s.data[lo-s.off:hi-s.off])
 	}
-	return written, nil
+	if n < uint64(len(p)) {
+		return int(n), io.EOF
+	}
+	return int(n), nil
 }
 
-// WriteAt writes len(p) bytes at the given offset, extending the file
-// as needed. Partial-block writes do read-modify-write to avoid
-// clobbering adjacent bytes.
-//
-// Sync MUST be called to flush dirty blocks to the backend; without
-// Sync the writes live only in this File's in-memory dirty set and
-// will be lost on close-without-sync.
-func (f *File) WriteAt(p []byte, off int64) (int, error) {
+// readBase copies settled bytes [off, off+len(p)) into p; a byte no chunk covers
+// is a hole and reads as zero.
+func (v *Volume) readBase(ctx context.Context, f *fileState, p []byte, off uint64) error {
+	if f.ext == nil {
+		n := 0
+		if off < uint64(len(f.inline)) {
+			n = copy(p, f.inline[off:])
+		}
+		clear(p[n:])
+		return nil
+	}
+	i := sort.Search(len(f.ext), func(i int) bool { return f.ext[i].end() > off })
+	for len(p) > 0 {
+		if i == len(f.ext) || f.ext[i].off > off {
+			hole := uint64(len(p))
+			if i < len(f.ext) {
+				hole = min(hole, f.ext[i].off-off)
+			}
+			clear(p[:hole])
+			p, off = p[hole:], off+hole
+			continue
+		}
+		e := f.ext[i]
+		plain, err := v.getChunk(ctx, e.id)
+		if err != nil {
+			return err
+		}
+		n := copy(p, plain[off-e.off:])
+		p, off, i = p[n:], off+uint64(n), i+1
+	}
+	return nil
+}
+
+// WriteAt writes p at off, extending the file if needed. The bytes are held in
+// memory until a settle chunks and uploads them; they are durable after Flush.
+func (h *File) WriteAt(ctx context.Context, p []byte, off int64) (int, error) {
 	if off < 0 {
-		return 0, fmt.Errorf("vfs.File.WriteAt: negative offset %d", off)
+		return 0, fmt.Errorf("%w: negative offset %d", fs.ErrInvalid, off)
 	}
 	if len(p) == 0 {
 		return 0, nil
 	}
-	stat, err := f.Stat()
-	if err != nil {
+	if uint64(off)+uint64(len(p)) > MaxSize {
+		return 0, fmt.Errorf("%w: a write to %d", ErrTooBig, uint64(off)+uint64(len(p)))
+	}
+	v := h.v
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if err := v.writable(); err != nil {
 		return 0, err
 	}
-
-	if f.dirty == nil {
-		f.dirty = map[int][]byte{}
+	if h.f.gone {
+		return 0, fs.ErrNotExist
 	}
-
-	written := 0
-	cur := uint64(off)
-	end := cur + uint64(len(p))
-	for cur < end {
-		blockIdx := int(cur / BlockSize)
-		blockOff := int(cur % BlockSize)
-		var existing []byte
-		// Existing block content for read-modify-write (if any)
-		if buf, ok := f.dirty[blockIdx]; ok {
-			existing = append([]byte(nil), buf...)
-		} else if blockIdx < len(stat.Blocks) {
-			b, err := f.readBlock(blockIdx, stat)
-			if err != nil {
-				return written, err
-			}
-			existing = append([]byte(nil), b...)
-		} else {
-			existing = make([]byte, BlockSize)
-		}
-
-		copyLen := BlockSize - blockOff
-		remaining := len(p) - written
-		if copyLen > remaining {
-			copyLen = remaining
-		}
-		copy(existing[blockOff:blockOff+copyLen], p[written:written+copyLen])
-		f.dirty[blockIdx] = existing
-		written += copyLen
-		cur += uint64(copyLen)
-	}
-
-	// Extend size if we wrote past the old end. Inode update is staged
-	// here in memory; the canonical Size + Blocks land at Sync().
-	f.fs.mu.Lock()
-	in := f.fs.inodeByID(f.inodeID)
-	if end > in.Size {
-		in.Size = end
-	}
-	in.Mtime = time.Now()
-	f.fs.dirty = true
-	f.fs.mu.Unlock()
-
-	return written, nil
+	f := h.f
+	v.write(f, p, uint64(off))
+	f.size = max(f.size, uint64(off)+uint64(len(p)))
+	f.mtime, f.changed = time.Now(), true
+	return len(p), v.relieve(ctx)
 }
 
-// Truncate sets the file size, dropping any blocks past the new end.
-// Extending past the current size zero-pads (creates dirty zero blocks
-// up to the new end).
-func (f *File) Truncate(size uint64) error {
-	stat, err := f.Stat()
+// write adds p at off to the file's unsettled writes, merging with the writes it
+// touches so the list stays sorted, disjoint and gap-separated.
+func (v *Volume) write(f *fileState, p []byte, off uint64) {
+	end := off + uint64(len(p))
+	d := f.dirty
+	i := sort.Search(len(d), func(i int) bool { return d[i].end() >= off })
+	j := i
+	for j < len(d) && d[j].off <= end {
+		j++
+	}
+	var merged span
+	switch {
+	case i == j:
+		merged = span{off, append([]byte(nil), p...)}
+	case j == i+1 && off >= d[i].off && end <= d[i].end():
+		copy(d[i].data[off-d[i].off:], p) // inside one write: overwrite in place
+		return
+	case j == i+1 && off == d[i].end():
+		merged = span{d[i].off, append(d[i].data, p...)} // append, amortized
+	default:
+		lo, hi := min(off, d[i].off), max(end, d[j-1].end())
+		buf := make([]byte, hi-lo)
+		for _, s := range d[i:j] {
+			copy(buf[s.off-lo:], s.data)
+		}
+		copy(buf[off-lo:], p)
+		merged = span{lo, buf}
+	}
+	grown := int64(len(merged.data)) + spanCost
+	for _, s := range d[i:j] {
+		grown -= int64(len(s.data)) + spanCost
+	}
+	f.dirty = slices.Replace(d, i, j, merged)
+	f.dirtyN += grown
+	v.dirty += grown
+}
+
+// Truncate sets the file's length. Shrinking discards the bytes past it for
+// good; growing adds zeros.
+func (h *File) Truncate(ctx context.Context, size uint64) error {
+	if size > MaxSize {
+		return fmt.Errorf("%w: %d bytes", ErrTooBig, size)
+	}
+	h.v.mu.Lock()
+	defer h.v.mu.Unlock()
+	if err := h.v.writable(); err != nil {
+		return err
+	}
+	if h.f.gone {
+		return fs.ErrNotExist
+	}
+	h.v.truncate(h.f, size)
+	return h.v.relieve(ctx)
+}
+
+// Truncate sets the length of the file with inode ino, as File.Truncate does.
+func (v *Volume) Truncate(ctx context.Context, ino InodeID, size uint64) error {
+	if size > MaxSize {
+		return fmt.Errorf("%w: %d bytes", ErrTooBig, size)
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if err := v.writable(); err != nil {
+		return err
+	}
+	f, err := v.state(ctx, ino)
 	if err != nil {
 		return err
 	}
-	if size == stat.Size {
-		return nil
-	}
-	if f.dirty == nil {
-		f.dirty = map[int][]byte{}
-	}
+	v.truncate(f, size)
+	return v.relieve(ctx)
+}
 
-	if size < stat.Size {
-		// Shrink: drop dirty blocks past size, no read needed for backend.
-		newBlockCount := int((size + BlockSize - 1) / BlockSize)
-		for idx := range f.dirty {
-			if idx >= newBlockCount {
-				delete(f.dirty, idx)
+func (v *Volume) truncate(f *fileState, size uint64) {
+	if size < f.size {
+		f.limit = min(f.limit, size)
+		var kept []span
+		var n int64
+		for _, s := range f.dirty {
+			if s.off >= size {
+				break
 			}
+			if s.end() > size {
+				s.data = s.data[:size-s.off]
+			}
+			kept = append(kept, s)
+			n += int64(len(s.data)) + spanCost
 		}
-	} else {
-		// Grow: load (or zero-init) the last block, zero-pad in place.
-		// Subsequent blocks remain implicitly zero — they materialise
-		// on first read as a zero block.
-		oldEnd := stat.Size
-		newEnd := size
-		if oldEnd%BlockSize != 0 || oldEnd == 0 {
-			lastIdx := int(oldEnd / BlockSize)
-			var buf []byte
-			if cached, ok := f.dirty[lastIdx]; ok {
-				buf = append([]byte(nil), cached...)
-			} else if lastIdx < len(stat.Blocks) {
-				existing, err := f.readBlock(lastIdx, stat)
-				if err != nil {
-					return err
-				}
-				buf = append([]byte(nil), existing...)
-			} else {
-				buf = make([]byte, BlockSize)
-			}
-			startZero := int(oldEnd % BlockSize)
-			zeroEnd := BlockSize
-			if newEnd-uint64(lastIdx*BlockSize) < uint64(BlockSize) {
-				zeroEnd = int(newEnd - uint64(lastIdx*BlockSize))
-			}
-			for i := startZero; i < zeroEnd; i++ {
-				buf[i] = 0
-			}
-			f.dirty[lastIdx] = buf
-		}
+		v.dirty += n - f.dirtyN
+		f.dirty, f.dirtyN = kept, n
 	}
+	f.size, f.mtime, f.changed = size, time.Now(), true
+}
 
-	f.fs.mu.Lock()
-	in := f.fs.inodeByID(f.inodeID)
-	in.Size = size
-	in.Mtime = time.Now()
-	f.fs.dirty = true
-	f.fs.mu.Unlock()
+// Close releases the handle. It does not Flush.
+func (h *File) Close() error {
+	h.v.mu.Lock()
+	defer h.v.mu.Unlock()
+	h.f.refs--
+	if h.f.refs == 0 && !h.f.changed {
+		delete(h.v.files, h.f.ino)
+	}
 	return nil
 }
 
-// Sync flushes all dirty blocks to the backend, updates the inode's
-// block list, and persists the FS metadata tree. After a successful
-// Sync the file's bytes are durable.
-func (f *File) Sync() error {
-	stat, err := f.Stat()
-	if err != nil {
-		return err
-	}
-
-	// Re-encrypt + upload each dirty block.
-	newBlocks := make(map[int]BlockID, len(f.dirty))
-	for idx, buf := range f.dirty {
-		id, err := f.fs.v.PutBlock(f.ctx, buf)
-		if err != nil {
-			return fmt.Errorf("vfs.File.Sync: PutBlock idx=%d: %w", idx, err)
+// sweep settles every changed file, then forgets files nobody holds.
+func (v *Volume) sweep(ctx context.Context) error {
+	for ino, f := range v.files {
+		if f.changed {
+			if err := v.settle(ctx, f); err != nil {
+				return err
+			}
 		}
-		newBlocks[idx] = id
-	}
-
-	// Splice new blocks into the inode's block list.
-	f.fs.mu.Lock()
-	in := f.fs.inodeByID(f.inodeID)
-	totalBlocks := int((stat.Size + BlockSize - 1) / BlockSize)
-	if len(in.Blocks) < totalBlocks {
-		// Extend
-		grown := make([]BlockID, totalBlocks)
-		copy(grown, in.Blocks)
-		in.Blocks = grown
-	} else if len(in.Blocks) > totalBlocks {
-		in.Blocks = in.Blocks[:totalBlocks]
-	}
-	for idx, id := range newBlocks {
-		if idx < len(in.Blocks) {
-			in.Blocks[idx] = id
+		if f.refs == 0 {
+			delete(v.files, ino)
 		}
 	}
-	f.fs.dirty = true
-	f.fs.mu.Unlock()
-
-	// Clear local dirty cache once committed.
-	f.dirty = nil
-
-	// Persist the metadata tree.
-	return f.fs.Sync(f.ctx)
+	return nil
 }
 
-// Close flushes pending writes and releases the handle. Mirrors
-// os.File.Close — must be called even on read-only handles to allow
-// the FS to release any resources.
-func (f *File) Close() error {
-	if len(f.dirty) > 0 {
-		if err := f.Sync(); err != nil {
+// touched reports whether an unsettled write overlaps [a, b).
+func (f *fileState) touched(a, b uint64) bool {
+	i := sort.Search(len(f.dirty), func(i int) bool { return f.dirty[i].end() > a })
+	return i < len(f.dirty) && f.dirty[i].off < b
+}
+
+// settle turns the file's unsettled writes into settled content: it re-cuts the
+// file into chunks, uploads the new ones, and records the file's new shape as
+// pending metadata. If it fails nothing about the file has changed, and the
+// writes are still held.
+//
+// Only the part of the file the writes touch is re-cut. Cutting is local (a cut
+// depends on the bytes since the previous cut), so a settled chunk that is
+// unchanged and begins where the new cutting stands is exactly a chunk the new
+// cutting would produce again: it is kept, and cutting resumes after it. The
+// result is the chunk list a cut of the whole file would give, found by reading
+// and sealing only the chunks around the edit.
+func (v *Volume) settle(ctx context.Context, f *fileState) error {
+	var inline []byte
+	var out []extent
+
+	if f.size <= small {
+		inline = make([]byte, f.size)
+		if _, err := v.read(ctx, f, inline, 0); err != nil && err != io.EOF {
+			return err
+		}
+	} else {
+		var err error
+		if out, err = v.recut(ctx, f); err != nil {
 			return err
 		}
 	}
-	f.dirty = nil
+
+	in, err := v.stat(ctx, f.ino)
+	if err != nil {
+		return err
+	}
+
+	// Diff against the settled records and queue only what differs.
+	if f.size <= small {
+		if f.size > 0 {
+			v.over.put(keyInline(f.ino), inline)
+		} else {
+			v.over.del(keyInline(f.ino))
+		}
+		for _, e := range f.ext {
+			v.over.del(keyExtent(f.ino, e.off))
+		}
+	} else {
+		v.over.del(keyInline(f.ino))
+		old := make(map[uint64]extent, len(f.ext))
+		for _, e := range f.ext {
+			old[e.off] = e
+		}
+		for _, e := range out {
+			if o, ok := old[e.off]; !ok || o != e {
+				v.over.put(keyExtent(f.ino, e.off), encodeExtent(e))
+			}
+			delete(old, e.off)
+		}
+		for off := range old {
+			v.over.del(keyExtent(f.ino, off))
+		}
+	}
+	in.Size, in.Mtime, in.Ctime = f.size, f.mtime, f.mtime
+	v.over.put(keyInode(f.ino), encodeInode(in))
+
+	f.inline, f.ext, f.base, f.limit = inline, out, f.size, f.size
+	v.dirty -= f.dirtyN
+	f.dirty, f.dirtyN, f.changed = nil, 0, false
+	if f.size <= small {
+		f.ext = nil
+	} else {
+		f.inline = nil
+	}
 	return nil
 }
 
-// readBlock returns the plaintext bytes for the given block index.
-// Blocks past the inode's block list (but inside the file size, e.g.
-// after a Truncate-grow that hasn't been Synced) read as zero.
-func (f *File) readBlock(idx int, stat *Inode) ([]byte, error) {
-	if buf, ok := f.dirty[idx]; ok {
-		return buf, nil
-	}
-	if idx >= len(stat.Blocks) {
-		return make([]byte, BlockSize), nil
-	}
-	id := stat.Blocks[idx]
-	if id == "" {
-		return make([]byte, BlockSize), nil
-	}
-	b, err := f.fs.v.GetBlock(f.ctx, id)
-	if err != nil {
-		if errors.Is(err, backend.ErrNotFound) {
-			return nil, fmt.Errorf("vfs.File.readBlock: dangling block %s at idx %d", id, idx)
+// run is a stretch of a file that holds written bytes: [a, b).
+type run struct{ a, b uint64 }
+
+// runs returns, in order, the stretches of the file that hold written bytes now:
+// the settled chunks and inline bytes that still count, and the unsettled writes.
+// Everything between them is a hole.
+func (f *fileState) runs() []run {
+	var rs []run
+	lim := min(f.size, f.limit)
+	add := func(a, b uint64) {
+		if b = min(b, f.size); a < b {
+			rs = append(rs, run{a, b})
 		}
-		return nil, err
 	}
-	return b, nil
+	for _, e := range f.ext {
+		if e.off >= lim {
+			break
+		}
+		add(e.off, min(e.end(), lim))
+	}
+	if f.ext == nil {
+		add(0, min(uint64(len(f.inline)), lim))
+	}
+	for _, s := range f.dirty {
+		add(s.off, s.end())
+	}
+	slices.SortFunc(rs, func(x, y run) int { return cmp.Compare(x.a, y.a) })
+	merged := rs[:0]
+	for _, r := range rs {
+		if n := len(merged); n > 0 && r.a <= merged[n-1].b {
+			merged[n-1].b = max(merged[n-1].b, r.b)
+		} else {
+			merged = append(merged, r)
+		}
+	}
+	return merged
 }
 
-// Compile-time interface checks.
-var (
-	_ io.ReaderAt = (*File)(nil)
-	_ io.WriterAt = (*File)(nil)
-)
+// recut returns the chunk list of the file's content now, uploading new chunks.
+// It cuts each run of written bytes on its own, from the run's first byte, so
+// chunks never span a hole and a hole costs nothing however long it is.
+func (v *Volume) recut(ctx context.Context, f *fileState) ([]extent, error) {
+	runs := f.runs()
+	var widest uint64
+	for _, r := range runs {
+		widest = max(widest, r.b-r.a)
+	}
+	window := make([]byte, min(widest, maxChunk))
+	old := f.ext
+	var out []extent
+	for _, r := range runs {
+		// A settled chunk is kept if its bytes are unchanged and the cut that ended
+		// it would still end it. A content cut does not depend on what follows. A
+		// chunk that ended a run was cut by the run's end, so it is kept only if the
+		// run still ends there.
+		clean := func() bool {
+			e := old[0]
+			if e.end() > min(f.size, f.limit) || f.touched(e.off, e.end()) {
+				return false
+			}
+			endsRun := len(old) == 1 || old[1].off != e.end()
+			return !endsRun || e.end() == r.b
+		}
+		for pos := r.a; pos < r.b; {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			for len(old) > 0 && old[0].off < pos {
+				old = old[1:]
+			}
+			if len(old) > 0 && old[0].off == pos && clean() {
+				out = append(out, old[0])
+				pos = old[0].end()
+				old = old[1:]
+				continue
+			}
+			w := window[:min(uint64(len(window)), r.b-pos)]
+			if _, err := v.read(ctx, f, w, pos); err != nil && err != io.EOF {
+				return nil, err
+			}
+			piece := w[:cut(v.gear, w)]
+			id, err := v.putChunk(ctx, piece)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, extent{off: pos, n: uint32(len(piece)), id: id})
+			pos += uint64(len(piece))
+		}
+	}
+	return out, nil
+}

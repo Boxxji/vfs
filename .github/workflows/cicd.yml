@@ -1,7 +1,8 @@
-# Canonical caller — every knob lives in /hanzo.yml, none here.
-# Runs on the git-runner fleet at git.hanzo.ai, the only pool serving these
-# labels. github.com resolves only .github/workflows and has no runner for
-# them, so a caller placed there is a gate that cannot be scheduled.
+# Canonical caller: hanzo.yml is the one list of gates, and the matrix below runs
+# each as a job of its own (`gates:`), so they run in parallel and none runs five
+# minutes. The last entry takes every gate the others do not name (`!`), so a gate
+# added to hanzo.yml is run by default. (Seven separate calls of the reusable
+# workflow in one file are refused at startup; a matrix of calls is not.)
 name: CI/CD
 on:
   push:
@@ -10,8 +11,36 @@ on:
   pull_request:
   workflow_dispatch:
 jobs:
-  cicd:
-    uses: hanzoai/ci/.github/workflows/build.yml@v1
+  gate:
+    strategy:
+      fail-fast: false
+      max-parallel: 3 # the gates share the machine: more at once only makes each slower
+      matrix:
+        gates:
+          - 'realserver'
+          - 'realserver-cas'
+          - 'realserver-cas-large'
+          - 'realserver-kill'
+          - 'check'
+          - 'unit'
+          - 'race'
+          - 'model'
+          - 'sparse'
+          - 'sparse-tiny'
+          - 'sqlite'
+          - 'scale-a'
+          - 'scale-b'
+          - 'scale-c'
+          - 'fuzz-head'
+          - '!realserver,realserver-cas,realserver-cas-large,realserver-kill,check,unit,race,model,sparse,sparse-tiny,sqlite,scale-a,scale-b,scale-c,fuzz-head'
+    # The reusable workflow runs with write permissions and a token, so it is named by the
+    # commit that the tag v2 pointed to when this was written, not by the tag, which moves.
+    uses: hanzoai/ci/.github/workflows/build.yml@de2a627ecac0c014a97bf61e37dce86de4f259fd
+    with:
+      gates: ${{ matrix.gates }}
+      # A pull request only reads the Go cache store and finds it empty until a push
+      # to main has filled it, and starting it costs a minute and a half of every job.
+      go-cache: ${{ github.event_name == 'pull_request' && 'false' || 'true' }}
     permissions:
       contents: write
       packages: write

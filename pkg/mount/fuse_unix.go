@@ -1,27 +1,31 @@
 //go:build fuse && linux
 
-// NOTE: bazil.org/fuse dropped macOS support (commit 65cc252+). On
-// macOS use the default no-fuse build for in-process testing, or
-// switch to github.com/jacobsa/fuse if you need a real FUSE mount
-// (a 0.3.1 follow-up adds a parallel mount_darwin.go using jacobsa).
+// NOTE: bazil.org/fuse dropped macOS support (commit 65cc252+); macOS uses
+// jacobsa/fuse in fuse_darwin.go.
 
-// Package mount wires the in-process *vfs.FS and *vfs.File to the
-// kernel via bazil.org/fuse so any POSIX consumer (SQLite, Postgres,
-// Redis, ripgrep, anything) can read/write the encrypted block VFS as
-// if it were a normal mounted filesystem.
+// Package mount serves a *vfs.Volume to the kernel over FUSE, so any POSIX
+// program (SQLite, Postgres, ripgrep) reads and writes the sealed Volume as a
+// mounted directory.
 //
-// Build-tag gated: `go build -tags fuse ./...`. Default builds stay
-// dependency-light (no FUSE link).
+// A mounted Volume is durable at Flush, which the kernel asks for on every close
+// of a file descriptor, and at Fsync; both return only after the Volume's Head
+// has advanced in the store, so each costs a commit. There is no node-local
+// journal yet to make Fsync cheaper. When the mount ends the Volume is flushed
+// once more.
+//
+// Build-tag gated: `go build -tags fuse ./...`.
 package mount
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
+	"os/exec"
 	"syscall"
-	"time"
 
 	"bazil.org/fuse"
 	bzfs "bazil.org/fuse/fs"
@@ -29,23 +33,17 @@ import (
 	"github.com/hanzoai/vfs"
 )
 
-// Mount mounts the given *vfs.FS at mountpoint and serves until the
-// context is cancelled or the kernel unmounts the filesystem.
-//
-// The caller is responsible for unmount-on-shutdown — typically:
-//
-//	go func() { <-ctx.Done(); _ = fuse.Unmount(mountpoint) }()
-//
-// On clean exit Mount returns nil; on kernel-side error it returns
-// the underlying fuse error.
-func Mount(ctx context.Context, fs *vfs.FS, mountpoint string) error {
-	if fs == nil {
-		return errors.New("mount: vfs.FS required")
+// Mount mounts vol at mountpoint and serves until ctx is cancelled or the kernel
+// unmounts it, then flushes the Volume. The caller owns vol and closes it. When ctx is
+// cancelled the mount commits, is unmounted, and if something holds it open is detached
+// after a few seconds, so that Mount returns within a bounded time (stop.go).
+func Mount(ctx context.Context, vol *vfs.Volume, mountpoint string) error {
+	if vol == nil {
+		return errors.New("mount: Volume required")
 	}
 	if mountpoint == "" {
 		return errors.New("mount: mountpoint required")
 	}
-
 	conn, err := fuse.Mount(mountpoint,
 		fuse.FSName("vfs"),
 		fuse.Subtype("hanzovfs"),
@@ -54,62 +52,68 @@ func Mount(ctx context.Context, fs *vfs.FS, mountpoint string) error {
 	if err != nil {
 		return fmt.Errorf("fuse.Mount %q: %w", mountpoint, err)
 	}
-	defer conn.Close()
 
-	// Ensure unmount on context cancel.
-	go func() {
-		<-ctx.Done()
-		_ = fuse.Unmount(mountpoint)
-	}()
+	// The mount's own context is not ctx: a read of a file still held open runs on it, and
+	// must go on while the end of the mount waits for its holders.
+	base, end := context.WithCancel(context.WithoutCancel(ctx))
+	defer end()
+	sess := newSession(base, vol)
+	served := make(chan error, 1)
+	go func() { served <- bzfs.New(conn, nil).Serve(&root{s: sess}) }()
+	var serveErr error
+	select {
+	case serveErr = <-served:
+		_ = conn.Close()
+	case <-ctx.Done():
+		var ended bool
+		serveErr, ended = sess.group.stop(mountpoint, fuse.Unmount, detach, served)
+		// A holder that outlived the grace keeps Serve reading, and closing the connection
+		// waits for that read: it is left to end with the process.
+		if ended {
+			_ = conn.Close()
+		}
+	}
+	if serveErr != nil {
+		serveErr = fmt.Errorf("fuse.Serve: %w", serveErr)
+	}
+	return finish(vol, serveErr)
+}
 
-	srv := bzfs.New(conn, nil)
-	if err := srv.Serve(&fsRoot{fs: fs, ctx: ctx}); err != nil {
-		return fmt.Errorf("fuse.Serve: %w", err)
+// detach takes the mount off the directory now and lets what holds it finish: fusermount
+// -u -z. Nothing new can reach it, and the kernel drops the connection when the last
+// holder lets go.
+func detach(mountpoint string) error {
+	if out, err := exec.Command("fusermount3", "-u", "-z", mountpoint).CombinedOutput(); err != nil {
+		return fmt.Errorf("%w: %s", err, bytes.TrimSpace(out))
 	}
 	return nil
 }
 
-// MountWithVFSAdapter is the alias used by the CLI when it constructs
-// a *vfs.VFS first and only wraps it as a *vfs.FS at mount time.
+// root is the file system.
+type root struct{ s *session }
+
+var _ bzfs.FS = (*root)(nil)
+
+func (r *root) Root() (bzfs.Node, error) {
+	return r.s.node(vfs.RootInode, vfs.RootInode), nil
+}
+
+// node is a file or directory, named by its inode.
 //
-// It exists so the public Mount(*vfs.FS, mp) signature stays canonical
-// while the cmd path can pass the cheaper *vfs.VFS form.
-func MountWithVFSAdapter(ctx context.Context, v *vfs.VFS, mountpoint string) error {
-	fs, err := vfs.NewFS(ctx, v)
-	if err != nil {
-		return fmt.Errorf("mount: NewFS: %w", err)
-	}
-	return Mount(ctx, fs, mountpoint)
-}
-
-// ============================================================================
-// fs.FS — root + node lookup
-// ============================================================================
-
-type fsRoot struct {
-	fs  *vfs.FS
-	ctx context.Context
-}
-
-var _ bzfs.FS = (*fsRoot)(nil)
-
-func (r *fsRoot) Root() (bzfs.Node, error) {
-	in, err := r.fs.Lookup("/")
-	if err != nil {
-		return nil, err
-	}
-	return &node{root: r, inode: in, path: "/"}, nil
-}
-
-// ============================================================================
-// fs.Node — dir + file
-// ============================================================================
-
+// A node is built only by session.node, so it always carries the session: the
+// Volume, the mount's context and the committer. A struct literal would leave the
+// context nil, and a store client that uses its context would panic on the first read.
 type node struct {
-	root  *fsRoot
-	inode *vfs.Inode
-	path  string
+	s      *session
+	ino    vfs.InodeID
+	parent vfs.InodeID // for ".."; every inode has one name, so one parent
 }
+
+// node returns the node of an inode of this mount.
+func (s *session) node(ino, parent vfs.InodeID) *node { return &node{s: s, ino: ino, parent: parent} }
+
+// handle returns the handle of a file opened on this mount.
+func (s *session) handle(f *vfs.File) *handle { return &handle{s: s, file: f} }
 
 var (
 	_ bzfs.Node               = (*node)(nil)
@@ -120,176 +124,189 @@ var (
 	_ bzfs.NodeRemover        = (*node)(nil)
 	_ bzfs.NodeSetattrer      = (*node)(nil)
 	_ bzfs.NodeFsyncer        = (*node)(nil)
+	_ bzfs.NodeOpener         = (*node)(nil)
+	_ bzfs.NodeRenamer        = (*node)(nil)
+	_ bzfs.NodeLinker         = (*node)(nil)
+	_ bzfs.NodeSymlinker      = (*node)(nil)
 )
 
-func (n *node) Attr(_ context.Context, a *fuse.Attr) error {
-	// Re-fetch in case another writer mutated the inode.
-	fresh, err := n.root.fs.Lookup(n.path)
-	if err != nil {
-		return err
-	}
-	n.inode = fresh
-	a.Inode = uint64(fresh.ID)
-	a.Mode = os.FileMode(fresh.Mode)
-	a.Size = fresh.Size
-	a.Blocks = (fresh.Size + 511) / 512
-	a.Mtime = fresh.Mtime
-	a.Atime = fresh.Atime
-	a.Ctime = fresh.Ctime
+func attr(a *fuse.Attr, in vfs.Inode) {
+	a.Inode = uint64(in.ID)
+	a.Mode = os.FileMode(in.Mode)
+	a.Size = in.Size
+	a.Blocks = (in.Size + 511) / 512
+	a.Mtime, a.Atime, a.Ctime = in.Mtime, in.Atime, in.Ctime
 	a.Nlink = 1
-	a.Uid = uint32(os.Getuid())
-	a.Gid = uint32(os.Getgid())
-	a.BlockSize = vfs.BlockSize
+	a.Uid, a.Gid = uint32(os.Getuid()), uint32(os.Getgid())
+	a.BlockSize = blockSize
+}
+
+func (n *node) Attr(ctx context.Context, a *fuse.Attr) error {
+	ctx, done := patient(ctx)
+	defer done()
+	in, err := n.s.vol.Stat(ctx, n.ino)
+	if err != nil {
+		return errno(err)
+	}
+	attr(a, in)
 	return nil
 }
 
-func (n *node) Lookup(_ context.Context, name string) (bzfs.Node, error) {
-	child := joinPath(n.path, name)
-	in, err := n.root.fs.Lookup(child)
+func (n *node) Lookup(ctx context.Context, name string) (bzfs.Node, error) {
+	ctx, done := patient(ctx)
+	defer done()
+	in, err := n.s.vol.Lookup(ctx, n.ino, name)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, syscall.ENOENT
-		}
-		return nil, err
+		return nil, errno(err)
 	}
-	return &node{root: n.root, inode: in, path: child}, nil
+	return n.s.node(in.ID, n.ino), nil
 }
 
-func (n *node) ReadDirAll(_ context.Context) ([]fuse.Dirent, error) {
-	if !n.inode.IsDir() {
-		return nil, syscall.ENOTDIR
-	}
-	children, err := n.root.fs.ReadDir(n.path)
+func (n *node) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
+	ctx, done := patient(ctx)
+	defer done()
+	ents, err := n.s.vol.ReadDir(ctx, n.ino)
 	if err != nil {
-		return nil, err
+		return nil, errno(err)
 	}
-	out := make([]fuse.Dirent, 0, len(children))
-	for _, c := range children {
+	// A listing starts with "." and "..": POSIX requires them, and the kernel does
+	// not make them up for a file system.
+	out := make([]fuse.Dirent, 0, len(ents)+2)
+	out = append(out,
+		fuse.Dirent{Inode: uint64(n.ino), Name: ".", Type: fuse.DT_Dir},
+		fuse.Dirent{Inode: uint64(n.parent), Name: "..", Type: fuse.DT_Dir})
+	for _, e := range ents {
 		typ := fuse.DT_File
-		if c.IsDir() {
+		if e.Mode.IsDir() {
 			typ = fuse.DT_Dir
 		}
-		out = append(out, fuse.Dirent{
-			Inode: uint64(c.ID),
-			Name:  c.Name,
-			Type:  typ,
-		})
+		out = append(out, fuse.Dirent{Inode: uint64(e.ID), Name: e.Name, Type: typ})
 	}
 	return out, nil
 }
 
-func (n *node) Mkdir(_ context.Context, req *fuse.MkdirRequest) (bzfs.Node, error) {
-	child := joinPath(n.path, req.Name)
-	in, err := n.root.fs.Mkdir(child, uint32(req.Mode.Perm()))
+func (n *node) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (bzfs.Node, error) {
+	ctx = context.WithoutCancel(ctx) // no request is answered EINTR: see errno.go
+	in, err := n.s.vol.Mkdir(ctx, n.ino, req.Name, req.Mode.Perm())
 	if err != nil {
-		return nil, err
+		return nil, errno(err)
 	}
-	return &node{root: n.root, inode: in, path: child}, nil
+	return n.s.node(in.ID, n.ino), nil
 }
 
 func (n *node) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.CreateResponse) (bzfs.Node, bzfs.Handle, error) {
-	child := joinPath(n.path, req.Name)
-	in, err := n.root.fs.Create(child, uint32(req.Mode.Perm()))
-	if err != nil {
-		return nil, nil, err
-	}
-	cn := &node{root: n.root, inode: in, path: child}
-	f, err := n.root.fs.Open(ctx, child)
-	if err != nil {
-		return nil, nil, err
-	}
-	resp.Attr.Inode = uint64(in.ID)
-	resp.Attr.Mode = os.FileMode(in.Mode)
-	resp.Attr.Size = in.Size
-	resp.Attr.Mtime = in.Mtime
-	resp.Attr.Atime = in.Atime
-	resp.Attr.Ctime = in.Ctime
-	resp.Attr.Nlink = 1
-	resp.Attr.Uid = uint32(os.Getuid())
-	resp.Attr.Gid = uint32(os.Getgid())
-	resp.Attr.BlockSize = vfs.BlockSize
-	return cn, &handle{node: cn, file: f}, nil
-}
-
-func (n *node) Remove(_ context.Context, req *fuse.RemoveRequest) error {
-	child := joinPath(n.path, req.Name)
-	if err := n.root.fs.Remove(child); err != nil {
-		return err
-	}
-	return nil
-}
-
-func (n *node) Setattr(_ context.Context, req *fuse.SetattrRequest, resp *fuse.SetattrResponse) error {
-	if req.Valid.Size() {
-		f, err := n.root.fs.Open(n.root.ctx, n.path)
+	ctx = context.WithoutCancel(ctx) // no request is answered EINTR: see errno.go
+	// A name that another caller removes while this one is looked up or opened is
+	// created again; a name that is removed every time is not an error of this call.
+	for range 8 {
+		in, f, err := n.create(ctx, req)
+		if errors.Is(err, errRemoved) {
+			continue
+		}
 		if err != nil {
-			return err
+			return nil, nil, errno(err)
 		}
-		defer f.Close()
-		if err := f.Truncate(req.Size); err != nil {
-			return err
+		attr(&resp.Attr, in)
+		return n.s.node(in.ID, n.ino), n.s.handle(f), nil
+	}
+	return nil, nil, syscall.EAGAIN
+}
+
+// errRemoved says that the name was removed between two steps of a creation.
+var errRemoved = errors.New("mount: the name was removed while it was being created")
+
+// create makes the file, or opens the one that exists: open(O_CREAT) of a file that
+// exists opens it, and only O_EXCL makes that an error. A kernel that does not look the
+// name up first, or one whose lookup was interrupted and not repeated, asks for the
+// creation anyway.
+func (n *node) create(ctx context.Context, req *fuse.CreateRequest) (vfs.Inode, *vfs.File, error) {
+	in, err := n.s.vol.Create(ctx, n.ino, req.Name, req.Mode.Perm())
+	if errors.Is(err, fs.ErrExist) && req.Flags&fuse.OpenFlags(os.O_EXCL) == 0 {
+		if in, err = n.s.vol.Lookup(ctx, n.ino, req.Name); errors.Is(err, fs.ErrNotExist) {
+			return in, nil, errRemoved
 		}
-		if err := f.Sync(); err != nil {
-			return err
+		switch {
+		case err != nil:
+		case in.IsDir():
+			err = vfs.ErrIsDir
+		case req.Flags&fuse.OpenFlags(os.O_TRUNC) != 0:
+			err = n.s.vol.Truncate(ctx, in.ID, 0)
 		}
 	}
-	// Refresh attr for response.
-	fresh, err := n.root.fs.Lookup(n.path)
 	if err != nil {
-		return err
+		return in, nil, err
 	}
-	n.inode = fresh
-	resp.Attr.Inode = uint64(fresh.ID)
-	resp.Attr.Mode = os.FileMode(fresh.Mode)
-	resp.Attr.Size = fresh.Size
-	resp.Attr.Mtime = fresh.Mtime
-	resp.Attr.Atime = fresh.Atime
-	resp.Attr.Ctime = fresh.Ctime
-	resp.Attr.Nlink = 1
-	resp.Attr.Uid = uint32(os.Getuid())
-	resp.Attr.Gid = uint32(os.Getgid())
-	resp.Attr.BlockSize = vfs.BlockSize
+	f, err := n.s.vol.Open(ctx, in.ID)
+	if errors.Is(err, fs.ErrNotExist) {
+		return in, nil, errRemoved
+	}
+	return in, f, err
+}
+
+func (n *node) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
+	ctx = context.WithoutCancel(ctx) // no request is answered EINTR: see errno.go
+	return errno(n.s.vol.Remove(ctx, n.ino, req.Name))
+}
+
+// Rename, Link and Symlink are not built: they answer "not supported".
+func (n *node) Rename(context.Context, *fuse.RenameRequest, bzfs.Node) error { return unsupported }
+
+func (n *node) Link(context.Context, *fuse.LinkRequest, bzfs.Node) (bzfs.Node, error) {
+	return nil, unsupported
+}
+
+func (n *node) Symlink(context.Context, *fuse.SymlinkRequest) (bzfs.Node, error) {
+	return nil, unsupported
+}
+
+func (n *node) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse.SetattrResponse) error {
+	ctx = context.WithoutCancel(ctx) // no request is answered EINTR: see errno.go
+	// Only the size can be set. chmod, chown and utimens would succeed here without
+	// changing anything, which tar, make and rsync would believe: they are refused.
+	if req.Valid.Mode() || req.Valid.Uid() || req.Valid.Gid() || req.Valid.Atime() || req.Valid.Mtime() {
+		return unsupported
+	}
+	if req.Valid.Size() {
+		if err := n.s.vol.Truncate(ctx, n.ino, req.Size); err != nil {
+			return errno(err)
+		}
+	}
+	in, err := n.s.vol.Stat(ctx, n.ino)
+	if err != nil {
+		return errno(err)
+	}
+	attr(&resp.Attr, in)
 	return nil
 }
 
 func (n *node) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenResponse) (bzfs.Handle, error) {
-	if n.inode.IsDir() {
-		return n, nil // fs.HandleReadDirAller
-	}
-	// O_TRUNC: caller wants size==0
-	if req.Flags&fuse.OpenFlags(os.O_TRUNC) != 0 {
-		f, err := n.root.fs.Open(ctx, n.path)
-		if err != nil {
-			return nil, err
-		}
-		if err := f.Truncate(0); err != nil {
-			_ = f.Close()
-			return nil, err
-		}
-		if err := f.Sync(); err != nil {
-			_ = f.Close()
-			return nil, err
-		}
-		return &handle{node: n, file: f}, nil
-	}
-	f, err := n.root.fs.Open(ctx, n.path)
+	ctx = context.WithoutCancel(ctx) // no request is answered EINTR: see errno.go
+	in, err := n.s.vol.Stat(ctx, n.ino)
 	if err != nil {
-		return nil, err
+		return nil, errno(err)
 	}
-	return &handle{node: n, file: f}, nil
+	if in.IsDir() {
+		return n, nil // served by ReadDirAll
+	}
+	if req.Flags&fuse.OpenFlags(os.O_TRUNC) != 0 {
+		if err := n.s.vol.Truncate(ctx, n.ino, 0); err != nil {
+			return nil, errno(err)
+		}
+	}
+	f, err := n.s.vol.Open(ctx, n.ino)
+	if err != nil {
+		return nil, errno(err)
+	}
+	return n.s.handle(f), nil
 }
 
-func (n *node) Fsync(_ context.Context, _ *fuse.FsyncRequest) error {
-	// Directory fsync: persist FS metadata.
-	return n.root.fs.Sync(n.root.ctx)
+func (n *node) Fsync(ctx context.Context, _ *fuse.FsyncRequest) error {
+	return errno(n.s.group.commit())
 }
 
-// ============================================================================
-// fs.Handle — open file
-// ============================================================================
-
+// handle is an open file.
 type handle struct {
-	node *node
+	s    *session
 	file *vfs.File
 }
 
@@ -301,43 +318,34 @@ var (
 	_ bzfs.HandleFlusher  = (*handle)(nil)
 )
 
-func (h *handle) Read(_ context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse) error {
+func (h *handle) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse) error {
+	// The work of a read is the mount's, not the request's (errno.go).
 	buf := make([]byte, req.Size)
-	n, err := h.file.ReadAt(buf, req.Offset)
+	n, err := h.file.ReadAt(h.s.base, buf, req.Offset)
 	if err != nil && !errors.Is(err, io.EOF) {
-		return err
+		return errno(err)
 	}
 	resp.Data = buf[:n]
 	return nil
 }
 
-func (h *handle) Write(_ context.Context, req *fuse.WriteRequest, resp *fuse.WriteResponse) error {
-	n, err := h.file.WriteAt(req.Data, req.Offset)
+func (h *handle) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.WriteResponse) error {
+	ctx = context.WithoutCancel(ctx) // no request is answered EINTR: see errno.go
+	n, err := h.file.WriteAt(ctx, req.Data, req.Offset)
 	if err != nil {
-		return err
+		return errno(err)
 	}
 	resp.Size = n
 	return nil
 }
 
-func (h *handle) Flush(_ context.Context, _ *fuse.FlushRequest) error {
-	return h.file.Sync()
+// Flush is a commit. close(2) is not restarted after EINTR (Linux has already dropped
+// the descriptor), so, like every request of this mount, it waits for the commit and
+// returns its result.
+func (h *handle) Flush(ctx context.Context, _ *fuse.FlushRequest) error {
+	return errno(h.s.group.commit())
 }
 
-func (h *handle) Release(_ context.Context, _ *fuse.ReleaseRequest) error {
-	return h.file.Close()
+func (h *handle) Release(context.Context, *fuse.ReleaseRequest) error {
+	return errno(h.file.Close())
 }
-
-// ============================================================================
-// helpers
-// ============================================================================
-
-func joinPath(parent, name string) string {
-	if parent == "/" {
-		return "/" + name
-	}
-	return parent + "/" + name
-}
-
-// keep imports referenced if a build mode strips one
-var _ = time.Now

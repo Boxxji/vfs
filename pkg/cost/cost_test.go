@@ -87,7 +87,7 @@ func TestBlockTimeSweep_PrintsCostCurve(t *testing.T) {
 	// Representative single-chain block size; chains with heavier
 	// activity should rerun with their own values.
 	const avgBlockBytes int64 = 20 * 1024 // 20 KB / block
-	const objectBytes int64 = 4 * 1024    // VFS 4 KiB blocks
+	const objectBytes int64 = 4 * 1024    // a small-object writer, one PUT per 4 KiB
 	const monthsRetention = 12.0
 	const readAmp = 2.0
 

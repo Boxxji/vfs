@@ -282,8 +282,8 @@ type Tiered struct {
 
 	// PutsPerByte / GetsPerByte map raw bytes to backend request
 	// counts. A pure-stream workload writing 64 KiB objects gives
-	// PutsPerByte = 1/65536. A 4 KiB-block content-addressed VFS
-	// gives PutsPerByte = 1/4096.
+	// PutsPerByte = 1/65536. A vfs Volume writes packs of about 16 MiB,
+	// which gives PutsPerByte = 1/16777216 plus its metadata shards.
 	PutsPerByte float64
 	GetsPerByte float64
 
@@ -421,8 +421,8 @@ func (c Cluster) Workload() Workload {
 //	monthsRetained:   how long blocks are held before deletion
 //	readAmplification: GET/PUT ratio at steady state
 //	objectBytes:      the granularity each block is split into when
-//	                  written to the archive (e.g. 4096 for VFS 4 KiB
-//	                  blocks; equal to avgBlockBytes for one-PUT-per-
+//	                  written to the archive (e.g. 16777216 for vfs
+//	                  packs; equal to avgBlockBytes for one-PUT-per-
 //	                  block writers)
 //
 // Returns a workload that callers can feed to EstimateFor /

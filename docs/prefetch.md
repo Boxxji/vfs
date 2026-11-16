@@ -960,22 +960,43 @@ never evicts a byte that has not been published.
 ### S6. Traces
 
 1. The engine SHOULD record the trace of an attachment and, at detach, store it
-   as one object of the volume's bucket, sealed with the volume's key, under the
-   attachment's workflow key. With no workflow key the engine MUST NOT prefetch
-   from a trace; read-ahead (S7) still applies.
-2. A trace MUST contain chunk identifiers in first-touch order, nothing else
-   that identifies content, and MUST be bounded: at most 1 048 576 entries,
-   the earliest kept.
+   as one extension object of the volume (docs/SPECIFICATION.md 3.1: `PutExt`,
+   extension `trace`), keyed by the attachment's workflow key. The object is at
+   `ext/trace/<64 hex digits of a hash keyed from the volume's seed>` (3.1 of the
+   specification: the same workflow key is another name in every volume, and the store
+   cannot confirm a guess at a key), and is sealed with the volume's key to the volume,
+   the extension and that name. With no workflow key the
+   engine MUST NOT prefetch from a trace; read-ahead (S7) still applies.
+2. A trace object is one version byte, `0x01`, and then chunk identifiers of 32
+   bytes each, in first-touch order, nothing else that identifies content. It
+   MUST be bounded: at most 1 000 000 entries, the earliest kept, so that the
+   object is 32 000 001 bytes at most and the extension object cap of 32 MiB
+   (specification 3.1) leaves room for a longer header in a later version. (1 048 576
+   entries of 32 bytes are exactly 32 MiB, which would leave no room for any
+   header.) A reader refuses a trace whose first byte it does not know, and the
+   attachment goes without a trace.
 3. A trace belongs to its volume. The engine MUST NOT use one volume's trace to
    fetch for another, except through a shared read-only base image the same
    party owns, whose chunks are the same for every volume built on it.
 4. Replacing a trace MUST be atomic: a reader sees the old trace or the new one.
 5. A new trace MUST replace the old one only if the run finished with a zero
    exit status reported by the attaching party, or the party asks for it.
+6. **Retention.** The engine never deletes a trace. A trace lives until the same
+   workflow key replaces it (4) or the volume is deleted, so a volume holds one
+   trace for each distinct workflow key that ever finished a run: a party that
+   wants the number bounded uses a key per image or per kind of job, not one per
+   run. A trace is a hint (specification 3.1, Fencing), so an operator can
+   delete the objects under `ext/trace/` at any time, by prefix, and the cost is
+   the prefetch of the next run of each key.
+7. **Cost of a read.** The name of the object needs the volume's seed, which the
+   Head holds, so the read of a trace is one `GET` after the Head has been read
+   and cannot be issued with it: an attachment that prefetches from a trace
+   waits one serial round trip to the store before its first prefetch request.
 
-*Acceptance.* A trace object, decrypted, parses as identifiers only; a volume
-opened with another volume's key cannot read it; killing the engine during the
-write leaves the previous trace intact.
+*Acceptance.* A trace object, decrypted, is the version byte and identifiers only,
+at most 32 000 001 bytes, and a trace of 1 000 001 identifiers is stored as its
+first 1 000 000; a volume opened with another volume's key cannot read it; killing
+the engine during the write leaves the previous trace intact.
 
 *Rationale.* The traces were recorded in a way that exposes paths; the engine
 does not need them, and keeping them out makes the trace safe to store beside
