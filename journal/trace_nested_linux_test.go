@@ -10,6 +10,7 @@ import (
 // ancestors it made are not synced. POSIX gives no durability for them; ext4
 // and xfs happen to commit them with the next fsync.
 func TestNestedDirectoryEntriesAreSynced(t *testing.T) {
+	t.Parallel()
 	base, err := filepath.EvalSymlinks(scratch(t))
 	if err != nil {
 		t.Fatal(err)

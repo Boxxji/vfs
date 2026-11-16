@@ -103,7 +103,8 @@ func tracedRun(t *testing.T, dir string, fail func(call) bool) (string, []call) 
 	inside := map[int]bool{}
 	current := map[int]*call{}
 	for len(live) > 0 {
-		tid, err := syscall.Wait4(-1, &ws, syscall.WALL, nil)
+		// Only the children of this thread: tests that trace run side by side.
+		tid, err := syscall.Wait4(-1, &ws, syscall.WALL|syscall.WNOTHREAD, nil)
 		if errors.Is(err, syscall.EINTR) {
 			continue
 		}
@@ -234,6 +235,7 @@ func dump(calls []call) string {
 // A failed fdatasync: Sync reports it, and the journal refuses every later
 // Append. The error is never retried and never swallowed.
 func TestFdatasyncFailurePoisonsTheJournal(t *testing.T) {
+	t.Parallel()
 	dir := journalDir(t)
 	out, calls := tracedRun(t, dir, func(c call) bool { return c.name == "fdatasync" && strings.HasSuffix(c.path, "000000.seg") })
 	if index(calls, 0, func(c call) bool { return c.inject }) < 0 {
@@ -251,6 +253,7 @@ func TestFdatasyncFailurePoisonsTheJournal(t *testing.T) {
 // place, then the directory is synced; and the Sync of a record is an fdatasync
 // of the segment.
 func TestCreateSyscallOrder(t *testing.T) {
+	t.Parallel()
 	dir := journalDir(t)
 	_, calls := tracedRun(t, dir, nil)
 	for _, seg := range []string{"000000.seg", "000001.seg"} {
@@ -274,6 +277,7 @@ func TestCreateSyscallOrder(t *testing.T) {
 // A removal is durable when it returns: the unlink is followed by an fsync of
 // the directory. (An interrupted Create, a zeroed file of the wrong size, is dropped by Open.)
 func TestRemoveSyncsTheDirectory(t *testing.T) {
+	t.Parallel()
 	dir := journalDir(t, func(dir string) {
 		if err := os.WriteFile(filepath.Join(dir, "000099.seg"), make([]byte, 10), 0o600); err != nil {
 			t.Fatal(err)
@@ -299,6 +303,7 @@ func TestRemoveSyncsTheDirectory(t *testing.T) {
 // Files makes the directory readable by its owner alone, makes its entry in the
 // parent durable, and takes the lock, before anything is written.
 func TestFilesPreparesTheDirectory(t *testing.T) {
+	t.Parallel()
 	dir := journalDir(t)
 	_, calls := tracedRun(t, dir, nil)
 	create := index(calls, 0, func(c call) bool { return c.name == "open" && strings.HasSuffix(c.path, ".seg.tmp") })

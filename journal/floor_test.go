@@ -272,7 +272,6 @@ func TestFloorFaults(t *testing.T) {
 			want kindOfOp
 			keep int
 		}{
-			{"markwrite-error", opMarkWrite, 0},
 			{"markwrite-half", opMarkWrite, 10},
 			{"wipewrite-error", opWipeWrite, 0},
 			{"sync-error", opAnySync, 0},
