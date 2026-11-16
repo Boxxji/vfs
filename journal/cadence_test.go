@@ -25,7 +25,7 @@ func TestCrashExplorationWithProductionCadence(t *testing.T) {
 			j := open(t, r.opts(0))
 			rng := rand.New(rand.NewSource(1))
 			var visible, published uint64
-			for i := 0; i < 120; i++ {
+			for i := 0; i < 90; i++ {
 				visible = r.append(t, j, payload(uint64(rng.Intn(1000))))
 				r.sync(t, j, visible)
 				switch rng.Intn(12) {

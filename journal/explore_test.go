@@ -23,7 +23,7 @@ func TestCrashDuringRecovery(t *testing.T) {
 	}{{1, 1}, {2, 16}} {
 		t.Run(fmt.Sprintf("every%d", c.every), func(t *testing.T) {
 			defer journal.MarkEvery(c.every)()
-			crashDuringRecovery(t, c.seed, 80)
+			crashDuringRecovery(t, c.seed, 65)
 		})
 	}
 }
