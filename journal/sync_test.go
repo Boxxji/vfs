@@ -81,10 +81,15 @@ func TestSyncGenerationOrder(t *testing.T) {
 	doneB := make(chan struct{})
 	go func() { mustSync(t, j, b); close(doneB) }()
 	waitFor(t, "second waiter", func() bool { return j.Stats().Waited == 2 })
+	replayed(t, j) // returns once b has reached the file: it is written while the first sync is in flight
 
 	p.release <- struct{}{} // first sync ends
 	<-doneA
-	<-p.entered // a second sync begins, because b is not covered
+	select {
+	case <-p.entered: // a second sync begins, because b is not covered
+	case <-time.After(5 * time.Second):
+		t.Fatal("no second sync began for a record written while the first was in flight")
+	}
 	select {
 	case <-doneB:
 		t.Fatal("Sync(b) returned on a sync that began before b was written")
