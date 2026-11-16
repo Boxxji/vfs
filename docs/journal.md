@@ -131,7 +131,8 @@ journal keeps accepting writes within its capacity, `Degraded` is true, and
 | Torn write (partial sector) | The valid prefix before the damaged record. The damaged record and everything after it are dropped, and `Recovery` says what was. |
 | Damage to a record a mark proves durable | `ErrCorrupt`; nothing is dropped. The disk lost something that was acknowledged; the Volume falls back to the store, as for a lost disk. |
 | Damage to a record that no surviving mark covers: any record `Sync` acknowledged in the last sixteen rounds, or the last megabyte, before a kill | Treated as a torn tail, and **dropped although its `Sync` had returned**: the marks are spaced out, so the proof lags. This is a documented residual, the price of not flushing a second block on every round; a clean `Close` leaves no such window for damage to a record. |
-| Damage to the header of a segment (one flipped bit in its checksum, first, life or lineage), whatever came before: the tail segment of a journal closed cleanly included | The marks that prove the segment's records are in the same block, and cannot be read without the life the header holds. `Open` succeeds, the segment's records are lost although their `Sync` returned and `Close` covered them, and `Recovery().Warnings` names the segment and its size. **Accepted:** a media error in that block is a loss of the disk, and the unpublished tail is lost with a disk. A flipped bit in the magic is refused (`ErrFormat`). A header torn on its way into a segment with nothing in it is quiet. |
+| Damage to the header of the *tail* segment (one flipped bit in its checksum, first, life or lineage), a journal closed cleanly included | The marks that prove the segment's records are in the same block, and cannot be read without the life the header holds. `Open` succeeds, the segment's records are lost although their `Sync` returned and `Close` covered them, and `Recovery().Warnings` names the segment and its size. **Accepted:** a media error in that block is a loss of the disk, and the unpublished tail is lost with a disk. A flipped bit in the magic is refused (`ErrFormat`). A header torn on its way in, or in the wipe that frees a segment, is quiet (see Recovery). |
+| Damage to the header of a segment that is *not* the tail | The later segments hold marks that prove its records: `ErrCorrupt`, as for any damage to a record a mark proves. Were those marks lost with the tail, the segments after it are given up and listed. |
 | A directory holding a segment that is not in this layout | `ErrFormat`; nothing is read, reused or deleted. |
 | Permanent disk loss | Nothing. The unpublished tail is lost. The journal cannot know what it lost; the caller knows the last published sequence and must report that an unpublished tail may be missing. A takeover must not report those writes as durable. |
 | A new disk for a volume with history | `Open` on an empty directory with `Published` set to the store's sequence numbers on from it. |
@@ -166,8 +167,10 @@ being written over zeros, or of zeros being written over a header, is zeros and 
 magic's own bytes in their places and nothing else, whichever byte the tear fell
 on: a magic of which every byte is zero or the magic's own at that place is torn,
 and its segment is free. Any other byte makes it foreign. The price is that a
-foreign file whose bytes at that place happen to be zeros and parts of the magic is
-taken for a torn header; nothing else of a foreign file is. Live segments are
+foreign file named like a segment whose four bytes at that place happen to be zeros
+and parts of the magic is taken for a torn header, and so for a free segment: it is
+**reused** (overwritten when a record is placed in it) when it is the size of a
+segment, and **deleted** when its size is not. Nothing else of a foreign file is. Live segments are
 ordered by the sequence of their first record, then by name, and kept while each
 begins exactly where the one before ended and holds at least one valid record.
 The valid records of a segment are the run, from its first, in which each
@@ -199,8 +202,13 @@ damage to a record. Damage to the *header* of a segment is another matter: its m
 are in the same block and need the header's life to be read, so the records of that
 segment are lost, even after a clean `Close` (the tail segment's, too), and `Open`
 succeeds; the warning in `Recovery()` names the segment and its size, and the loss is
-accepted as that of a block of the disk (a segment whose header is torn on its way in,
-with nothing after it, raises none). This is a residual of the design, not a bug to be fixed by a caller: a journal that must
+accepted as that of a block of the disk. The warning is raised when the first record
+behind the damaged header names a sequence the store does not hold; a header torn on
+its way into a segment (a new file, or a recycled one whose records are an older
+life's, all published) and one torn in the wipe that frees a segment (all its records
+published) raise none, for the first record behind them is zeros or a sequence the
+store holds. A false alarm remains possible for a directory opened under a Head older
+than the one it was reclaimed under, which `Open` refuses before it gets there. This is a residual of the design, not a bug to be fixed by a caller: a journal that must
 not lose an acknowledged record to media damage in its last rounds has to write a
 mark with every round, and pays a second block flush for it.
 
@@ -775,9 +783,12 @@ of the volatile writes, each possibly torn at any byte.
     segment's `life` (8 bytes) followed by its `lineage`. Integers are little endian.
     Records do not span segments. A header whose magic is zero marks a free segment,
     as does one whose magic is the fixed bytes and whose checksum fails, and one whose
-    magic is torn: every byte of it zero or the fixed byte at that place. There is one
-    layout and no version: an implementation MUST NOT read, reuse or delete a segment
-    file whose first bytes are none of these (see 13), and a change of layout MUST be
+    magic is torn: every byte of it zero or the fixed byte at that place. A header whose
+    checksum holds and whose first sequence is zero is not a segment's either: it is
+    free. There is one layout and no version: an implementation MUST NOT read, reuse
+    or delete a segment file whose first bytes are none of these (see 13), except
+    that a file whose magic only looks torn, being zeros and parts of the magic, is
+    free and so is reused or, if its size is not a segment's, deleted, and a change of layout MUST be
     made by publishing everything, closing the journal and deleting its directory.
 12. **Marks.** A mark's `through` MUST be a sequence that a completed sync had
     covered before the mark was written; its `floor` MUST be a sequence the store
@@ -787,11 +798,14 @@ of the volatile writes, each possibly torn at any byte.
     of a killed journal is covered by no surviving mark and is treated as a torn tail
     (the reference implementation writes one every sixteenth round or megabyte). The two
     mark slots MUST be written alternately: a mark goes to the slot that does not hold
-    the highest `through`, also in a segment found at `open`, so that a write torn in
+    the newest mark, the one with the highest `through` and, among equal throughs,
+    the highest `floor`, also in a segment found at `open`, so that a write torn in
     flight leaves the newest standing. A reader takes the highest `through` and
     `floor` of the slots that validate.
 13. **Recovery.** `open` MUST decide before it writes. It MUST fail, and MUST NOT
-    write, when: a segment file is not in this layout; a segment's lineage is not the caller's; the store's sequence is
+    write (but for removing the empty temporary files of its own interrupted creations
+    of segments, which are not a segment and which a refused `open` still removes),
+    when: a segment file is not in this layout; a segment's lineage is not the caller's; the store's sequence is
     below the highest floor; the store's sequence is above the last record of a
     non-empty log; or a `through` is above both the last record and the store's
     sequence (records that were made durable are gone); or the log begins after the
@@ -925,7 +939,8 @@ Each criterion is a test that fails if the requirement is removed.
 * **A21a header damage**: a flipped bit in the checksum, first, life or lineage of the
   tail segment of a journal closed cleanly leaves the log ending before that
   segment, and a warning that names the segment and its size; a flipped bit in the
-  magic is refused; a torn header in a segment with nothing in it raises no warning.
+  magic is refused; a header torn at any byte, over a new segment, over a recycled one,
+  or in a wipe of a published one, raises no warning.
 * **A22 floor**: with the write of the floor failing once, the next `reclaim`
   writes it again before wiping, and a power loss then leaves a floor that refuses a
   stale store; with the sync of the floor failing, the journal fails and no header
@@ -934,11 +949,15 @@ Each criterion is a test that fails if the requirement is removed.
   beyond a hole, fails with the range error and wipes neither; a copy of a segment
   inside the range goes with it.
 * **A24 report**: damage to the payload of record 6 of 10, the marks lost, leaves 1
-  to 5 and lists 6 to 10; damage to payloads 5 and 9 of 12 lists 6 to 12; with
+  to 5 and lists 6 to 10; damage to payloads 5 and 9 of 12 lists 5 to 12; with
   records in three segments and the first record of the middle one damaged, the
   records of that segment and the next are listed; damage to a header lists nothing,
   and damage to the last record lists no empty range. `discard(1, 5)` of a journal
-  that also holds 7 to 10 behind a damaged 6 fails and changes nothing.
+  that also holds 7 to 10 behind a damaged 6 fails and changes nothing. A journal
+  that holds valid records behind a hole, or whose record 1 is damaged with the marks
+  present, cannot be cleared by `discard` for any range: the recourse is to delete
+  the directory and treat the disk as lost. The `first` in the error text of `open`
+  (`the first record of the log is 4`) is not a range to give to `discard`.
 * **A25 cadence**: the crash exploration of A4 and A6 is repeated with a mark every
   round, every third, every sixteenth and every thousandth round, and a journal with
   nothing set writes one every sixteenth; a mark is
