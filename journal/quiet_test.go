@@ -317,3 +317,53 @@ func TestDamagedHeaderOfAPartlyPublishedSegmentIsReported(t *testing.T) {
 		t.Fatalf("Warnings %q: want the segment of 4 to 6 named, with the 6 the store does not hold", w)
 	}
 }
+
+// What is followed behind a damaged header is a chain of records, one sequence
+// after another: a segment recycled for shorter records still has the headers of
+// an older life behind the new ones, and those are not part of the chain. Were
+// they, the chain would end at the older life's sequence and the warning, whose
+// test is the last sequence, would stay quiet for records the store lacks.
+func TestWarningFollowsOnlyTheChainOfSequences(t *testing.T) {
+	d := closedJournal(t, 9)
+	j := open(t, small(d, newClock(), 0))
+	if err := j.Publish(6); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Reclaim(); err != nil { // the segments of 1 to 3 and 4 to 6 are free, their records behind a zero header
+		t.Fatal(err)
+	}
+	closeWithin(t, j)
+	// With room for three segments and three in use, the next is one of the free ones.
+	j = open(t, journal.Options{Capacity: 3 * 4096, Segment: 4096, Disk: d, Clock: newClock(), Published: 6})
+	mustAppend(t, j, bigRecord(10)) // over the first two records of the older life: the third is still behind them
+	mustSync(t, j, mustAppend(t, j, bigRecord(11)))
+	closeWithin(t, j)
+	name := segmentStarting(t, d, 10)
+	f, _ := d.Open(name)
+	b := make([]byte, 1)
+	f.ReadAt(b, 20)
+	b[0] ^= 1
+	f.WriteAt(b, 20) // its life
+	forgetMarks(t, d)
+	j = open(t, journal.Options{Capacity: 3 * 4096, Segment: 4096, Disk: d, Clock: newClock(), Published: 6})
+	defer closeWithin(t, j)
+	w := j.Recovery().Warnings
+	if len(w) != 1 || !strings.Contains(w[0], name) || !strings.Contains(w[0], "sequence 11") {
+		t.Fatalf("Warnings %q: want %s named, with its records going as far as 11", w, name)
+	}
+}
+
+// A segment that cannot be read is not a segment that holds nothing: the error of
+// the read that follows a damaged header is Open's.
+func TestReadErrorBehindADamagedHeaderIsReturned(t *testing.T) {
+	d := closedJournal(t, 9)
+	f, _ := d.Open("000002.seg")
+	b := make([]byte, 1)
+	f.ReadAt(b, 20)
+	b[0] ^= 1
+	f.WriteAt(b, 20)
+	_, err := journal.Open("", small(failReads{d, map[string]bool{"000002.seg": true}}, newClock(), 0))
+	if !errors.Is(err, errRead) {
+		t.Fatalf("Open: %v, want the read error", err)
+	}
+}
