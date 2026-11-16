@@ -23,7 +23,7 @@
 #   realserver-kill  a writer killed at random moments, against the real server
 #   scale-a/b/c      the measurements: 100,000 files, a million inodes, sync cost, the
 #                    object budget, a petabyte, amplification (-short skips them)
-#   fuzz             the model run over many more seeds
+#   fuzz             the model run over many more seeds, and the Head parser against the reference decoder
 #
 # The realserver gates fail if a test they exist for did not pass: a skip is a
 # failure there, never a pass. The real server is the published image of release
@@ -108,7 +108,7 @@ test:
       set -euo pipefail
       go test -race -short -count=1 ./pkg/...
       go test -race -short -count=1 -run '^Test(ConcurrentWorkers|NoGoroutineLeak|SameRoundRace|RacingClaims|TakeoverLosesNoAcknowledgedCommit|FenceRefusesOlderRound|AttachNeedsAHigherRound|AttachLostAckIsNotStale|StalledCommitHonoursItsDeadline|DeposedWriterIsToldAtItsNextCommit|LostAckNoLostUpdateNoDuplicate|LostAckThenTakeoverIsNotReportedLost|VolumeOnEveryStore)$' .
-      go test -race -tags fuse -short -count=1 -run '^Test(InterruptIsEINTR|FsyncWaitsForItsCommit|CloseWaitsForItsCommit|ReadWaitsForItsData|FsyncCallersShareTwoCommits|SessionRefusesANilContext|LookedUpFileReadsOnTheMountContext|CreateOfAnExistingFileOpensIt|LookupIsNotAnsweredEINTR|AttrIsNotAnsweredEINTR|ReaddirIsNotAnsweredEINTR|MkdirIsNotAnsweredEINTR|RemoveIsNotAnsweredEINTR|CreateIsNotAnsweredEINTR|NodesAreBuiltOnlyByTheirConstructors|EveryHandlerOutlivesItsRequest|FinishCommitsWhatTheMountWrote|FinishDoesNotWaitForAStalledCommitForever|FinishReportsWhatWentWrong|FinishOfAReadOnlyVolumeCommitsNothing|KilledColdLookupIsFreedAfterTheGrace|ErrnoMapping|FsyncJoinsAFlightThatCoversIt)$' ./pkg/mount
+      go test -race -tags fuse -short -count=1 -run '^Test(InterruptIsEINTR|FsyncWaitsForItsCommit|CloseWaitsForItsCommit|ReadWaitsForItsData|FsyncCallersShareTwoCommits|SessionRefusesANilContext|LookedUpFileReadsOnTheMountContext|CreateOfAnExistingFileOpensIt|LookupIsNotAnsweredEINTR|AttrIsNotAnsweredEINTR|ReaddirIsNotAnsweredEINTR|MkdirIsNotAnsweredEINTR|RemoveIsNotAnsweredEINTR|CreateIsNotAnsweredEINTR|NodesAreBuiltOnlyByTheirConstructors|EveryHandlerOutlivesItsRequest|FinishCommitsWhatTheMountWrote|FinishDoesNotWaitForAStalledCommitForever|FinishDoesNotClaimALostCommitIsLost|FinishReportsTheLostCommitEvenWhenServeFailed|FinishWaitsForASlowCommit|FinishReportsWhatWentWrong|FinishOfAReadOnlyVolumeCommitsNothing|KilledColdLookupIsFreedAfterTheGrace|ErrnoMapping|FsyncJoinsAFlightThatCoversIt)$' ./pkg/mount
   - name: model
     run: go test -short -count=1 -run '^Test(Sparse|Model|TreeForced)' .
   - name: sparse
@@ -128,4 +128,7 @@ test:
   - name: scale-c
     run: go test -count=1 -timeout 4m -run '^(TestObjectsPerThousandSmallFiles|TestAppendWithFsyncAmplification|TestColdReadAmplification|TestSmallWritesAmplifyMemory|TestFlushLatency|TestSustainedWriteWithFsync|TestTinyExtentsCost|TestPetabyteScattered)$' .
   - name: fuzz
-    run: go test -count=1 -timeout 4m -run '^TestModelFuzzMany$' .
+    run: |
+      set -euo pipefail
+      go test -count=1 -timeout 4m -run '^TestModelFuzzMany$' .
+      go test -count=1 -timeout 2m -run '^$' -fuzz '^FuzzHead$' -fuzztime 20s .

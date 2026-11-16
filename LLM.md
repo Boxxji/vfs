@@ -137,12 +137,19 @@ the Head compare-and-swap is the only mutation of the tree.
   collector sets its bit and writes its field.
 * Integers are in their shortest form and a value wider than its field is refused, not
   truncated (SPECIFICATION 1): `reader.uvarint`, `uvarint32`, `varint`.
-* An extension object's name is `ext/<name>/<hash keyed from Head.Seed>` (SPECIFICATION 3.1):
-  `Volume.ExtKey` gives it. `snapshots`, `links` and `base` are not extension names.
 * Objects beside the tree (a trace store, say) are extension objects (SPECIFICATION 3.1):
-  `Volume.PutExt` and `GetExt` keep one at `ext/<name>/<BLAKE3 of the key, hex>`, sealed
-  to the Volume, the name and the key, outside the Round's fence. Readers ignore keys
-  they do not know and a collector never deletes them (11.1 says how collection will go).
+  `Volume.PutExt` and `GetExt` keep one at `ext/<name>/<64 hex digits of a BLAKE3 hash keyed
+  from Head.Seed over the length-framed name and the key>` (`Volume.ExtKey` gives it), sealed
+  to the Volume, the name and that segment, outside the Round's fence. `snapshots`, `links`
+  and `base` are not extension names. Readers ignore keys they do not know and a collector
+  never deletes them (11.1 says how collection will go).
+* The `head` object is at most 65,536 bytes, read and written: `fence.Store` refuses (with
+  `ErrTooLarge`, before any request) a record it would not read back, so a commit that would
+  pass the bound fails and changes nothing. A Head is read in a fixed order, `ErrCorrupt` for
+  a fixed field, `ErrNeeds` for a bit that is not known, `ErrCorrupt` for the Tail
+  (`parseHead(b, known)` takes the known bits, so a table of them is tested before one is
+  defined). Reseal reads the Head the same way on the branch where it is already sealed to
+  the place.
 * Every key a Volume writes is 1 to 511 bytes of `a-z`, `0-9`, `-` in segments of at most
   255, separated by `/`; every backend keeps those as written (a backend may keep more: the
   replica package's `orgs/acme/kv.db`), and `storetest.Strict` refuses any other from the

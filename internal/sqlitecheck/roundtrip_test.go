@@ -65,10 +65,19 @@ func TestSQLiteRoundTrip(t *testing.T) {
 	if _, err := db.Exec(`CREATE TABLE coins (sym TEXT PRIMARY KEY, name TEXT, decimals INT)`); err != nil {
 		t.Fatal(err)
 	}
+	// One transaction: committed one by one, 20,000 inserts made 80,004 fsyncs, which is
+	// minutes on a disk of 3 ms an fsync and nothing the test is about.
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
 	for i := range 20000 {
-		if _, err := db.Exec(`INSERT INTO coins VALUES (?, ?, ?)`, fmt.Sprintf("SYM_%d", i), strings.Repeat("name ", 1+i%9), i%19); err != nil {
+		if _, err := tx.Exec(`INSERT INTO coins VALUES (?, ?, ?)`, fmt.Sprintf("SYM_%d", i), strings.Repeat("name ", 1+i%9), i%19); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)

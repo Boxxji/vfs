@@ -258,7 +258,9 @@ increasing. It is sealed (4.2) and placed in a fence record.
 * `Seed` draws the Volume's chunking table (section 7.2) and keys the boundaries of
   the metadata tree (section 6.3). A new Volume draws it at random. It is as secret as
   the Volume: it is what a party who chooses file names does not know. It never changes: a
-  commit and a reseal (5.4) write it back as it was.
+  commit and a reseal (5.4) write it back as it was. It cannot be rotated: it keys the
+  chunking table, the tree boundaries and the names of extension objects (3.1), so a new
+  Seed is a new Volume, written by copying the files into it.
 * `Journal` is the highest sequence of the node journal (`docs/journal.md`) whose effects
   the Head includes: what the store holds of it, as the journal's `Published`. It is 0
   when there is no journal. A writer that rewrites the Head and does not publish carries it
@@ -271,7 +273,11 @@ increasing. It is sealed (4.2) and placed in a fence record.
   bit, appends the field, and a build that lacks the feature refuses instead of damaging the
   Volume. A reader that knows every bit set MUST also refuse a Head that lacks the field of
   a bit it sets (`ErrCorrupt`): a bit that nothing backs is a Head that was not written by
-  a writer of the feature. Tags 64 and above have no bit and are never needed.
+  a writer of the feature. Tags 64 and above have no bit and are never needed. There is no
+  class of feature that only writers must know: a bit refuses every build that lacks the
+  feature, readers included, even where a reader could have read what a writer cannot
+  write (a link count that only unlink maintains locks out an old reader too). A reader
+  that is to be let in is a feature that sets no bit.
 * The Tail is the fields of later builds, and its form is checked by every reader, whether
   it knows a field or not: every field whole (the tag, the length, and `length` bytes of
   value), tags strictly increasing (so no tag twice, and one order of the fields), at most
@@ -287,6 +293,13 @@ increasing. It is sealed (4.2) and placed in a fence record.
   MUST NOT write a field of a tag, whose encoding is not in this text. A build that sets
   `Needs` bit 3 with a field of its own invention writes a Head that another build, which
   was given the encoding, cannot read, and was not a conformant writer.
+* **Precedence of the refusals.** A reader checks a Head in this order, and the first that
+  fails is the error. The fixed fields: one that is short, or not in its shortest form, is
+  `ErrCorrupt`. `Needs`: a bit that the build does not know is `ErrNeeds`, whatever the Tail
+  holds, even a Tail that is not whole (a build cannot judge the Head of a feature it does
+  not have). Then the Tail: not whole, not in order, over 256 fields, or lacking the field
+  of a bit it knows is set, is `ErrCorrupt`. So a Head is `ErrNeeds` only if its fixed
+  fields are sound, and an `ErrCorrupt` Head is one that no build could read.
 
 The bits below are decided and RESERVED: they have names and no encoding, no build sets one,
 and each is named so that two changes do not take the same bit or tag.
@@ -296,9 +309,17 @@ and each is named so that two changes do not take the same bit or tag.
 | 1 | `snapshots` | the Volume has retained roots, stored as extension objects (3.1), that a collector must keep: a collector that does not know the bit would delete what they reach, so a build that does not know it refuses the Volume |
 | 2 | `links` | inodes carry link counts that every unlink must adjust (6.1): a writer that does not keep them would leave them wrong |
 | 3 | `base` | chunks are read through a base layer shared with other Volumes (11.1): the field names the layer, and a shared read key opens its chunks |
+| 63 | (escape) | a Head that needs more than 62 features, or that needs one whose field is not a tag: this text will say how, and until it does the bit is unusable, as the others are |
 
-A reader MUST bound its read of `head` (the reference implementation accepts at most
-64 KiB).
+**The size of the Head.** The `head` object (the fence record of 5.2: 30 bytes of header
+and the sealed Head) is at most 65,536 bytes. A reader MUST refuse a longer one, and a writer
+MUST NOT write one: a commit that would make the object longer is refused with an error
+(`ErrTooLarge` in the reference implementation) before any request is made, and changes
+nothing, so no commit that returned success leaves a Volume that cannot be opened. A
+Head of the default Cipher is about 1,850 bytes with the header, plus its Tail (the largest
+single field value that fits is 63,678 bytes, measured). `Seq` and `Next` grow, so a Head that is
+within a few bytes of the bound ends the Volume's writes: a feature keeps its fields small,
+and keeps what is large in an extension object (3.1) that its field names.
 
 ### 5.2 The fence record
 
@@ -392,8 +413,10 @@ The payload is opened in one of three ways, tried in this order:
 
 1. under the context of the old place, given as its canonical location string (1);
 2. if that fails because the context differs, under the context of the new place: the
-   Head is already sealed there, a reseal whose reply was lost for instance, and it is
-   left as it is and only the Round is claimed. A reseal can therefore be repeated at
+   Head is already sealed there, a reseal whose reply was lost for instance. It is read
+   like any other (5.1: a bit this build does not know is refused, and the Round is not
+   claimed), and the copy is checked; then it is left as it is and only the Round is
+   claimed. A reseal can therefore be repeated at
    a higher Round whatever it is told the old place was;
 3. if the old place is not given, with the key alone, ignoring the context. This
    trusts the key (only a holder of it can have written a Head that opens, because of
@@ -598,7 +621,8 @@ reached its caller as `EIO`; `close(2)` is never restarted; a restarted create w
 | chunk | 64 KiB to 4 MiB (a short final chunk of a run is allowed) |
 | pack | uploaded at 16 MiB; a pack may exceed that by one frame |
 | node (shard plaintext) | ends at 512 KiB; sealed shard read bound 1 MiB |
-| Head read bound | 64 KiB |
+| `head` object (fence record: 30 bytes and the sealed Head) | 65,536 bytes, read and written |
+| Head Tail | at most 256 fields |
 | name | 1 to 255 bytes, no `/`, no NUL, not `.` or `..` |
 | prefix | at most 512 bytes, segments as in section 2 |
 | round | 1 to 2^64-2 for a writer |
@@ -615,14 +639,14 @@ reference implementation (all in the repository root unless a package is named):
 | Property | Tests |
 |---|---|
 | every byte of the layout | `TestSpecContexts`, `TestSpecFrameAndTag`, `TestSpecHead`, `TestSpecFenceRecord`, `TestSpecRecords`, `TestSpecNodeAndBoundary`, `TestSpecChunker`, `TestSpecExtension` (each rebuilds the bytes from this text and compares), `TestObjectKeysAreTheSpecShapes`, `TestFenceTokenIsSixteenBytes`, `TestTheSizesOfTheText`, and `TestTheCipherOpensAGoldenObject`, which holds the default Cipher's format to an object that the library produced once |
-| the Head: its fields, the journal sequence, the bits, the tagged Tail and what a later build appends | `TestHeadRejectsGarbage`, `TestHeadNeeds`, `TestHeadTailRules`, `TestNeededFieldsMustBePresent`, `TestTailSurvivesAnOrdinaryWriter`, `TestHeadMatrix`, `TestHeadParserFuzz`, `TestTheHeadHasRoomForTheJournalSequence`, `TestHeadFieldsSurviveACommit`, `TestHeadOfALaterBuildIsRefusedByEveryDoor` |
+| the Head: its fields, the journal sequence, the bits, the tagged Tail and what a later build appends | `TestHeadRejectsGarbage`, `TestHeadNeeds`, `TestHeadTailRules`, `TestNeededFieldsMustBePresent`, `TestTailSurvivesAnOrdinaryWriter`, `TestHeadMatrix`, `TestHeadParserFuzz`, `TestHeadDifferentialFuzz`, `TestHeadDifferentialWithKnownBits`, `TestAKnownBitIsHeldToItsField`, `TestHeadProduct`, `TestOneSpellingPerHead`, `TestTailThroughEveryDoor`, `TestNeedsAndTailAreSealed`, `TestCommitCarriesNeedsAndTail`, `TestTailOrderIsAgainstThePreviousField`, `FuzzHead`, `TestWriterNeverWritesAHeadItsReadersRefuse`, `TestStoreNeverWritesWhatItWouldNotRead` (`pkg/fence`), `TestTheHeadHasRoomForTheJournalSequence`, `TestHeadFieldsSurviveACommit`, `TestHeadOfALaterBuildIsRefusedByEveryDoor` |
 | objects are written once; crash at any point leaves the last commit | `TestSigkill` (six kill points, every run), `TestFailureAtEveryWrite`, `TestLostAcknowledgementOfHead`, `TestKillOverRealServer` |
 | fence: one winner, older Round refused, takeover loses nothing, lost acknowledgements | `pkg/fence` tests, `TestFenceRefusesOlderRound`, `TestAttachNeedsAHigherRound`, `TestTakeoverLosesNoAcknowledgedCommit`, `TestRacingClaims`, `TestSameRoundRace`, `TestAttachLostAckIsNotStale`, `TestAttachAfterALostClaimNeedsAHigherRound`, `TestRoundMaxIsRefused`, `TestHeadSeqNeverRepeats` |
 | store contract, the key grammar, listing by string prefix with sizes and times | `internal/storetest` conformance suite, run on every backend (the memory store, the directory, an S3 protocol server and the real server); `TestRealServerCAS`, `TestRealServerRaceStress`, `TestValidKey`, `TestListTimesAndPages` |
-| extension objects: one behaviour on every store, sealed to Volume, name and key, left alone | `TestExtensionObjectsOnEveryStore`, `TestExtensionObjectsAndTheFence`, `TestExtensionObjectsRaced`, `TestExtensionObjectIsSealedToItsVolumeNameAndKey`, `TestExtensionReplaceRetriesAndGivesUp`, `TestStrayKeysAreIgnoredAndKept`, `TestExtNameRevealsTheKey`, `TestExtNamesAndCollisions`, `TestExtMasquerade`, `TestExtReadIsBounded`, `TestStrayKeys` |
+| extension objects: one behaviour on every store, sealed to Volume, name and key, left alone | `TestExtensionObjectsOnEveryStore`, `TestExtensionObjectsAndTheFence`, `TestExtensionObjectsRaced`, `TestExtensionObjectIsSealedToItsVolumeNameAndKey`, `TestExtensionReplaceRetriesAndGivesUp`, `TestStrayKeysAreIgnoredAndKept`, `TestExtNameRevealsTheKey`, `TestExtNamesMatchAnIndependentBLAKE3` (vectors from another BLAKE3 library, `testdata/extnames.json`), `TestSeedDerivationsAreSeparate`, `TestExtNamesFollowTheVolume`, `TestExtKeyRefusesWhatPutExtRefuses`, `TestExtNamesAndCollisions`, `TestExtMasquerade`, `TestExtReadIsBounded`, `TestStrayKeys` |
 | sealing context, exact and injective | `TestSealedToItsContext`, `TestHeadContextIsExact`, `TestContextsDoNotCollide`, `TestSwappedHeadIsRefused`, `TestChunkHashIsChecked` |
 | the Cipher: checked at configuration and at every Seal; unforgeable with the recipient alone | `TestIdentityCipherIsRefused`, `TestCipherThatStopsSealingIsCaughtAtEverySeal`, `TestSealCatchesAHeaderedFallback`, `TestNoPublicTagKeyVerifies`, `TestShortForgedPlaintextIsRefusedNotPanicked`, `TestContextIsComparedWhole`, `TestRecipientAloneCannotForge`, `TestEveryByteOfTheTagIsChecked`, `TestWrongKeyFailsClosed`, `TestTamperedObjectsAreRefused`, `TestSwappedChunkIsRefused` |
-| places and moving a Volume | `TestPlaceSpellings`, `TestPlaceStringsAreOneSpelling`, `TestPlacesAreRefusedNotCleaned`, `TestRedact`, `TestRedactionCases`, `TestRedactionLeaks`, `TestRedactionOfEverySpelling`, `TestErrorsDoNotEchoACredentialInAPrefix`, `TestResealMovesAVolume`, `TestResealWrongFromChangesNothing`, `TestResealCrashAtTheWrite`, `TestResealIsRepeatable`, `TestResealWithoutThePlace`, `TestResealOfALiveVolume`, `TestResealRacesAWriter`, `TestResealRefusesTheLastRound`, `TestResealRefusesAGarbageHead`, `TestResealChecksTheCopy`, `TestResealWrongKeyChangesNothing`, `TestResealWithoutAPlaceRefusesAnotherKindOfObject`, `TestPartialCopyFailsClosed`, `TestVerifyFindsAnExtentWithoutItsChunk`, `TestVerifyChecksTheFurthestChunk`, `TestResealOfShortCopies`, `TestResealRepeatsAndForeigners`, `TestCLIReseal` (`cmd/vfs`), `TestFileOpenCreatesNothing` (`pkg/backend/file`) |
+| places and moving a Volume | `TestPlaceSpellings`, `TestPlaceStringsAreOneSpelling`, `TestPlacesAreRefusedNotCleaned`, `TestRedact`, `TestRedactionCases`, `TestRedactionLeaks`, `TestRedactionOfEverySpelling`, `TestErrorsDoNotEchoACredentialInAPrefix`, `TestResealMovesAVolume`, `TestResealWrongFromChangesNothing`, `TestResealCrashAtTheWrite`, `TestResealIsRepeatable`, `TestResealWithoutThePlace`, `TestResealOfALiveVolume`, `TestResealRacesAWriter`, `TestResealRefusesTheLastRound`, `TestResealRefusesAGarbageHead`, `TestResealChecksTheCopy`, `TestResealWrongKeyChangesNothing`, `TestResealWithoutAPlaceRefusesAnotherKindOfObject`, `TestPartialCopyFailsClosed`, `TestVerifyFindsAnExtentWithoutItsChunk`, `TestResealOfAlreadySealedHeadChangesNothingWhenItNeedsMore`, `TestVerifyChecksTheFurthestChunk`, `TestResealOfShortCopies`, `TestResealRepeatsAndForeigners`, `TestCLIReseal` (`cmd/vfs`), `TestFileOpenCreatesNothing` (`pkg/backend/file`) |
 | shortest-form integers and fields no wider than their width | `TestHeadNonMinimalUvarint`, `TestIntegersAreInTheirShortestFormAndFitTheirField` |
 | keyed tree boundaries | `TestGroundNamesDoNotBloatTheTree`, `TestBoundariesDependOnTheSeed` |
 | rotation | `TestRotation` |
@@ -632,7 +656,7 @@ reference implementation (all in the repository root unless a package is named):
 | holes and truncation, byte for byte against a plain model | `TestSparseExact`, `TestSparseRandom`, `TestSparsePetabyte`, `TestModelFuzz` |
 | bounded reads | `TestHeadBound`, `TestShardBound`, `TestBackendBodyIsBounded`, `TestReadIsBounded` |
 | prefixes | `TestValidPrefix`, `TestPrefixConfinement` |
-| durability and interrupts on a mount | `TestFUSEFsyncSurvivesKill`, `TestFUSEInterruptsAreNotErrors`, `TestFsyncWaitsForItsCommit`, `TestCloseWaitsForItsCommit`, `TestReadWaitsForItsData`, `TestLookupIsNotAnsweredEINTR`, `TestAttrIsNotAnsweredEINTR`, `TestReaddirIsNotAnsweredEINTR`, `TestMkdirIsNotAnsweredEINTR`, `TestRemoveIsNotAnsweredEINTR`, `TestCreateIsNotAnsweredEINTR`, `TestEveryHandlerOutlivesItsRequest`, `TestFsyncCallersShareTwoCommits`, `TestFsyncJoinsAFlightThatCoversIt`, `TestKilledColdLookupIsFreedAfterTheGrace`, `TestErrnoMapping`, `TestFinishCommitsWhatTheMountWrote` (the flush at the end of a mount), `TestFinishDoesNotWaitForAStalledCommitForever`, `TestFUSETermStopsAMountInUse`, `TestFUSEReadsExistingFilesOverS3`, and `TestFUSESQLite` (`internal/sqlitecheck`) on a Linux kernel |
+| durability and interrupts on a mount | `TestFUSEFsyncSurvivesKill`, `TestFUSEInterruptsAreNotErrors`, `TestFsyncWaitsForItsCommit`, `TestCloseWaitsForItsCommit`, `TestReadWaitsForItsData`, `TestLookupIsNotAnsweredEINTR`, `TestAttrIsNotAnsweredEINTR`, `TestReaddirIsNotAnsweredEINTR`, `TestMkdirIsNotAnsweredEINTR`, `TestRemoveIsNotAnsweredEINTR`, `TestCreateIsNotAnsweredEINTR`, `TestEveryHandlerOutlivesItsRequest`, `TestFsyncCallersShareTwoCommits`, `TestFsyncJoinsAFlightThatCoversIt`, `TestKilledColdLookupIsFreedAfterTheGrace`, `TestErrnoMapping`, `TestFinishCommitsWhatTheMountWrote` (the flush at the end of a mount), `TestFinishDoesNotWaitForAStalledCommitForever`, `TestFinishDoesNotClaimALostCommitIsLost`, `TestFinishReportsTheLostCommitEvenWhenServeFailed`, `TestFinishWaitsForASlowCommit`, `TestFUSETermStopsAMountInUse`, `TestFUSEReadsExistingFilesOverS3`, and `TestFUSESQLite` (`internal/sqlitecheck`) on a Linux kernel |
 | full-size randomised runs | `TestSparseExact`, `TestSparseRandom`, `TestSparseCanonicalRuns`, `TestSparseTinyBounds` (the `sparse` gate, not `-short`) |
 
 ## 11. Not specified, and known limits
@@ -722,9 +746,14 @@ Known limits of the reference implementation. None changes the layout.
   mount open says so, asks again for 5 s and then detaches it lazily and ends within 3 s
   more. What a holder writes after the commit is lost with the connection. The commit at
   the end has a deadline of 3 s: when the store has stopped answering, the daemon says that
-  the last commit did not finish and what it held is lost, and exits non-zero; it does not
-  wait for the Volume's lock, which a stalled commit keeps. A supervisor that escalates to
-  SIGKILL, or kills at once, loses what was not committed.
+  the last commit did not finish and that what it held may be lost (its request may be at
+  the store already), and exits non-zero; it does not wait for the Volume's lock, which a
+  stalled commit keeps. With a stalled store the whole of it takes up to 21 s: 10 s for the
+  commit, 5 s of asking for the unmount when something holds the mount, 3 s for the kernel
+  to let Serve go, 3 s for the last commit. A supervisor whose kill timer is shorter than
+  that never sees the line "unmounting without the commit" (printed at 10 s) or the exit
+  status, and one that escalates to SIGKILL, or kills at once, loses what was not
+  committed.
 * **Every close is a full commit** (section 8): about 143 files per second and 5.7 objects
   per file in `cp -r` and in a checkout through the mount, against about 0.04 objects per
   file for the same files written and committed once.

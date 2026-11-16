@@ -183,10 +183,13 @@ Linux host, and they are part of releasing:
 > round passes. `TestFUSEInterruptsAreNotErrors` fails only for a call that failed, never
 > for how long the host took.
 >
-> Put `TMPDIR` (and `GOTMPDIR`) on a tmpfs, `/dev/shm` for one. Measured: `sqlitecheck` built
-> with `CGO_ENABLED=0` hung for more than 250 s with `TMPDIR` on an ordinary disk of an amd64
-> host, and passed in 4 to 5 s with it on `/dev/shm`. The cause is not found; until it is, a
-> run that is slow on a disk is not a failure of the Volume, and a release run uses tmpfs.
+> `TMPDIR` is a directory the binary can create files in, made in the same session that runs the
+> binary. `/dev/shm` is faster than a disk but is not safe to prepare ahead: on a host whose
+> logind has `RemoveIPC=yes` and the account `Linger=no` (an amd64 host used for release runs), the
+> account's `/dev/shm` is deleted when its last session ends, and a test started afterwards
+> fails at once, in `t.TempDir()`, with nothing wrong with the Volume. `TestSQLiteRoundTrip`
+> builds its reference database in one transaction; committed row by row it made 80,004 fsyncs,
+> which took more than 250 s on a disk of about 3 ms an fsync.
 
 The recorded Cipher object of `pin_test.go` pins what a later build of the library reads
 (`TestTheCipherOpensAGoldenObject`) and the structure that a build of the past needs to read

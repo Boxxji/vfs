@@ -1847,5 +1847,211 @@
   "new": "\t\t\tif _, ok, err = v.t.get(ctx, v.root, keyChunk(e.id)); err == nil && !ok && false {",
   "pkg": ".",
   "run": "^TestVerifyFindsAnExtentWithoutItsChunk$"
+ },
+ {
+  "name": "fence: Put writes a record over the bound",
+  "file": "pkg/fence/fence.go",
+  "old": "\tif err := s.fits(want); err != nil {\n\t\treturn fmt.Errorf(\"fence: put %s: %w\", key, err)\n\t}\n",
+  "new": "",
+  "pkg": "./pkg/fence",
+  "run": "^TestStoreNeverWritesWhatItWouldNotRead$"
+ },
+ {
+  "name": "fence: Create writes a record over the bound",
+  "file": "pkg/fence/fence.go",
+  "old": "\tif err := s.fits(record); err != nil {\n\t\treturn fmt.Errorf(\"fence: create %s: %w\", key, err)\n\t}\n",
+  "new": "",
+  "pkg": "./pkg/fence",
+  "run": "^TestStoreNeverWritesWhatItWouldNotRead$"
+ },
+ {
+  "name": "fence: Rewrite writes a record over the bound",
+  "file": "pkg/fence/fence.go",
+  "old": "\t\tif err := s.fits(last); err != nil {\n\t\t\treturn fmt.Errorf(\"fence: claim %s: %w\", key, err)\n\t\t}\n",
+  "new": "",
+  "pkg": "./pkg/fence",
+  "run": "^TestStoreNeverWritesWhatItWouldNotRead$"
+ },
+ {
+  "name": "fence: a record of exactly the bound is refused",
+  "file": "pkg/fence/fence.go",
+  "old": "if int64(len(record)) > s.max {",
+  "new": "if int64(len(record)) >= s.max {",
+  "pkg": "./pkg/fence",
+  "run": "^TestStoreNeverWritesWhatItWouldNotRead$"
+ },
+ {
+  "name": "fence: a record one over the bound is written",
+  "file": "pkg/fence/fence.go",
+  "old": "if int64(len(record)) > s.max {",
+  "new": "if int64(len(record)) > s.max+1 {",
+  "pkg": "./pkg/fence",
+  "run": "^TestStoreNeverWritesWhatItWouldNotRead$"
+ },
+ {
+  "name": "head: a commit writes a Head over the bound",
+  "file": "pkg/fence/fence.go",
+  "old": "\tif err := s.fits(want); err != nil {\n\t\treturn fmt.Errorf(\"fence: put %s: %w\", key, err)\n\t}\n",
+  "new": "",
+  "pkg": ".",
+  "run": "^TestWriterNeverWritesAHeadItsReadersRefuse$"
+ },
+ {
+  "name": "reseal: a Head sealed to this place is not read",
+  "file": "volume.go",
+  "old": "\t\t\t\tsealedHere = true\n",
+  "new": "\t\t\t\treturn payload, nil\n",
+  "pkg": ".",
+  "run": "^TestResealOfAlreadySealedHeadChangesNothingWhenItNeedsMore$"
+ },
+ {
+  "name": "reseal: the Needs of the Head are not checked",
+  "file": "volume.go",
+  "old": "\t\th, err := unmarshalHead(plain)\n\t\tif err != nil {\n\t\t\treturn nil, fmt.Errorf(\"vfs: head: %w\", err)",
+  "new": "\t\th, err := parseHead(plain, ^uint64(0))\n\t\tif err != nil {\n\t\t\treturn nil, fmt.Errorf(\"vfs: head: %w\", err)",
+  "pkg": ".",
+  "run": "^TestResealOfAlreadySealedHeadChangesNothingWhenItNeedsMore$"
+ },
+ {
+  "name": "finish: the serve error hides the lost commit",
+  "file": "pkg/mount/errno.go",
+  "old": "\treturn errors.Join(serveErr, err)",
+  "new": "\tif serveErr != nil {\n\t\treturn serveErr\n\t}\n\treturn err",
+  "pkg": "./pkg/mount",
+  "run": "^TestFinish",
+  "tags": "fuse"
+ },
+ {
+  "name": "finish: the lost commit hides the serve error",
+  "file": "pkg/mount/errno.go",
+  "old": "\treturn errors.Join(serveErr, err)",
+  "new": "\tif err != nil {\n\t\treturn err\n\t}\n\treturn serveErr",
+  "pkg": "./pkg/mount",
+  "run": "^TestFinish",
+  "tags": "fuse"
+ },
+ {
+  "name": "finish: a commit that may be lost is said to be lost",
+  "file": "pkg/mount/errno.go",
+  "old": "had not committed may be lost\"",
+  "new": "had not committed is lost\"",
+  "pkg": "./pkg/mount",
+  "run": "^TestFinish",
+  "tags": "fuse"
+ },
+ {
+  "name": "finish: the grace is 5 s",
+  "file": "pkg/mount/errno.go",
+  "old": "const finishGrace = 3 * time.Second",
+  "new": "const finishGrace = 5 * time.Second",
+  "pkg": "./pkg/mount",
+  "run": "^TestFinish",
+  "tags": "fuse"
+ },
+ {
+  "name": "finish: the grace is 0.2 s",
+  "file": "pkg/mount/errno.go",
+  "old": "const finishGrace = 3 * time.Second",
+  "new": "const finishGrace = time.Second / 5",
+  "pkg": "./pkg/mount",
+  "run": "^TestFinish",
+  "tags": "fuse"
+ },
+ {
+  "name": "tail: order is against the first field only",
+  "file": "head.go",
+  "old": "\t\tlast = tag\n\t\tif tag < 64 {",
+  "new": "\t\tif n == 0 {\n\t\t\tlast = tag\n\t\t}\n\t\tif tag < 64 {",
+  "pkg": ".",
+  "run": "^Test(TailOrderIsAgainstThePreviousField|HeadTailRules)$"
+ },
+ {
+  "name": "tail: a known bit is not held to its field",
+  "file": "head.go",
+  "old": "\tif err := checkTail(r.b, h.Needs); err != nil {",
+  "new": "\tif err := checkTail(r.b, 0); err != nil {",
+  "pkg": ".",
+  "run": "^Test(AKnownBitIsHeldToItsField|HeadDifferentialWithKnownBits)$"
+ },
+ {
+  "name": "head: bit 3 is taken for known",
+  "file": "head.go",
+  "old": "\tif unknown := h.Needs &^ known; unknown != 0 {",
+  "new": "\tif unknown := h.Needs &^ known; unknown != 0 && known != 1<<3 {",
+  "pkg": ".",
+  "run": "^Test(AKnownBitIsHeldToItsField|HeadDifferentialWithKnownBits)$"
+ },
+ {
+  "name": "commit: Needs is not carried",
+  "file": "volume.go",
+  "old": "\th.Seq, h.Root, h.Next = v.seq, v.root, uint64(v.next)\n",
+  "new": "\th.Seq, h.Root, h.Next = v.seq, v.root, uint64(v.next)\n\th.Needs = 0\n",
+  "pkg": ".",
+  "run": "^TestCommitCarriesNeedsAndTail$"
+ },
+ {
+  "name": "commit: the Tail is not carried",
+  "file": "volume.go",
+  "old": "\th.Seq, h.Root, h.Next = v.seq, v.root, uint64(v.next)\n",
+  "new": "\th.Seq, h.Root, h.Next = v.seq, v.root, uint64(v.next)\n\th.Tail = \"\"\n",
+  "pkg": ".",
+  "run": "^TestCommitCarriesNeedsAndTail$"
+ },
+ {
+  "name": "commit: the journal sequence is not carried",
+  "file": "volume.go",
+  "old": "\th.Seq, h.Root, h.Next = v.seq, v.root, uint64(v.next)\n",
+  "new": "\th.Seq, h.Root, h.Next = v.seq, v.root, uint64(v.next)\n\th.Journal = 0\n",
+  "pkg": ".",
+  "run": "^TestCommitCarriesNeedsAndTail$"
+ },
+ {
+  "name": "ext: ExtKey accepts a bad name",
+  "file": "ext.go",
+  "old": "func (v *Volume) ExtKey(name string, key []byte) (string, error) {\n\tif err := validExtName(name); err != nil {\n\t\treturn \"\", err\n\t}",
+  "new": "func (v *Volume) ExtKey(name string, key []byte) (string, error) {",
+  "pkg": ".",
+  "run": "^TestExtKeyRefusesWhatPutExtRefuses$"
+ },
+ {
+  "name": "ext: ExtKey takes the name of another Volume",
+  "file": "ext.go",
+  "old": "\tseed := v.head.Seed\n\tv.mu.RUnlock()\n\treturn extObjectKey",
+  "new": "\tseed := [32]byte{}\n\tv.mu.RUnlock()\n\treturn extObjectKey",
+  "pkg": ".",
+  "run": "^Test(ExtNamesMatchAnIndependentBLAKE3|ExtNamesFollowTheVolume|SpecExtension)$"
+ },
+ {
+  "name": "ext name: the context string is another (independent vectors)",
+  "file": "ext.go",
+  "old": "blake3.DeriveKey(\"hanzoai/vfs extension names\"",
+  "new": "blake3.DeriveKey(\"hanzoai/vfs extension names \"",
+  "pkg": ".",
+  "run": "^TestExtNamesMatchAnIndependentBLAKE3$"
+ },
+ {
+  "name": "head: Needs is not checked at all",
+  "file": "head.go",
+  "old": "\tif unknown := h.Needs &^ known; unknown != 0 {",
+  "new": "\tif unknown := uint64(0); unknown != 0 {",
+  "pkg": ".",
+  "run": "^Test(HeadNeeds|HeadRejectsGarbage|AKnownBitIsHeldToItsField)$"
+ },
+ {
+  "name": "head: Needs bit 63 is not checked",
+  "file": "head.go",
+  "old": "h.Needs &^ known; unknown",
+  "new": "h.Needs &^ known &^ (1 << 63); unknown",
+  "pkg": ".",
+  "run": "^Test(HeadNeeds|AKnownBitIsHeldToItsField|HeadDifferentialWithKnownBits)$"
+ },
+ {
+  "name": "finish: the lost commit is dropped when Serve is well",
+  "file": "pkg/mount/errno.go",
+  "old": "\treturn errors.Join(serveErr, err)",
+  "new": "\t_ = err\n\treturn serveErr",
+  "pkg": "./pkg/mount",
+  "run": "^TestFinish",
+  "tags": "fuse"
  }
 ]
