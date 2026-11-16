@@ -76,7 +76,16 @@ func (h Head) marshal() []byte {
 	return w.b
 }
 
-func unmarshalHead(b []byte) (Head, error) {
+// unmarshalHead reads a Head as this build does: it knows the bits of knownNeeds.
+func unmarshalHead(b []byte) (Head, error) { return parseHead(b, knownNeeds) }
+
+// parseHead reads a Head as a build that knows the Needs bits of known. In this order: a
+// fixed field that is short or not in its shortest form is ErrCorrupt; a Needs bit that
+// is not in known is ErrNeeds, whatever the Tail holds; then the Tail must be whole and
+// in order, and hold the field of every bit of Needs, or it is ErrCorrupt. A table of
+// known bits, where the build holds a constant, is how the day a bit is defined is
+// exercised before it comes.
+func parseHead(b []byte, known uint64) (Head, error) {
 	r := reader{b: b}
 	h := Head{Seq: r.uvarint()}
 	copy(h.Root[:], r.raw(32))
@@ -88,7 +97,7 @@ func unmarshalHead(b []byte) (Head, error) {
 	if r.err != nil {
 		return Head{}, r.err
 	}
-	if unknown := h.Needs &^ knownNeeds; unknown != 0 {
+	if unknown := h.Needs &^ known; unknown != 0 {
 		return Head{}, fmt.Errorf("%w: bits %#x", ErrNeeds, unknown)
 	}
 	if err := checkTail(r.b, h.Needs); err != nil {
