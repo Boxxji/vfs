@@ -105,9 +105,11 @@ the Head compare-and-swap is the only mutation.
   answered EINTR is an error to a C caller, a read answered EINTR reaches the caller
   as EIO, close is not restarted, a restarted O_EXCL create would meet its own file.
   Every handler therefore runs on `context.WithoutCancel(ctx)` (`TestEveryHandlerOutlivesItsRequest`
-  reads the source for it). The cost is that a stalled store stalls its callers and a
-  SIGKILL does not free them until it resumes; deadlines are the next change
-  (SPECIFICATION section 11 has the numbers). The details are in `pkg/mount/errno.go`;
+  reads the source for it). The cost, a known limit: store requests have no deadlines, so
+  a stalled store stalls its callers and SIGKILL frees none of read, stat, readdir,
+  create, mkdir, unlink, truncate, write or fsync (the kernel keeps a request the daemon
+  holds), and the daemon holds 128 KiB for each abandoned request (1,600 reads: 225 MB;
+  3,000 lookups: 386 MB). Deadlines on the store are the next change; SPECIFICATION 11. The details are in `pkg/mount/errno.go`;
   `TestFUSEInterruptsAreNotErrors` hammers the mount with signals.
 * A moved Volume is `vfs reseal --backend NEW --round N [--from OLD]` after copying its
   objects; it can be repeated at a higher round, and `--from` can be left out
