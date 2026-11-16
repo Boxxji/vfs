@@ -182,6 +182,19 @@ Linux host, and they are part of releasing:
 > `./sqlitecheck.test -test.count=1`, with `s3` of `tools/ci/s3server.sh` on `PATH`. Every
 > round passes. `TestFUSEInterruptsAreNotErrors` fails only for a call that failed, never
 > for how long the host took.
+>
+> Put `TMPDIR` (and `GOTMPDIR`) on a tmpfs, `/dev/shm` for one. Measured: `sqlitecheck` built
+> with `CGO_ENABLED=0` hung for more than 250 s with `TMPDIR` on an ordinary disk of an amd64
+> host, and passed in 4 to 5 s with it on `/dev/shm`. The cause is not found; until it is, a
+> run that is slow on a disk is not a failure of the Volume, and a release run uses tmpfs.
+
+The recorded Cipher object of `pin_test.go` pins what a later build of the library reads
+(`TestTheCipherOpensAGoldenObject`) and the structure that a build of the past needs to read
+what a later library writes: the length and id of the key, the version line and the type of
+the recipient stanza (`TestTheCipherSealsTheStructureOfTheGoldenObject`). It does not run
+the build of the past. Before a release that raises the version of `luxfi/age`, open a Volume
+that the last release wrote with the new build, and a Volume that the new build wrote with the
+last release.
 
 What the mount does that needs no kernel is gated: the commits, the interrupts
 (no request is answered `EINTR`, checked by a test of the source and by calling every
@@ -323,8 +336,9 @@ Plain statements of fact; each is its own change.
   a caller's deadline ends its own call, and a `Stat` waited 2.0 s behind the stalled
   commit). There are no deadlines of the library's own, no retry policy of its own,
   and no circuit breaker. The S3 backend's SDK retries a failing request about ten
-  times, out of sight: an unreachable endpoint took about 31 s to fail, and the mount
-  flushes at its end with no deadline, so an unmount can take that long.
+  times, out of sight: an unreachable endpoint took about 31 s to fail. The mount flushes
+  at its end with a deadline of 3 s (`TestFinishDoesNotWaitForAStalledCommitForever`): past
+  it, the daemon says that the last commit did not finish and exits non-zero.
 * A commit per `close(2)` on the mount: a file costs a Head, its shards and a pack
   (2.0 to 4.9 objects through the mount, above); group commit is not built. The node cache
   and journal are not built either: reads and writes go to the store, `Fsync` costs a

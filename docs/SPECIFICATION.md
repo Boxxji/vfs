@@ -18,6 +18,14 @@ other tests read back.
   is that encoding of its zigzag form (`(n << 1) ^ (n >> 63)`). A byte string is a
   varint length and then the bytes. A decoder MUST reject a truncated item and MUST
   reject bytes left over after the last item of a record.
+* **An integer is in its shortest form**, and a value is as wide as its field and no
+  wider. An encoding whose last byte is zero after a first byte that continues (`80 00`
+  for 0) is another spelling of a number that has one, and a decoder MUST reject it; so
+  it MUST reject one that does not fit 64 bits. A field of a fixed width (the mode and
+  the length of an extent are 32 bits, a node's level is 8) is rejected, not truncated,
+  when its value is wider. Without this one record has many byte strings, and a hash of
+  the bytes (a shard's ref, a Head's seal) names one of them. A writer never writes
+  another form, so a Volume that has one was not written by a conformant writer.
 * Integers inside a key, and in the fence header, are big-endian and fixed width.
 * A hash is BLAKE3 with a 32-byte output unless said otherwise.
 * A Volume lives in one place: a prefix of a bucket of an object store, or a
@@ -109,14 +117,25 @@ the rules for one are these.
   must keep reaches. A tool that finds a key of another shape, under `meta/` or `pack/`
   or anywhere else, reports it and leaves it.
 * **Naming.** An extension object lives at `ext/<name>/<rest>`. `<name>` is 1 to 32
-  bytes of `a-z`, `0-9` and `-` and names the extension. `<rest>` is the BLAKE3 hash of
-  the caller's key, in 64 lower case hex digits, whatever the key is: the extension's own
-  name for an object (a workflow, a snapshot) is bytes of its choosing and is never part of
-  the key in the store. So every extension key is one segment of one length: none is a
-  prefix of another, the alphabet is the grammar of section 2 and no store holds it
-  differently from another, and the whole key is at most 101 bytes. An extension that must
-  enumerate its objects keeps an index object of its own, as it keeps any other state;
-  `List` shows hashes. Nothing but an extension defined this way uses `ext/`.
+  bytes of `a-z`, `0-9` and `-` and names the extension. `<rest>` is 64 lower case hex
+  digits of a hash that is keyed from the Volume, whatever the caller's key is:
+  `BLAKE3` keyed with `K = DeriveKey("hanzoai/vfs extension names", Head.Seed)` (32 bytes)
+  over `len(<name>)` as a uvarint, then `<name>`, then the caller's key. The extension's
+  own name for an object (a workflow, a snapshot) is bytes of its choosing and is never
+  part of the key in the store. The store sees every name, and `Head.Seed` is secret to
+  the Volume (5.1), so the store cannot confirm a guess at a key by hashing it, and the
+  same key in two Volumes, or under two extensions, is two names: nothing in the name
+  says that two Volumes share a workflow. The name is framed by its length, so no way of
+  splitting a string into a name and a key gives another's. Every extension key is one
+  segment of one length: none is a prefix of another, the alphabet is the grammar of
+  section 2 and no store holds it differently from another, and the whole key is at most
+  101 bytes. An extension that must enumerate its objects keeps an index object of its
+  own, as it keeps any other state; `List` shows hashes. Nothing but an extension defined
+  this way uses `ext/`. A Volume's `Seed` is not rewritten (5.1), so a name is stable for
+  the life of the Volume and moves with it (5.4).
+* **Reserved names.** `snapshots`, `links` and `base` are the names of the features of
+  5.1, and an extension MUST NOT take them for any other use: a feature keeps its objects
+  under its own name. The reference implementation refuses them.
 * **Sealing.** An extension object is a sealed frame (4.2) whose context has the kind
   `ext` and the fields: the 16-byte Volume id, the extension's `<name>` as bytes, and
   `<rest>` as bytes. It is bound to the Volume (it moves with it, as shards do, and
@@ -144,7 +163,7 @@ the rules for one are these.
 
 The reference implementation has `GetExt` and `PutExt` for them. The first user is the
 trace store of `docs/prefetch.md` (S6), one object per workflow key at
-`ext/trace/<hash of the workflow key>`.
+`ext/trace/<keyed hash of the workflow key>`.
 
 ## 4. Sealing
 
@@ -183,7 +202,8 @@ is the first 8 bytes of the hash of the public recipient, in hex. Its integrity 
 on the secrecy of the identity, not of the recipient: the plaintext carries a final
 32-byte tag, the BLAKE3 keyed hash of everything before it under a key derived from
 the secret identity (`DeriveKey("hanzoai/vfs seal tag", identity string)`), and `Open`
-refuses an object whose tag does not verify. A party that holds only the public
+refuses an object whose tag does not verify. All 32 bytes are compared: a tag that is
+right in its first 16 bytes and wrong after them is refused. A party that holds only the public
 recipient can encrypt to the Volume but cannot make an object the Volume accepts.
 Everything that can open an object can also seal one. (informative)
 
@@ -225,8 +245,9 @@ resealing the Head (5.4).
 The Head is the root of everything a reader may see: it names the metadata tree, so
 the tree it names is exactly the Volume at the instant it was written. Its plaintext
 is, in order: `Seq` (uvarint), `Root` (32 bytes), `Next` (uvarint), `ID` (16 bytes), `Seed` (32
-bytes), `Journal` (uvarint), `Needs` (uvarint), and then the fields a later build appends
-(none today). It is sealed (4.2) and placed in a fence record.
+bytes), `Journal` (uvarint), `Needs` (uvarint), and then the Tail: the fields of later
+builds (none today), each `[tag: uvarint][length: uvarint][value]`, with tags strictly
+increasing. It is sealed (4.2) and placed in a fence record.
 
 * `Seq` numbers commit attempts. A writer takes the next number for every attempt,
   including one whose reply was lost, so no two Heads a Volume writes share a `Seq`; it
@@ -236,31 +257,45 @@ bytes), `Journal` (uvarint), `Needs` (uvarint), and then the fields a later buil
 * `ID` names the Volume. A new Volume draws it at random.
 * `Seed` draws the Volume's chunking table (section 7.2) and keys the boundaries of
   the metadata tree (section 6.3). A new Volume draws it at random. It is as secret as
-  the Volume: it is what a party who chooses file names does not know.
+  the Volume: it is what a party who chooses file names does not know. It never changes: a
+  commit and a reseal (5.4) write it back as it was.
 * `Journal` is the highest sequence of the node journal (`docs/journal.md`) whose effects
   the Head includes: what the store holds of it, as the journal's `Published`. It is 0
   when there is no journal. A writer that rewrites the Head and does not publish carries it
   unchanged.
-* `Needs` is a set of feature bits, 0 today. A reader MUST refuse a Head whose `Needs` has a
-  bit it does not know, and change nothing (`ErrNeeds`). A writer sets a bit only for a
-  feature it implements. This is how a change that every writer, or every collector, must
-  honour reaches the Volume without a flag day: it sets a bit, and appends the fields it
-  needs after `Needs`, and a build that lacks the feature refuses instead of damaging
-  the Volume.
-* What follows `Needs` is the fields of later builds. A reader that knows every bit set in
-  `Needs` MUST ignore those bytes, and a writer that rewrites the Head MUST write them back
-  unchanged. A field that can be ignored (a hint, a counter nothing depends on) is
-  appended without a bit and never forces a flag day.
+* `Needs` is a set of feature bits, 0 today. Bit N says that the field of the Tail with tag N
+  is there and must be understood. A reader MUST refuse a Head whose `Needs` has a bit it
+  does not know, and change nothing (`ErrNeeds`). A writer sets a bit only for a feature it
+  implements, and writes the field of that tag with it. This is how a change that every
+  writer, or every collector, must honour reaches the Volume without a flag day: it sets a
+  bit, appends the field, and a build that lacks the feature refuses instead of damaging the
+  Volume. A reader that knows every bit set MUST also refuse a Head that lacks the field of
+  a bit it sets (`ErrCorrupt`): a bit that nothing backs is a Head that was not written by
+  a writer of the feature. Tags 64 and above have no bit and are never needed.
+* The Tail is the fields of later builds, and its form is checked by every reader, whether
+  it knows a field or not: every field whole (the tag, the length, and `length` bytes of
+  value), tags strictly increasing (so no tag twice, and one order of the fields), at most
+  256 fields, and nothing after the last. A reader MUST reject a Tail that is not that
+  (`ErrCorrupt`). It does not look inside a value: what a field holds is its feature's. A
+  reader MUST skip a field whose tag it does not know, and a writer that rewrites the Head
+  MUST write every field back unchanged, byte for byte and in order, including the fields
+  it skipped. A field whose bit is not set is ignorable (a hint, a counter nothing depends
+  on): it is carried, and never forces a flag day.
+* **Reserved tags and bits.** Tag and bit 1 are `snapshots`, 2 are `links` and 3 are `base`
+  (the table below); tag and bit 0 are not assigned. A reserved bit is unusable until the
+  encoding of its field is written in this text: an implementation MUST NOT set a bit, and
+  MUST NOT write a field of a tag, whose encoding is not in this text. A build that sets
+  `Needs` bit 3 with a field of its own invention writes a Head that another build, which
+  was given the encoding, cannot read, and was not a conformant writer.
 
-The bits below are decided and RESERVED: no build sets one yet, and each is named so that
-two changes do not take the same bit. Each, when set, appends the fields its section says
-after `Needs`.
+The bits below are decided and RESERVED: they have names and no encoding, no build sets one,
+and each is named so that two changes do not take the same bit or tag.
 
-| Bit | Name | Set when |
+| Bit and tag | Name | Set when |
 |---|---|---|
-| 0 | `snapshots` | the Volume has retained roots, stored as extension objects (3.1), that a collector must keep: a collector that does not know the bit would delete what they reach, so a build that does not know it refuses the Volume |
-| 1 | `links` | inodes carry link counts that every unlink must adjust (6.1): a writer that does not keep them would leave them wrong |
-| 2 | `base` | chunks are read through a base layer shared with other Volumes (11.1): a field after `Needs` names the layer, and a shared read key opens its chunks |
+| 1 | `snapshots` | the Volume has retained roots, stored as extension objects (3.1), that a collector must keep: a collector that does not know the bit would delete what they reach, so a build that does not know it refuses the Volume |
+| 2 | `links` | inodes carry link counts that every unlink must adjust (6.1): a writer that does not keep them would leave them wrong |
+| 3 | `base` | chunks are read through a base layer shared with other Volumes (11.1): the field names the layer, and a shared read key opens its chunks |
 
 A reader MUST bound its read of `head` (the reference implementation accepts at most
 64 KiB).
@@ -348,9 +383,10 @@ root shard that the Head names MUST open at the new place under the Volume id th
 carries and MUST hold the root directory (inode 1). That refuses a copy that lacks its
 objects, a Head of another Volume, and an object of another kind that a writer of the store
 put where the Head goes. A reseal MAY also be asked for the full check (`--verify`): every
-shard the Head reaches opens, and every pack that a chunk record names is present and long
-enough to hold it. The check reads no chunk; a chunk is checked against its hash when a
-file is read.
+shard the Head reaches opens, every pack that a chunk record names is present and long
+enough to hold it, and every chunk that an extent names has a record in the chunk table. The
+check reads no chunk and does not follow a chunk record into the pack's bytes: a chunk is
+checked against its hash when a file is read.
 
 The payload is opened in one of three ways, tried in this order:
 
@@ -389,7 +425,7 @@ root directory is inode 1. Inode numbers are assigned in increasing order from
 no `/` and no NUL, and is not `.` or `..`.
 
 An inode's fields: tag 1 mode (uvarint, a 32-bit value, below), 2 size in bytes
-(uvarint), 3 mtime, 4 atime, 5 ctime (varint, nanoseconds since the Unix epoch). Tags 1 to 5 MUST be present. A reader MUST check the fields it
+(uvarint), 3 mtime, 4 atime, 5 ctime (varint, nanoseconds since the Unix epoch). Tags 1 to 5 MUST be present. The length of an extent (the table above) and the type bits of a directory entry are 32-bit values too (section 1). A reader MUST check the fields it
 knows, MUST reject tags that are not strictly ascending, MUST keep the bytes of fields
 it does not know and write them back unchanged when it rewrites the inode, and MUST
 NOT fail on them. A new attribute is a new tag. A new kind of record is a new first
@@ -424,7 +460,7 @@ the field's back.
 
 ### 6.2 Shards and nodes
 
-A node is `[level: uvarint][count: uvarint]` and then `count` pairs of byte strings
+A node is `[level: uvarint][count: uvarint]` (the level is at most 255, as 6.3 hashes it as one byte) and then `count` pairs of byte strings
 `(key, value)`, with `count` at least 1. Level 0 is a leaf: its pairs are records. At a
 higher level each pair is the first key of a child and the child's ref (32 bytes), and
 the child is at level one below. A shard is a node, sealed (4.2); its ref is the hash of
@@ -579,14 +615,15 @@ reference implementation (all in the repository root unless a package is named):
 | Property | Tests |
 |---|---|
 | every byte of the layout | `TestSpecContexts`, `TestSpecFrameAndTag`, `TestSpecHead`, `TestSpecFenceRecord`, `TestSpecRecords`, `TestSpecNodeAndBoundary`, `TestSpecChunker`, `TestSpecExtension` (each rebuilds the bytes from this text and compares), `TestObjectKeysAreTheSpecShapes`, `TestFenceTokenIsSixteenBytes`, `TestTheSizesOfTheText`, and `TestTheCipherOpensAGoldenObject`, which holds the default Cipher's format to an object that the library produced once |
-| the Head: its fields, the journal sequence, the bits, what a later build appends | `TestHeadRejectsGarbage`, `TestHeadNeeds`, `TestTheHeadHasRoomForTheJournalSequence`, `TestHeadFieldsSurviveACommit`, `TestHeadOfALaterBuildIsRefusedByEveryDoor` |
+| the Head: its fields, the journal sequence, the bits, the tagged Tail and what a later build appends | `TestHeadRejectsGarbage`, `TestHeadNeeds`, `TestHeadTailRules`, `TestNeededFieldsMustBePresent`, `TestTailSurvivesAnOrdinaryWriter`, `TestHeadMatrix`, `TestHeadParserFuzz`, `TestTheHeadHasRoomForTheJournalSequence`, `TestHeadFieldsSurviveACommit`, `TestHeadOfALaterBuildIsRefusedByEveryDoor` |
 | objects are written once; crash at any point leaves the last commit | `TestSigkill` (six kill points, every run), `TestFailureAtEveryWrite`, `TestLostAcknowledgementOfHead`, `TestKillOverRealServer` |
 | fence: one winner, older Round refused, takeover loses nothing, lost acknowledgements | `pkg/fence` tests, `TestFenceRefusesOlderRound`, `TestAttachNeedsAHigherRound`, `TestTakeoverLosesNoAcknowledgedCommit`, `TestRacingClaims`, `TestSameRoundRace`, `TestAttachLostAckIsNotStale`, `TestAttachAfterALostClaimNeedsAHigherRound`, `TestRoundMaxIsRefused`, `TestHeadSeqNeverRepeats` |
-| store contract, the key grammar, listing by string prefix with sizes and times | `internal/storetest` conformance suite, run on every backend (the memory store, the directory, an S3 protocol server and the real server); `TestRealServerCAS`, `TestRealServerRaceStress`, `TestValidKey` |
-| extension objects: one behaviour on every store, sealed to Volume, name and key, left alone | `TestExtensionObjectsOnEveryStore`, `TestExtensionObjectsAndTheFence`, `TestExtensionObjectsRaced`, `TestExtensionObjectIsSealedToItsVolumeNameAndKey`, `TestStrayKeysAreIgnoredAndKept` |
+| store contract, the key grammar, listing by string prefix with sizes and times | `internal/storetest` conformance suite, run on every backend (the memory store, the directory, an S3 protocol server and the real server); `TestRealServerCAS`, `TestRealServerRaceStress`, `TestValidKey`, `TestListTimesAndPages` |
+| extension objects: one behaviour on every store, sealed to Volume, name and key, left alone | `TestExtensionObjectsOnEveryStore`, `TestExtensionObjectsAndTheFence`, `TestExtensionObjectsRaced`, `TestExtensionObjectIsSealedToItsVolumeNameAndKey`, `TestExtensionReplaceRetriesAndGivesUp`, `TestStrayKeysAreIgnoredAndKept`, `TestExtNameRevealsTheKey`, `TestExtNamesAndCollisions`, `TestExtMasquerade`, `TestExtReadIsBounded`, `TestStrayKeys` |
 | sealing context, exact and injective | `TestSealedToItsContext`, `TestHeadContextIsExact`, `TestContextsDoNotCollide`, `TestSwappedHeadIsRefused`, `TestChunkHashIsChecked` |
-| the Cipher: checked at configuration and at every Seal; unforgeable with the recipient alone | `TestIdentityCipherIsRefused`, `TestCipherThatStopsSealingIsCaughtAtEverySeal`, `TestSealCatchesAHeaderedFallback`, `TestNoPublicTagKeyVerifies`, `TestShortForgedPlaintextIsRefusedNotPanicked`, `TestContextIsComparedWhole`, `TestRecipientAloneCannotForge`, `TestWrongKeyFailsClosed`, `TestTamperedObjectsAreRefused`, `TestSwappedChunkIsRefused` |
-| places and moving a Volume | `TestPlaceSpellings`, `TestPlaceStringsAreOneSpelling`, `TestPlacesAreRefusedNotCleaned`, `TestRedact`, `TestRedactionCases`, `TestRedactionLeaks`, `TestRedactionOfEverySpelling`, `TestErrorsDoNotEchoACredentialInAPrefix`, `TestResealMovesAVolume`, `TestResealWrongFromChangesNothing`, `TestResealCrashAtTheWrite`, `TestResealIsRepeatable`, `TestResealWithoutThePlace`, `TestResealOfALiveVolume`, `TestResealRacesAWriter`, `TestResealRefusesTheLastRound`, `TestResealRefusesAGarbageHead`, `TestResealChecksTheCopy`, `TestResealWrongKeyChangesNothing`, `TestResealWithoutAPlaceRefusesAnotherKindOfObject`, `TestPartialCopyFailsClosed`, `TestCLIReseal` (`cmd/vfs`), `TestFileOpenCreatesNothing` (`pkg/backend/file`) |
+| the Cipher: checked at configuration and at every Seal; unforgeable with the recipient alone | `TestIdentityCipherIsRefused`, `TestCipherThatStopsSealingIsCaughtAtEverySeal`, `TestSealCatchesAHeaderedFallback`, `TestNoPublicTagKeyVerifies`, `TestShortForgedPlaintextIsRefusedNotPanicked`, `TestContextIsComparedWhole`, `TestRecipientAloneCannotForge`, `TestEveryByteOfTheTagIsChecked`, `TestWrongKeyFailsClosed`, `TestTamperedObjectsAreRefused`, `TestSwappedChunkIsRefused` |
+| places and moving a Volume | `TestPlaceSpellings`, `TestPlaceStringsAreOneSpelling`, `TestPlacesAreRefusedNotCleaned`, `TestRedact`, `TestRedactionCases`, `TestRedactionLeaks`, `TestRedactionOfEverySpelling`, `TestErrorsDoNotEchoACredentialInAPrefix`, `TestResealMovesAVolume`, `TestResealWrongFromChangesNothing`, `TestResealCrashAtTheWrite`, `TestResealIsRepeatable`, `TestResealWithoutThePlace`, `TestResealOfALiveVolume`, `TestResealRacesAWriter`, `TestResealRefusesTheLastRound`, `TestResealRefusesAGarbageHead`, `TestResealChecksTheCopy`, `TestResealWrongKeyChangesNothing`, `TestResealWithoutAPlaceRefusesAnotherKindOfObject`, `TestPartialCopyFailsClosed`, `TestVerifyFindsAnExtentWithoutItsChunk`, `TestVerifyChecksTheFurthestChunk`, `TestResealOfShortCopies`, `TestResealRepeatsAndForeigners`, `TestCLIReseal` (`cmd/vfs`), `TestFileOpenCreatesNothing` (`pkg/backend/file`) |
+| shortest-form integers and fields no wider than their width | `TestHeadNonMinimalUvarint`, `TestIntegersAreInTheirShortestFormAndFitTheirField` |
 | keyed tree boundaries | `TestGroundNamesDoNotBloatTheTree`, `TestBoundariesDependOnTheSeed` |
 | rotation | `TestRotation` |
 | records and the tagged inode | `TestInodeRecordIsExtensible`, `TestHeadRejectsGarbage` |
@@ -595,7 +632,7 @@ reference implementation (all in the repository root unless a package is named):
 | holes and truncation, byte for byte against a plain model | `TestSparseExact`, `TestSparseRandom`, `TestSparsePetabyte`, `TestModelFuzz` |
 | bounded reads | `TestHeadBound`, `TestShardBound`, `TestBackendBodyIsBounded`, `TestReadIsBounded` |
 | prefixes | `TestValidPrefix`, `TestPrefixConfinement` |
-| durability and interrupts on a mount | `TestFUSEFsyncSurvivesKill`, `TestFUSEInterruptsAreNotErrors`, `TestFsyncWaitsForItsCommit`, `TestCloseWaitsForItsCommit`, `TestReadWaitsForItsData`, `TestLookupIsNotAnsweredEINTR`, `TestAttrIsNotAnsweredEINTR`, `TestReaddirIsNotAnsweredEINTR`, `TestMkdirIsNotAnsweredEINTR`, `TestRemoveIsNotAnsweredEINTR`, `TestCreateIsNotAnsweredEINTR`, `TestEveryHandlerOutlivesItsRequest`, `TestFsyncCallersShareTwoCommits`, `TestFsyncJoinsAFlightThatCoversIt`, `TestKilledColdLookupIsFreedAfterTheGrace`, `TestErrnoMapping`, `TestFinishCommitsWhatTheMountWrote` (the flush at the end of a mount), `TestFUSETermStopsAMountInUse`, `TestFUSEReadsExistingFilesOverS3`, and `TestFUSESQLite` (`internal/sqlitecheck`) on a Linux kernel |
+| durability and interrupts on a mount | `TestFUSEFsyncSurvivesKill`, `TestFUSEInterruptsAreNotErrors`, `TestFsyncWaitsForItsCommit`, `TestCloseWaitsForItsCommit`, `TestReadWaitsForItsData`, `TestLookupIsNotAnsweredEINTR`, `TestAttrIsNotAnsweredEINTR`, `TestReaddirIsNotAnsweredEINTR`, `TestMkdirIsNotAnsweredEINTR`, `TestRemoveIsNotAnsweredEINTR`, `TestCreateIsNotAnsweredEINTR`, `TestEveryHandlerOutlivesItsRequest`, `TestFsyncCallersShareTwoCommits`, `TestFsyncJoinsAFlightThatCoversIt`, `TestKilledColdLookupIsFreedAfterTheGrace`, `TestErrnoMapping`, `TestFinishCommitsWhatTheMountWrote` (the flush at the end of a mount), `TestFinishDoesNotWaitForAStalledCommitForever`, `TestFUSETermStopsAMountInUse`, `TestFUSEReadsExistingFilesOverS3`, and `TestFUSESQLite` (`internal/sqlitecheck`) on a Linux kernel |
 | full-size randomised runs | `TestSparseExact`, `TestSparseRandom`, `TestSparseCanonicalRuns`, `TestSparseTinyBounds` (the `sparse` gate, not `-short`) |
 
 ## 11. Not specified, and known limits
@@ -623,7 +660,12 @@ rules, and a change to a rule is a change to this text.
   Age is measured from the object's modification time as the store reports it in `List`
   (`Object.Modified`), against the store's own time, which a collector learns by writing an
   object of its own and listing it: never against a writer's clock or the collector's. The
-  reference interface lists keys, sizes and modification times.
+  reference interface lists keys, sizes and modification times. A store's time has a
+  granularity: S3 reports `LastModified` in whole seconds, truncated down, so an object
+  written at 12.9 s is listed at 12 s and looks up to a second older than it is, and the
+  grace below MUST be that long and one second more: an age that looks a second older than
+  it is deletes an object of a commit that has not landed. The conformance suite checks that every store it runs on
+  lists a time within 2 s of the write.
 * **Grace.** Longer than the longest a commit can take, which is the longest time between
   the first object of a commit being written and the Head naming it. That is bounded only
   when every store request has a deadline (11.2), so no collector is built before them: a
@@ -631,10 +673,17 @@ rules, and a change to a rule is a change to this text.
   twice their sum. A collector marks from the Head it reads after the listing, not before,
   so a commit that landed during the listing is marked.
 * **Volumes never share chunks**, and stay so until a build that sets the `base` bit (5.1)
-  exists: a base layer shared across Volumes needs a field after `Needs` that names it and
+  exists: a base layer shared across Volumes needs the field of its tag (5.1) that names it and
   a read key that opens its chunks for every Volume that uses it, and a collector of one
   Volume never deletes what another can reach. Until then every object of a Volume is
   reachable from that Volume's roots alone, and a prefix does not nest in another (2).
+* **`Open` pins nothing.** A reader holds the Head it read and nothing in the store says so,
+  so the grace is the only thing that keeps its shards and packs: a reader that stays on
+  one Head for longer than the grace, while the Volume goes on committing, finds that a shard
+  it needs is gone, and sees `ErrCorrupt` (the object is absent and the Head says it must be
+  there), not a "stale" error that a reader could tell from damage. A reader that lives
+  long re-reads the Head before the grace ends; a collector's grace is therefore a limit on
+  how long a Head may be held, and it is published with the collector.
 
 ### 11.2 Known limits
 
@@ -671,8 +720,11 @@ Known limits of the reference implementation. None changes the layout.
   (`fusermount3 -u -z`), because a mount in use refuses a plain unmount.
 * **SIGTERM** commits what the daemon holds, asks for the unmount, and if something holds the
   mount open says so, asks again for 5 s and then detaches it lazily and ends within 3 s
-  more. What a holder writes after the commit is lost with the connection. A supervisor that
-  escalates to SIGKILL, or kills at once, loses what was not committed.
+  more. What a holder writes after the commit is lost with the connection. The commit at
+  the end has a deadline of 3 s: when the store has stopped answering, the daemon says that
+  the last commit did not finish and what it held is lost, and exits non-zero; it does not
+  wait for the Volume's lock, which a stalled commit keeps. A supervisor that escalates to
+  SIGKILL, or kills at once, loses what was not committed.
 * **Every close is a full commit** (section 8): about 143 files per second and 5.7 objects
   per file in `cp -r` and in a checkout through the mount, against about 0.04 objects per
   file for the same files written and committed once.

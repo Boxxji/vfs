@@ -1117,8 +1117,8 @@
  {
   "name": "mount: the end of a mount does not flush",
   "file": "pkg/mount/errno.go",
-  "old": "if err := vol.Flush(context.Background()); err != nil && serveErr == nil {",
-  "new": "if err := error(nil); err != nil && serveErr == nil {",
+  "old": "\t\tdone <- vol.Flush(context.Background())",
+  "new": "\t\tdone <- nil",
   "pkg": "./pkg/mount",
   "run": "^TestFinish",
   "tags": "fuse"
@@ -1458,14 +1458,6 @@
   "run": "^TestExtensionObjectsAndTheFence$"
  },
  {
-  "name": "extension: key not hashed",
-  "file": "ext.go",
-  "old": "\tsum := blake3.Sum256(key)\n\treturn hex.EncodeToString(sum[:])",
-  "new": "\t_ = blake3.Sum256(key)\n\treturn hex.EncodeToString(append(key, make([]byte, 32)...)[:32])",
-  "pkg": ".",
-  "run": "^(TestExtensionObjectsOnEveryStore|TestSpecExtension)$"
- },
- {
   "name": "file backend: a stray key is hidden",
   "file": "pkg/backend/file/file.go",
   "old": "if rel == \".lock\" || rel == \".tmp\" {",
@@ -1506,5 +1498,354 @@
   "pkg": "./pkg/mount",
   "run": "^TestLookupIsNotAnsweredEINTR$|^TestKilledColdLookupIsFreedAfterTheGrace$",
   "tags": "fuse"
+ },
+ {
+  "name": "ext name: the hash is not keyed",
+  "file": "ext.go",
+  "old": "\th, _ := blake3.NewKeyed(k[:])\n",
+  "new": "\th := blake3.New()\n",
+  "pkg": ".",
+  "run": "^Test(SpecExtension|ExtNameRevealsTheKey|ExtNamesAndCollisions|ExtensionObjectsOnEveryStore)$"
+ },
+ {
+  "name": "ext name: the seed is not mixed in",
+  "file": "ext.go",
+  "old": "blake3.DeriveKey(\"hanzoai/vfs extension names\", seed[:], k[:])",
+  "new": "blake3.DeriveKey(\"hanzoai/vfs extension names\", seed[:0], k[:])",
+  "pkg": ".",
+  "run": "^Test(SpecExtension|ExtNameRevealsTheKey|ExtNamesAndCollisions|ExtensionObjectsOnEveryStore)$"
+ },
+ {
+  "name": "ext name: the context string is another",
+  "file": "ext.go",
+  "old": "blake3.DeriveKey(\"hanzoai/vfs extension names\"",
+  "new": "blake3.DeriveKey(\"hanzoai/vfs extension name\"",
+  "pkg": ".",
+  "run": "^Test(SpecExtension|ExtNameRevealsTheKey|ExtNamesAndCollisions|ExtensionObjectsOnEveryStore)$"
+ },
+ {
+  "name": "ext name: the name is not length-framed",
+  "file": "ext.go",
+  "old": "binary.AppendUvarint(nil, uint64(len(name)))",
+  "new": "binary.AppendUvarint(nil, 0)",
+  "pkg": ".",
+  "run": "^Test(SpecExtension|ExtNameRevealsTheKey|ExtNamesAndCollisions|ExtensionObjectsOnEveryStore)$"
+ },
+ {
+  "name": "ext name: the name is not in the hash",
+  "file": "ext.go",
+  "old": "\t_, _ = h.WriteString(name)\n",
+  "new": "",
+  "pkg": ".",
+  "run": "^Test(SpecExtension|ExtNameRevealsTheKey|ExtNamesAndCollisions|ExtensionObjectsOnEveryStore)$"
+ },
+ {
+  "name": "ext name: the key is not in the hash",
+  "file": "ext.go",
+  "old": "\t_, _ = h.Write(key)\n",
+  "new": "",
+  "pkg": ".",
+  "run": "^Test(SpecExtension|ExtNameRevealsTheKey|ExtNamesAndCollisions|ExtensionObjectsOnEveryStore)$"
+ },
+ {
+  "name": "ext name: a reserved name is accepted",
+  "file": "ext.go",
+  "old": "\tif reservedExt[name] {",
+  "new": "\tif reservedExt[name] && false {",
+  "pkg": ".",
+  "run": "^Test(SpecExtension|ExtNameRevealsTheKey|ExtNamesAndCollisions|ExtensionObjectsOnEveryStore)$"
+ },
+ {
+  "name": "ext name: one reserved name is missing",
+  "file": "ext.go",
+  "old": "var reservedExt = map[string]bool{\"snapshots\": true, \"links\": true, \"base\": true}",
+  "new": "var reservedExt = map[string]bool{\"snapshots\": true, \"links\": true}",
+  "pkg": ".",
+  "run": "^Test(SpecExtension|ExtNameRevealsTheKey|ExtNamesAndCollisions|ExtensionObjectsOnEveryStore)$"
+ },
+ {
+  "name": "ext: PutExt tries once to replace",
+  "file": "ext.go",
+  "old": "extReplace = 8",
+  "new": "extReplace = 1",
+  "pkg": ".",
+  "run": "^TestExtensionReplaceRetriesAndGivesUp$"
+ },
+ {
+  "name": "ext: PutExt tries without end",
+  "file": "ext.go",
+  "old": "extReplace = 8",
+  "new": "extReplace = 80",
+  "pkg": ".",
+  "run": "^TestExtensionReplaceRetriesAndGivesUp$"
+ },
+ {
+  "name": "tail: a duplicate tag is accepted",
+  "file": "head.go",
+  "old": "case n > 0 && tag <= last:",
+  "new": "case n > 0 && tag < last:",
+  "pkg": ".",
+  "run": "^Test(HeadRejectsGarbage|HeadNeeds|HeadTailRules|NeededFieldsMustBePresent|TheHeadHasRoomForTheJournalSequence|HeadFieldsSurviveACommit|HeadOfALaterBuildIsRefusedByEveryDoor|SpecHead|TailSurvivesAnOrdinaryWriter|HeadMatrix|HeadParserFuzz|HeadNonMinimalUvarint)$"
+ },
+ {
+  "name": "tail: the order of tags is not checked",
+  "file": "head.go",
+  "old": "case n > 0 && tag <= last:",
+  "new": "case false:",
+  "pkg": ".",
+  "run": "^Test(HeadRejectsGarbage|HeadNeeds|HeadTailRules|NeededFieldsMustBePresent|TheHeadHasRoomForTheJournalSequence|HeadFieldsSurviveACommit|HeadOfALaterBuildIsRefusedByEveryDoor|SpecHead|TailSurvivesAnOrdinaryWriter|HeadMatrix|HeadParserFuzz|HeadNonMinimalUvarint)$"
+ },
+ {
+  "name": "tail: a field that is not whole is accepted",
+  "file": "head.go",
+  "old": "case r.err != nil:\n\t\t\treturn fmt.Errorf(\"%w: a field of the Head's tail is not whole\", ErrCorrupt)",
+  "new": "case false:\n\t\t\treturn nil",
+  "pkg": ".",
+  "run": "^Test(HeadRejectsGarbage|HeadNeeds|HeadTailRules|NeededFieldsMustBePresent|TheHeadHasRoomForTheJournalSequence|HeadFieldsSurviveACommit|HeadOfALaterBuildIsRefusedByEveryDoor|SpecHead|TailSurvivesAnOrdinaryWriter|HeadMatrix|HeadParserFuzz|HeadNonMinimalUvarint)$"
+ },
+ {
+  "name": "tail: the count is not bounded",
+  "file": "head.go",
+  "old": "case n >= maxTailFields:",
+  "new": "case false:",
+  "pkg": ".",
+  "run": "^Test(HeadRejectsGarbage|HeadNeeds|HeadTailRules|NeededFieldsMustBePresent|TheHeadHasRoomForTheJournalSequence|HeadFieldsSurviveACommit|HeadOfALaterBuildIsRefusedByEveryDoor|SpecHead|TailSurvivesAnOrdinaryWriter|HeadMatrix|HeadParserFuzz|HeadNonMinimalUvarint)$"
+ },
+ {
+  "name": "tail: the count bound is off by one",
+  "file": "head.go",
+  "old": "case n >= maxTailFields:",
+  "new": "case n > maxTailFields:",
+  "pkg": ".",
+  "run": "^Test(HeadRejectsGarbage|HeadNeeds|HeadTailRules|NeededFieldsMustBePresent|TheHeadHasRoomForTheJournalSequence|HeadFieldsSurviveACommit|HeadOfALaterBuildIsRefusedByEveryDoor|SpecHead|TailSurvivesAnOrdinaryWriter|HeadMatrix|HeadParserFuzz|HeadNonMinimalUvarint)$"
+ },
+ {
+  "name": "tail: a needed field is not required",
+  "file": "head.go",
+  "old": "\tif missing := needs &^ seen; missing != 0 {",
+  "new": "\tif missing := needs &^ seen; missing != 0 && false {",
+  "pkg": ".",
+  "run": "^Test(HeadRejectsGarbage|HeadNeeds|HeadTailRules|NeededFieldsMustBePresent|TheHeadHasRoomForTheJournalSequence|HeadFieldsSurviveACommit|HeadOfALaterBuildIsRefusedByEveryDoor|SpecHead|TailSurvivesAnOrdinaryWriter|HeadMatrix|HeadParserFuzz|HeadNonMinimalUvarint)$"
+ },
+ {
+  "name": "tail: the bit of a tag is not recorded",
+  "file": "head.go",
+  "old": "\t\t\tseen |= 1 << tag\n",
+  "new": "",
+  "pkg": ".",
+  "run": "^Test(HeadRejectsGarbage|HeadNeeds|HeadTailRules|NeededFieldsMustBePresent|TheHeadHasRoomForTheJournalSequence|HeadFieldsSurviveACommit|HeadOfALaterBuildIsRefusedByEveryDoor|SpecHead|TailSurvivesAnOrdinaryWriter|HeadMatrix|HeadParserFuzz|HeadNonMinimalUvarint)$"
+ },
+ {
+  "name": "tail: the bit of tag 63 is not recorded",
+  "file": "head.go",
+  "old": "\t\tif tag < 64 {",
+  "new": "\t\tif tag < 63 {",
+  "pkg": ".",
+  "run": "^Test(HeadRejectsGarbage|HeadNeeds|HeadTailRules|NeededFieldsMustBePresent|TheHeadHasRoomForTheJournalSequence|HeadFieldsSurviveACommit|HeadOfALaterBuildIsRefusedByEveryDoor|SpecHead|TailSurvivesAnOrdinaryWriter|HeadMatrix|HeadParserFuzz|HeadNonMinimalUvarint)$"
+ },
+ {
+  "name": "tail: a tag past 63 sets a bit",
+  "file": "head.go",
+  "old": "\t\tif tag < 64 {\n\t\t\tseen |= 1 << tag\n\t\t}",
+  "new": "\t\tseen |= 1 << (tag & 63)",
+  "pkg": ".",
+  "run": "^Test(HeadRejectsGarbage|HeadNeeds|HeadTailRules|NeededFieldsMustBePresent|TheHeadHasRoomForTheJournalSequence|HeadFieldsSurviveACommit|HeadOfALaterBuildIsRefusedByEveryDoor|SpecHead|TailSurvivesAnOrdinaryWriter|HeadMatrix|HeadParserFuzz|HeadNonMinimalUvarint)$"
+ },
+ {
+  "name": "tail: not checked at all",
+  "file": "head.go",
+  "old": "\tif err := checkTail(r.b, h.Needs); err != nil {\n\t\treturn Head{}, err\n\t}\n",
+  "new": "",
+  "pkg": ".",
+  "run": "^Test(HeadRejectsGarbage|HeadNeeds|HeadTailRules|NeededFieldsMustBePresent|TheHeadHasRoomForTheJournalSequence|HeadFieldsSurviveACommit|HeadOfALaterBuildIsRefusedByEveryDoor|SpecHead|TailSurvivesAnOrdinaryWriter|HeadMatrix|HeadParserFuzz|HeadNonMinimalUvarint)$"
+ },
+ {
+  "name": "tail: checked before the needs",
+  "file": "head.go",
+  "old": "\tif unknown := h.Needs &^ knownNeeds; unknown != 0 {\n\t\treturn Head{}, fmt.Errorf(\"%w: bits %#x\", ErrNeeds, unknown)\n\t}\n\tif err := checkTail(r.b, h.Needs); err != nil {\n\t\treturn Head{}, err\n\t}",
+  "new": "\tif err := checkTail(r.b, h.Needs); err != nil {\n\t\treturn Head{}, err\n\t}\n\tif unknown := h.Needs &^ knownNeeds; unknown != 0 {\n\t\treturn Head{}, fmt.Errorf(\"%w: bits %#x\", ErrNeeds, unknown)\n\t}",
+  "pkg": ".",
+  "run": "^Test(HeadRejectsGarbage|HeadNeeds|HeadTailRules|NeededFieldsMustBePresent|TheHeadHasRoomForTheJournalSequence|HeadFieldsSurviveACommit|HeadOfALaterBuildIsRefusedByEveryDoor|SpecHead|TailSurvivesAnOrdinaryWriter|HeadMatrix|HeadParserFuzz|HeadNonMinimalUvarint)$"
+ },
+ {
+  "name": "canon: a non-minimal uvarint is accepted",
+  "file": "codec.go",
+  "old": "\tx, n := binary.Uvarint(r.b)\n\tif n <= 0 || n > 1 && r.b[n-1] == 0 {",
+  "new": "\tx, n := binary.Uvarint(r.b)\n\tif n <= 0 {",
+  "pkg": ".",
+  "run": "^Test(HeadNonMinimalUvarint|IntegersAreInTheirShortestFormAndFitTheirField)$"
+ },
+ {
+  "name": "canon: a non-minimal varint is accepted",
+  "file": "codec.go",
+  "old": "\tx, n := binary.Varint(r.b)\n\tif n <= 0 || n > 1 && r.b[n-1] == 0 {",
+  "new": "\tx, n := binary.Varint(r.b)\n\tif n <= 0 {",
+  "pkg": ".",
+  "run": "^Test(HeadNonMinimalUvarint|IntegersAreInTheirShortestFormAndFitTheirField)$"
+ },
+ {
+  "name": "canon: a 32-bit field takes a wider value",
+  "file": "codec.go",
+  "old": "\tif x > math.MaxUint32 {",
+  "new": "\tif x > math.MaxUint32 && false {",
+  "pkg": ".",
+  "run": "^Test(HeadNonMinimalUvarint|IntegersAreInTheirShortestFormAndFitTheirField)$"
+ },
+ {
+  "name": "canon: a 32-bit field is off by one",
+  "file": "codec.go",
+  "old": "\tif x > math.MaxUint32 {",
+  "new": "\tif x >= math.MaxUint32 {",
+  "pkg": ".",
+  "run": "^Test(HeadNonMinimalUvarint|IntegersAreInTheirShortestFormAndFitTheirField)$"
+ },
+ {
+  "name": "canon: the mode of an inode is truncated",
+  "file": "record.go",
+  "old": "in.Mode = fs.FileMode(v.uvarint32())",
+  "new": "in.Mode = fs.FileMode(v.uvarint())",
+  "pkg": ".",
+  "run": "^Test(HeadNonMinimalUvarint|IntegersAreInTheirShortestFormAndFitTheirField)$"
+ },
+ {
+  "name": "canon: the mode of an entry is truncated",
+  "file": "record.go",
+  "old": "id, mode := InodeID(r.uvarint()), fs.FileMode(r.uvarint32())",
+  "new": "id, mode := InodeID(r.uvarint()), fs.FileMode(r.uvarint())",
+  "pkg": ".",
+  "run": "^Test(HeadNonMinimalUvarint|IntegersAreInTheirShortestFormAndFitTheirField)$"
+ },
+ {
+  "name": "canon: the length of an extent is truncated",
+  "file": "record.go",
+  "old": "e.n = r.uvarint32()",
+  "new": "e.n = uint32(r.uvarint())",
+  "pkg": ".",
+  "run": "^Test(HeadNonMinimalUvarint|IntegersAreInTheirShortestFormAndFitTheirField)$"
+ },
+ {
+  "name": "canon: a node level past 255 is accepted",
+  "file": "shard.go",
+  "old": "\tif level > 255 {",
+  "new": "\tif level > 255 && false {",
+  "pkg": ".",
+  "run": "^Test(HeadNonMinimalUvarint|IntegersAreInTheirShortestFormAndFitTheirField)$"
+ },
+ {
+  "name": "seal: the tag compare reads 16 bytes",
+  "file": "cipher.go",
+  "old": "subtle.ConstantTimeCompare(got, tag(c.tags[keyID], body)) != 1",
+  "new": "subtle.ConstantTimeCompare(got[:16], tag(c.tags[keyID], body)[:16]) != 1",
+  "pkg": ".",
+  "run": "^TestEveryByteOfTheTagIsChecked$"
+ },
+ {
+  "name": "seal: the tag compare skips the last byte",
+  "file": "cipher.go",
+  "old": "subtle.ConstantTimeCompare(got, tag(c.tags[keyID], body)) != 1",
+  "new": "subtle.ConstantTimeCompare(got[:31], tag(c.tags[keyID], body)[:31]) != 1",
+  "pkg": ".",
+  "run": "^TestEveryByteOfTheTagIsChecked$"
+ },
+ {
+  "name": "seal: the tag compare skips the first byte",
+  "file": "cipher.go",
+  "old": "subtle.ConstantTimeCompare(got, tag(c.tags[keyID], body)) != 1",
+  "new": "subtle.ConstantTimeCompare(got[1:], tag(c.tags[keyID], body)[1:]) != 1",
+  "pkg": ".",
+  "run": "^TestEveryByteOfTheTagIsChecked$"
+ },
+ {
+  "name": "finish: the deadline is an hour",
+  "file": "pkg/mount/errno.go",
+  "old": "case <-time.After(finishGrace):",
+  "new": "case <-time.After(time.Hour):",
+  "pkg": "./pkg/mount",
+  "run": "^TestFinishDoesNotWaitForAStalledCommitForever$",
+  "tags": "fuse"
+ },
+ {
+  "name": "finish: the lost commit is not reported",
+  "file": "pkg/mount/errno.go",
+  "old": "\t\terr = fmt.Errorf(\"the last commit did not finish in %s: what the mount held and had not committed is lost\", finishGrace)",
+  "new": "\t\terr = nil",
+  "pkg": "./pkg/mount",
+  "run": "^TestFinishDoesNotWaitForAStalledCommitForever$",
+  "tags": "fuse"
+ },
+ {
+  "name": "finish: the serve error is replaced",
+  "file": "pkg/mount/errno.go",
+  "old": "\tif err != nil && serveErr == nil {\n\t\treturn err\n\t}\n\treturn serveErr",
+  "new": "\tif err != nil {\n\t\treturn err\n\t}\n\treturn serveErr",
+  "pkg": "./pkg/mount",
+  "run": "^TestFinish",
+  "tags": "fuse"
+ },
+ {
+  "name": "finish: the flush error is lost",
+  "file": "pkg/mount/errno.go",
+  "old": "\tif err != nil && serveErr == nil {\n\t\treturn err\n\t}\n\treturn serveErr",
+  "new": "\t_ = err\n\treturn serveErr",
+  "pkg": "./pkg/mount",
+  "run": "^TestFinish",
+  "tags": "fuse"
+ },
+ {
+  "name": "finish: Stats is called outside the deadline",
+  "file": "pkg/mount/errno.go",
+  "old": "\tdone := make(chan error, 1)\n\tgo func() {\n\t\tif vol.Stats().Round == 0 {\n\t\t\tdone <- nil\n\t\t\treturn\n\t\t}\n\t\tdone <- vol.Flush(context.Background())\n\t}()",
+  "new": "\tdone := make(chan error, 1)\n\tro := vol.Stats().Round == 0\n\tgo func() {\n\t\tif ro {\n\t\t\tdone <- nil\n\t\t\treturn\n\t\t}\n\t\tdone <- vol.Flush(context.Background())\n\t}()",
+  "pkg": "./pkg/mount",
+  "run": "^TestFinish",
+  "tags": "fuse"
+ },
+ {
+  "name": "list: file times 10 minutes late",
+  "file": "pkg/backend/file/file.go",
+  "old": "Modified: info.ModTime()}",
+  "new": "Modified: info.ModTime().Add(600e9)}",
+  "pkg": "./pkg/backend/file",
+  "run": "^Test"
+ },
+ {
+  "name": "list: file times 30 minutes early",
+  "file": "pkg/backend/file/file.go",
+  "old": "Modified: info.ModTime()}",
+  "new": "Modified: info.ModTime().Add(-1800e9)}",
+  "pkg": "./pkg/backend/file",
+  "run": "^Test"
+ },
+ {
+  "name": "list: file times 3 seconds late",
+  "file": "pkg/backend/file/file.go",
+  "old": "Modified: info.ModTime()}",
+  "new": "Modified: info.ModTime().Add(3e9)}",
+  "pkg": "./pkg/backend/file",
+  "run": "^Test"
+ },
+ {
+  "name": "list: mem times 10 minutes late",
+  "file": "internal/storetest/mem.go",
+  "old": "Modified: m.mod[k]}",
+  "new": "Modified: m.mod[k].Add(600e9)}",
+  "pkg": "./internal/storetest",
+  "run": "^Test"
+ },
+ {
+  "name": "list: s3 times 10 minutes late",
+  "file": "pkg/backend/s3/s3.go",
+  "old": "Modified: obj.LastModified}",
+  "new": "Modified: obj.LastModified.Add(600e9)}",
+  "pkg": "./pkg/backend/s3",
+  "run": "^Test"
+ },
+ {
+  "name": "verify: an extent without its chunk passes",
+  "file": "verify.go",
+  "old": "\t\t\tif _, ok, err = v.t.get(ctx, v.root, keyChunk(e.id)); err == nil && !ok {",
+  "new": "\t\t\tif _, ok, err = v.t.get(ctx, v.root, keyChunk(e.id)); err == nil && !ok && false {",
+  "pkg": ".",
+  "run": "^TestVerifyFindsAnExtentWithoutItsChunk$"
  }
 ]

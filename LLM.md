@@ -115,20 +115,30 @@ the Head compare-and-swap is the only mutation of the tree.
   freed. The details are in `pkg/mount/errno.go`; `TestFUSEInterruptsAreNotErrors`
   hammers the mount with signals.
 * SIGTERM on a mount commits, asks for the unmount, detaches a mount in use after 5 s
-  and returns within 3 s more (`pkg/mount/stop.go`). A supervisor needs a lazy unmount
+  and returns within 3 s more (`pkg/mount/stop.go`); the commit at the end (`finish`) has a
+  deadline of 3 s and exits non-zero saying what was not committed. A supervisor needs a lazy unmount
   at teardown and a store-latency watchdog (SPECIFICATION 11.2).
 * A moved Volume is `vfs reseal --backend NEW --round N [--from OLD]` after copying its
   objects; it can be repeated at a higher round, and `--from` can be left out
   (SPECIFICATION 5.4 says what that trusts). The copy is always checked (the root shard
-  opens and holds the root directory); `--verify` reads every shard and checks every pack.
+  opens and holds the root directory); `--verify` reads every shard and checks every pack and
+  that every extent's chunk is in the chunk table.
 * The layout bytes are pinned by `spec_test.go`, which rebuilds each from the
   specification text, and by `pin_test.go` (key shapes, sizes, a fixture of the default
   Cipher). Change a byte and one fails; change the text and the test together.
-* The Head ends in `Journal` (the journal sequence it includes, 0 for none) and `Needs`
-  (feature bits, 0 for none; none is defined). A build refuses a Head with a bit it does
-  not know (`ErrNeeds`) and carries the bytes after `Needs` unchanged. `snapshots`,
-  `links` and `base` are reserved bits (SPECIFICATION 5.1): a change that must be honoured
-  by every writer or every collector sets one.
+* The Head ends in `Journal` (the journal sequence it includes, 0 for none), `Needs`
+  (feature bits, 0 for none; none is defined) and the Tail: fields `[tag][length][value]`
+  with strictly increasing tags. A build refuses a Head with a bit it does not know
+  (`ErrNeeds`), refuses one whose Tail is not whole, in order and at most 256 fields or that
+  lacks the field of a bit it sets (`ErrCorrupt`), skips the fields it does not know and
+  carries every one unchanged. `snapshots`, `links` and `base` are the reserved tags and bits
+  1 to 3 (SPECIFICATION 5.1), with no encoding: a bit is unusable until its encoding is in the
+  text, and no build sets one. A change that must be honoured by every writer or every
+  collector sets its bit and writes its field.
+* Integers are in their shortest form and a value wider than its field is refused, not
+  truncated (SPECIFICATION 1): `reader.uvarint`, `uvarint32`, `varint`.
+* An extension object's name is `ext/<name>/<hash keyed from Head.Seed>` (SPECIFICATION 3.1):
+  `Volume.ExtKey` gives it. `snapshots`, `links` and `base` are not extension names.
 * Objects beside the tree (a trace store, say) are extension objects (SPECIFICATION 3.1):
   `Volume.PutExt` and `GetExt` keep one at `ext/<name>/<BLAKE3 of the key, hex>`, sealed
   to the Volume, the name and the key, outside the Round's fence. Readers ignore keys
