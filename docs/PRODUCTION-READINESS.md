@@ -145,7 +145,7 @@ Mount tests run only with `-tags fuse`, from a child process that serves the mou
 while the test acts as its client; a process that mounts a Volume and also opens a
 file on that mount deadlocks. The real-server tests need an `s3` binary on `PATH`.
 
-CI (`hanzo.yml`, `.github/workflows/cicd.yml`) runs fifteen gates as jobs, three at a
+CI (`hanzo.yml`, `.github/workflows/cicd.yml`) runs sixteen gates as jobs, three at a
 time, each under five minutes from a cold Go cache. Three at a time because the gates
 share the machine's capacity, and more at once only made each slower. The gates are:
 `check` (build, vet and gofmt of what does not need the SQLite engine, and a vet of
@@ -157,7 +157,8 @@ holes at full size; `sqlite`, the only gate that builds the SQLite engine; `real
 `realserver-cas`, `realserver-cas-large` and `realserver-kill`, against the real Hanzo
 S3 server (the conditional-write race on a real server is split in two because its
 objects are the slowest thing CI does), which fail if a test they exist for did not
-pass; the measurements `scale-a`, `scale-b` and `scale-c`; and `fuzz`.
+pass; the measurements `scale-a`, `scale-b` and `scale-c`; `fuzz`; and `fuzz-head`, the
+Head parser fuzzed for 20 s against a decoder written from the text.
 The server is the published image of release v1.0.41, pinned by digest and read with
 `crane`, which needs no docker: building it from its source costs five minutes of a
 cold job, and every real-server test passes against the release as it did against a
@@ -325,7 +326,7 @@ content, a chunk-reuse rule, the commit order, the fence comparison, a missing
 conditional header, an unchecked hash, a Cipher check removed, a hole that stores
 chunks, a Get that reads past its bound, and so on), copies the repository, applies
 the change, and runs the test that should catch it. `tools/mutate/mutations.json` is
-the list; `go run ./tools/mutate -j 5` runs it. The list has 105 mutations and every one is killed by a test (a run takes about fifteen minutes on four workers).
+the list; `go run ./tools/mutate -j 5` runs it. The list has 252 mutations and every one is killed by a test (a run takes about fifteen minutes on four workers).
 
 ## Not yet built
 

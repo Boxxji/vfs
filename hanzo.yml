@@ -23,7 +23,8 @@
 #   realserver-kill  a writer killed at random moments, against the real server
 #   scale-a/b/c      the measurements: 100,000 files, a million inodes, sync cost, the
 #                    object budget, a petabyte, amplification (-short skips them)
-#   fuzz             the model run over many more seeds, and the Head parser against the reference decoder
+#   fuzz             the model run over many more seeds
+#   fuzz-head        the Head parser against a decoder written from the text, coverage-guided
 #
 # The realserver gates fail if a test they exist for did not pass: a skip is a
 # failure there, never a pass. The real server is the published image of release
@@ -128,7 +129,6 @@ test:
   - name: scale-c
     run: go test -count=1 -timeout 4m -run '^(TestObjectsPerThousandSmallFiles|TestAppendWithFsyncAmplification|TestColdReadAmplification|TestSmallWritesAmplifyMemory|TestFlushLatency|TestSustainedWriteWithFsync|TestTinyExtentsCost|TestPetabyteScattered)$' .
   - name: fuzz
-    run: |
-      set -euo pipefail
-      go test -count=1 -timeout 4m -run '^TestModelFuzzMany$' .
-      go test -count=1 -timeout 2m -run '^$' -fuzz '^FuzzHead$' -fuzztime 20s .
+    run: go test -count=1 -timeout 4m -run '^TestModelFuzzMany$' .
+  - name: fuzz-head
+    run: go test -count=1 -timeout 3m -run '^$' -fuzz '^FuzzHead$' -fuzztime 20s .

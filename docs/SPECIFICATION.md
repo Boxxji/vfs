@@ -288,7 +288,7 @@ increasing. It is sealed (4.2) and placed in a fence record.
   it skipped. A field whose bit is not set is ignorable (a hint, a counter nothing depends
   on): it is carried, and never forces a flag day.
 * **Reserved tags and bits.** Tag and bit 1 are `snapshots`, 2 are `links` and 3 are `base`
-  (the table below); tag and bit 0 are not assigned. A reserved bit is unusable until the
+  (the table below) and 63 is an escape; tag and bit 0 are not assigned. A reserved bit is unusable until the
   encoding of its field is written in this text: an implementation MUST NOT set a bit, and
   MUST NOT write a field of a tag, whose encoding is not in this text. A build that sets
   `Needs` bit 3 with a field of its own invention writes a Head that another build, which

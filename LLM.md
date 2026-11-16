@@ -266,11 +266,11 @@ go run ./tools/mutate                            # every mutation must be killed
 The real-server tests start `s3 server` (own-storage mode) in a temp dir with a
 throwaway key pair, race 16 and 128 writers on one version, run whole Volumes on it,
 and kill a writer at random moments. CI (`hanzo.yml`, `.github/workflows/cicd.yml`)
-runs fifteen gates as parallel jobs, each under five minutes: `check`, `unit`, `race`,
+runs sixteen gates as parallel jobs, each under five minutes: `check`, `unit`, `race`,
 `model`, `sparse`, `sparse-tiny`, `sqlite` (the only gate that builds the SQLite engine),
 `realserver`, `realserver-cas`, `realserver-cas-large` and `realserver-kill` (against the
 published image of the server, pinned by digest, which fail if a test did not pass),
-`scale-a`, `scale-b`, `scale-c` and `fuzz`. The tests on a kernel mount are not gates: they
+`scale-a`, `scale-b`, `scale-c`, `fuzz` and `fuzz-head`. The tests on a kernel mount are not gates: they
 assert what Linux's FUSE does, which a kernel of another kind answers differently
 (`docs/PRODUCTION-READINESS.md` has the release checklist). They run on a Linux
 kernel before a release, with `go test -tags fuse -count=1 ./pkg/mount ./internal/sqlitecheck`, or with

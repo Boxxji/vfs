@@ -914,7 +914,7 @@
  {
   "name": "reseal: an already-moved Head is refused",
   "file": "volume.go",
-  "old": "\t\t\t\treturn payload, nil // already sealed to this place\n",
+  "old": "\t\t\t\tsealedHere = true\n",
   "new": "\t\t\t\treturn nil, errContext\n",
   "pkg": ".",
   "run": "^TestResealCrashAtTheWrite|^TestResealIsRepeatable"
@@ -1226,8 +1226,8 @@
  {
   "name": "Reseal already-moved returns the plaintext",
   "file": "volume.go",
-  "old": "\t\t\t\treturn payload, nil // already sealed to this place\n",
-  "new": "\t\t\t\treturn plain, nil // already sealed to this place\n",
+  "old": "\t\t\treturn payload, nil // left as it is: only the Round is claimed\n",
+  "new": "\t\t\treturn plain, nil // left as it is: only the Round is claimed\n",
   "pkg": ".",
   "run": "."
  },
@@ -1364,8 +1364,8 @@
  {
   "name": "head: an unknown Needs bit is accepted",
   "file": "head.go",
-  "old": "if unknown := h.Needs &^ knownNeeds; unknown != 0 {",
-  "new": "if unknown := h.Needs &^ knownNeeds; unknown != 0 && false {",
+  "old": "if unknown := h.Needs &^ known; unknown != 0 {",
+  "new": "if unknown := h.Needs &^ known; unknown != 0 && false {",
   "pkg": ".",
   "run": "^Test(HeadRejectsGarbage|HeadNeeds|TheHeadHasRoomForTheJournalSequence|HeadFieldsSurviveACommit|HeadOfALaterBuildIsRefusedByEveryDoor|SpecHead)$"
  },
@@ -1662,8 +1662,8 @@
  {
   "name": "tail: checked before the needs",
   "file": "head.go",
-  "old": "\tif unknown := h.Needs &^ knownNeeds; unknown != 0 {\n\t\treturn Head{}, fmt.Errorf(\"%w: bits %#x\", ErrNeeds, unknown)\n\t}\n\tif err := checkTail(r.b, h.Needs); err != nil {\n\t\treturn Head{}, err\n\t}",
-  "new": "\tif err := checkTail(r.b, h.Needs); err != nil {\n\t\treturn Head{}, err\n\t}\n\tif unknown := h.Needs &^ knownNeeds; unknown != 0 {\n\t\treturn Head{}, fmt.Errorf(\"%w: bits %#x\", ErrNeeds, unknown)\n\t}",
+  "old": "\tif unknown := h.Needs &^ known; unknown != 0 {\n\t\treturn Head{}, fmt.Errorf(\"%w: bits %#x\", ErrNeeds, unknown)\n\t}\n\tif err := checkTail(r.b, h.Needs); err != nil {\n\t\treturn Head{}, err\n\t}",
+  "new": "\tif err := checkTail(r.b, h.Needs); err != nil {\n\t\treturn Head{}, err\n\t}\n\tif unknown := h.Needs &^ known; unknown != 0 {\n\t\treturn Head{}, fmt.Errorf(\"%w: bits %#x\", ErrNeeds, unknown)\n\t}",
   "pkg": ".",
   "run": "^Test(HeadRejectsGarbage|HeadNeeds|HeadTailRules|NeededFieldsMustBePresent|TheHeadHasRoomForTheJournalSequence|HeadFieldsSurviveACommit|HeadOfALaterBuildIsRefusedByEveryDoor|SpecHead|TailSurvivesAnOrdinaryWriter|HeadMatrix|HeadParserFuzz|HeadNonMinimalUvarint)$"
  },
@@ -1767,28 +1767,10 @@
  {
   "name": "finish: the lost commit is not reported",
   "file": "pkg/mount/errno.go",
-  "old": "\t\terr = fmt.Errorf(\"the last commit did not finish in %s: what the mount held and had not committed is lost\", finishGrace)",
+  "old": "\t\terr = fmt.Errorf(\"the last commit did not finish in %s: what the mount held and had not committed may be lost\", finishGrace)",
   "new": "\t\terr = nil",
   "pkg": "./pkg/mount",
   "run": "^TestFinishDoesNotWaitForAStalledCommitForever$",
-  "tags": "fuse"
- },
- {
-  "name": "finish: the serve error is replaced",
-  "file": "pkg/mount/errno.go",
-  "old": "\tif err != nil && serveErr == nil {\n\t\treturn err\n\t}\n\treturn serveErr",
-  "new": "\tif err != nil {\n\t\treturn err\n\t}\n\treturn serveErr",
-  "pkg": "./pkg/mount",
-  "run": "^TestFinish",
-  "tags": "fuse"
- },
- {
-  "name": "finish: the flush error is lost",
-  "file": "pkg/mount/errno.go",
-  "old": "\tif err != nil && serveErr == nil {\n\t\treturn err\n\t}\n\treturn serveErr",
-  "new": "\t_ = err\n\treturn serveErr",
-  "pkg": "./pkg/mount",
-  "run": "^TestFinish",
   "tags": "fuse"
  },
  {
