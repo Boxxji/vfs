@@ -293,6 +293,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer) 
 	}
 
 	var from string
+	var verify bool
 	reseal := &cobra.Command{
 		Use:   "reseal",
 		Short: "Seal the Head of a Volume that was copied to --backend to that place, and claim it at --round",
@@ -300,8 +301,10 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer) 
 copied to another bucket or prefix, reseal makes the copy open there. The old place is
 --from, the URL the Volume was last used at; leave it out if it is not remembered, and the
 Head is opened with the key alone: that trusts the key, and that the Head in the copy is
-the newest one, and it refuses a copy whose root shard is missing. Stop any writer at the
-old place first: reseal fences the copy only. It can be repeated at a higher --round.`,
+the newest one. Either way the copy is checked first and refused if its root shard is
+missing; --verify also reads every shard the Head reaches and checks every pack is there.
+Stop any writer at the old place first: reseal fences the copy only. It can be repeated at
+a higher --round.`,
 		Args: cobra.NoArgs,
 		RunE: func(*cobra.Command, []string) error {
 			if round == 0 {
@@ -312,6 +315,7 @@ old place first: reseal fences the copy only. It can be repeated at a higher --r
 				return err
 			}
 			defer cfg.Backend.Close()
+			cfg.Verify = verify
 			if from != "" {
 				old, err := backend.Open(ctx, from)
 				if err != nil {
@@ -324,6 +328,7 @@ old place first: reseal fences the copy only. It can be repeated at a higher --r
 		},
 	}
 	reseal.Flags().StringVar(&from, "from", "", "the URL the Volume was last used at")
+	reseal.Flags().BoolVar(&verify, "verify", false, "read every shard the Head reaches and check every pack it needs is there")
 
 	mountCmd := &cobra.Command{
 		Use:   "mount <mountpoint>",

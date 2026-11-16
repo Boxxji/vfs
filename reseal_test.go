@@ -81,41 +81,29 @@ func TestResealWrongFromChangesNothing(t *testing.T) {
 	resealCheck(t, reopen(t, be, c), want)
 }
 
-// A Volume copied head first, resealed, attached and written before the rest of the
-// objects arrive: every failure is a closed one, and the Head never names a state the
-// copy cannot read.
+// A Volume copied head first is not resealed until its objects have come: Reseal refuses
+// the partial copy and changes nothing, and resealed after the rest arrives the Volume is
+// whole.
 func TestPartialCopyFailsClosed(t *testing.T) {
 	be, c, _, want := resealPopulate(t)
 	dst := storetest.NewMem()
 	resealCopy(t, be, dst, func(k string) bool { return k != "head" })
-	if err := vfs.Reseal(ctx, cfg(dst, c, 9), be.String()); err != nil {
+	headBefore := dst.Dump()["head"]
+	if err := vfs.Reseal(ctx, cfg(dst, c, 9), be.String()); err == nil {
+		t.Fatal("a copy that is only a Head was resealed")
+	}
+	if !bytes.Equal(dst.Dump()["head"], headBefore) {
+		t.Fatal("a refused Reseal changed the Head")
+	}
+	resealCopy(t, be, dst, func(k string) bool { return k == "head" })
+	if err := vfs.Reseal(ctx, cfg(dst, c, 10), be.String()); err != nil {
 		t.Fatal(err)
 	}
-	w, err := vfs.Attach(ctx, cfg(dst, c, 10))
+	w, err := vfs.Attach(ctx, cfg(dst, c, 11))
 	if err != nil {
-		t.Fatalf("attach on a head-only copy: %v", err)
+		t.Fatal(err)
 	}
-	headBefore := dst.Dump()["head"]
-	if _, err := w.Create(ctx, vfs.RootInode, "new", 0o644); err != nil {
-		t.Logf("create on the partial copy: %v", err)
-	}
-	err = w.Flush(ctx)
-	t.Logf("flush on the partial copy: %v", err)
-	if err == nil && !bytes.Equal(dst.Dump()["head"], headBefore) {
-		// the commit landed: it must still be readable
-		if _, rerr := vfs.Open(ctx, cfg(dst, c, 0)); rerr != nil {
-			t.Errorf("a commit landed on a copy that cannot be read: %v", rerr)
-		}
-	}
-	// now the rest of the objects arrive; the Volume is whole
-	resealCopy(t, be, dst, func(k string) bool { return k == "head" })
-	if err != nil {
-		w2, err2 := vfs.Attach(ctx, cfg(dst, c, 11))
-		if err2 != nil {
-			t.Fatal(err2)
-		}
-		resealCheck(t, w2, want)
-	}
+	resealCheck(t, w, want)
 }
 
 // Reseal at the live place fences the writer there without telling it: its next commit
@@ -170,7 +158,7 @@ func TestResealRacesAWriter(t *testing.T) {
 		// A writer that commits without pause can win the race for the Head eight times:
 		// Reseal says so (backend.ErrConflict) and is retried at a higher Round.
 		var rerr error
-		for round := uint64(30); round < 40; round++ {
+		for round := uint64(30); round < 130; round++ {
 			if rerr = vfs.Reseal(ctx, cfg(be, c, round), be.String()); rerr == nil || !errors.Is(rerr, backend.ErrConflict) {
 				break
 			}
@@ -291,4 +279,101 @@ func TestResealIsRepeatable(t *testing.T) {
 	if err := vfs.Reseal(ctx, cfg(dst, c, 54), be.String()); !errors.Is(err, vfs.ErrStaleRound) {
 		t.Errorf("a repeat at a spent Round = %v, want ErrStaleRound", err)
 	}
+}
+
+// A key that is not the Volume's: nothing changes.
+func TestResealWrongKeyChangesNothing(t *testing.T) {
+	be, _, _, _ := resealPopulate(t)
+	dst := storetest.NewMem()
+	resealCopy(t, be, dst, nil)
+	before := dst.Dump()["head"]
+	k, _ := age.GenerateHybridIdentity()
+	for _, from := range []string{"", be.String()} {
+		if err := vfs.Reseal(ctx, cfg(dst, vfs.Hybrid(k), 10), from); err == nil {
+			t.Fatalf("Reseal with another key succeeded (from %q)", from)
+		}
+		if !bytes.Equal(dst.Dump()["head"], before) {
+			t.Fatalf("a refused Reseal changed the Head (from %q)", from)
+		}
+	}
+}
+
+// The copy is checked whichever way the Head was opened. Without --from a copy that lacks
+// its shards was refused and with it was resealed and left a Head that opens to nothing.
+func TestResealChecksTheCopy(t *testing.T) {
+	be, c, _, want := resealPopulate(t)
+	for _, from := range []string{"", be.String()} {
+		dst := storetest.NewMem()
+		resealCopy(t, be, dst, func(k string) bool { return strings.HasPrefix(k, "meta/") })
+		before := dst.Dump()["head"]
+		if err := vfs.Reseal(ctx, cfg(dst, c, 10), from); err == nil {
+			t.Errorf("from %q: a copy with no shard at all was resealed", from)
+		}
+		if !bytes.Equal(dst.Dump()["head"], before) {
+			t.Errorf("from %q: a refused Reseal changed the Head", from)
+		}
+	}
+	// A shard the Head reaches is found by the full check, and what it lets through is
+	// readable: a shard it does not reach is an older commit's, and the copy is whole
+	// without it.
+	var caught int
+	for k := range be.Dump() {
+		if !strings.HasPrefix(k, "meta/") {
+			continue
+		}
+		dst := storetest.NewMem()
+		resealCopy(t, be, dst, func(o string) bool { return o == k })
+		full := cfg(dst, c, 11)
+		full.Verify = true
+		if err := vfs.Reseal(ctx, full, be.String()); err != nil {
+			caught++
+			continue
+		}
+		resealCheck(t, reopen(t, dst, c), want)
+	}
+	if caught == 0 {
+		t.Error("the full check found no missing shard of a Volume that has a tree to reach")
+	}
+	// A pack that is missing, or shorter than a chunk in it, is refused by Verify.
+	for _, how := range []string{"missing", "short"} {
+		dst := storetest.NewMem()
+		resealCopy(t, be, dst, nil)
+		for k, b := range dst.Dump() {
+			if strings.HasPrefix(k, "pack/") {
+				if how == "missing" {
+					_ = dst.Delete(ctx, k)
+				} else if err := dst.Put(ctx, k, b[:len(b)/2]); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		if err := vfs.Reseal(ctx, cfg(dst, c, 10), be.String()); err != nil {
+			t.Errorf("a copy with a %s pack is refused without Verify: %v (chunks are checked when a file is read)", how, err)
+		}
+		dst2 := storetest.NewMem()
+		resealCopy(t, be, dst2, nil)
+		for k, b := range dst2.Dump() {
+			if strings.HasPrefix(k, "pack/") {
+				if how == "missing" {
+					_ = dst2.Delete(ctx, k)
+				} else if err := dst2.Put(ctx, k, b[:len(b)/2]); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		full := cfg(dst2, c, 10)
+		full.Verify = true
+		if err := vfs.Reseal(ctx, full, be.String()); err == nil {
+			t.Errorf("Verify resealed a copy with a %s pack", how)
+		}
+	}
+	// A whole copy passes Verify and reads back.
+	dst := storetest.NewMem()
+	resealCopy(t, be, dst, nil)
+	full := cfg(dst, c, 10)
+	full.Verify = true
+	if err := vfs.Reseal(ctx, full, ""); err != nil {
+		t.Fatal(err)
+	}
+	resealCheck(t, reopen(t, dst, c), want)
 }

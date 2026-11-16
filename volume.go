@@ -39,6 +39,7 @@ type Config struct {
 	Backend backend.Backend // the Volume's prefix; the Volume owns it and Close closes it
 	Cipher  Cipher          // seals and opens every object
 	Round   uint64          // Attach, Reseal: the Round to claim; must exceed the recorded one, and be above 0
+	Verify  bool            // Reseal: read every shard the Head reaches and check every pack it needs is there, not only the root
 
 	Cache   int64 // bytes of shards and chunks kept decoded; default 256 MiB
 	Dirty   int64 // bytes of unsettled writes (each separate write counts a fixed overhead too) before they are chunked and uploaded; default 64 MiB
@@ -235,10 +236,15 @@ func Attach(ctx context.Context, cfg Config) (*Volume, error) {
 // from may be empty when the old place is not remembered. The Head is then opened
 // with the key alone, whatever place it was sealed to. That trusts the key (only a
 // holder can have written a Head that opens) and that the Head at cfg.Backend is the
-// newest Head of the Volume the caller means: it refuses a Head whose root shard is
-// not at cfg.Backend sealed to the Volume the Head names, which is a copy that is
-// missing objects or a Head of another Volume, but it cannot tell a Head from before
-// the newest commit from the newest, as no one can without the place.
+// newest Head of the Volume the caller means: it cannot tell a Head from before the
+// newest commit from the newest, as no one can without the place.
+//
+// However the Head was opened, the copy is checked before anything is written: the root
+// shard the Head names must open at cfg.Backend sealed to the Volume the Head names and
+// hold the root directory, which refuses a copy that lacks its objects, a Head of another
+// Volume, and an object of another kind that a store writer put where the Head goes.
+// cfg.Verify reads every shard the Head reaches and checks that every pack a chunk is in
+// is there and long enough; chunks are checked when a file is read.
 func Reseal(ctx context.Context, cfg Config, from string) error {
 	cfg, err := cfg.valid()
 	if err != nil {
@@ -249,6 +255,7 @@ func Reseal(ctx context.Context, cfg Config, from string) error {
 	}
 	v := newVolume(cfg)
 	here := cfg.Backend.String()
+	w := newVolume(cfg) // reads the copy: one cache for every attempt, which find mostly the same shards
 	return v.fence.Rewrite(ctx, headKey, cfg.Round, func(payload []byte, recorded uint64) ([]byte, error) {
 		if payload == nil {
 			return nil, fmt.Errorf("vfs: no volume at %s: %w", cfg.Backend, fs.ErrNotExist)
@@ -273,12 +280,11 @@ func Reseal(ctx context.Context, cfg Config, from string) error {
 		if err != nil {
 			return nil, fmt.Errorf("vfs: head: %w", err)
 		}
-		if from == "" {
-			w := newVolume(cfg)
-			w.adopt(h)
-			if _, err := w.t.sh.load(ctx, h.Root); err != nil {
-				return nil, fmt.Errorf("vfs: the Head names a root that %s does not hold: %w", here, err)
-			}
+		// The copy is checked whichever way the Head was opened: a Head sealed to the old
+		// place says nothing about whether the objects it names came along.
+		w.adopt(h)
+		if err := w.checkTree(ctx, cfg.Verify); err != nil {
+			return nil, fmt.Errorf("vfs: the copy at %s is not whole: %w", here, err)
 		}
 		return seal(cfg.Cipher, headAAD(here), plain)
 	})
