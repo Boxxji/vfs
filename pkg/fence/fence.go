@@ -94,7 +94,9 @@ type Store struct {
 const tokenLen = 16
 
 // New builds a Store over a conditional-write backend. max bounds the size of the
-// objects it will read (header and payload).
+// objects it will read and the size of those it will write (header and payload): a
+// record that a reader of this Store would refuse is never written, so a commit that
+// would brick the object fails instead, with ErrTooLarge and nothing changed.
 func New(be Backend, max int64) *Store {
 	s := &Store{be: be, max: max}
 	if _, err := rand.Read(s.token[:]); err != nil {
@@ -123,6 +125,14 @@ func decode(b []byte) (round uint64, payload []byte, err error) {
 	return binary.BigEndian.Uint64(b[m : m+8]), b[m+8+tokenLen:], nil
 }
 
+// fits refuses a record that the Store itself would not read back.
+func (s *Store) fits(record []byte) error {
+	if int64(len(record)) > s.max {
+		return fmt.Errorf("fence: a record of %d bytes is over the bound of %d that every reader holds: %w", len(record), s.max, backend.ErrTooLarge)
+	}
+	return nil
+}
+
 // write conditions a write on the version just read: create-only when the key was
 // absent (version ""), else compare-and-set on that version.
 func (s *Store) write(ctx context.Context, key string, data []byte, v backend.Version) error {
@@ -148,7 +158,11 @@ func (s *Store) read(ctx context.Context, key string) ([]byte, backend.Version, 
 // an object is born: Put would admit round 0 over an existing round-0 object.
 // If key exists the error wraps backend.ErrConflict.
 func (s *Store) Create(ctx context.Context, key string, payload []byte) error {
-	if _, err := s.be.PutIfAbsent(ctx, key, s.encode(0, payload)); err != nil {
+	record := s.encode(0, payload)
+	if err := s.fits(record); err != nil {
+		return fmt.Errorf("fence: create %s: %w", key, err)
+	}
+	if _, err := s.be.PutIfAbsent(ctx, key, record); err != nil {
 		return fmt.Errorf("fence: create %s: %w", key, err)
 	}
 	return nil
@@ -170,6 +184,9 @@ func (s *Store) Put(ctx context.Context, key string, payload []byte, round uint6
 		return fmt.Errorf("fence: nil store")
 	}
 	want := s.encode(round, payload)
+	if err := s.fits(want); err != nil {
+		return fmt.Errorf("fence: put %s: %w", key, err)
+	}
 	var lastErr error
 	for range maxCASAttempts {
 		data, version, err := s.read(ctx, key)
@@ -264,6 +281,9 @@ func (s *Store) Rewrite(ctx context.Context, key string, round uint64, carry fun
 			}
 		}
 		last = s.encode(round, payload)
+		if err := s.fits(last); err != nil {
+			return fmt.Errorf("fence: claim %s: %w", key, err)
+		}
 		if err := s.write(ctx, key, last, version); err != nil {
 			if errors.Is(err, backend.ErrConflict) {
 				lastErr = err

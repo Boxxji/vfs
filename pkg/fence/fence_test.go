@@ -541,3 +541,48 @@ func TestReadIsBounded(t *testing.T) {
 		t.Fatalf("Claim over an object past the bound = %v, want ErrTooLarge", err)
 	}
 }
+
+// TestStoreNeverWritesWhatItWouldNotRead: max bounds the objects a Store reads and the objects it
+// writes. A record at exactly max is written and read; one byte more is refused with ErrTooLarge by
+// Create, Put and Claim alike, before any request, and the object is as it was.
+func TestStoreNeverWritesWhatItWouldNotRead(t *testing.T) {
+	ctx := context.Background()
+	const max = 100
+	room := max - len(magic) - 8 - tokenLen // the largest payload that fits
+	be := newFakeCAS()
+	f := New(be, max)
+	fits, over := bytes.Repeat([]byte{'a'}, room), bytes.Repeat([]byte{'b'}, room+1)
+
+	if err := f.Create(ctx, "o", over); !errors.Is(err, backend.ErrTooLarge) {
+		t.Fatalf("Create of a record one byte over = %v, want ErrTooLarge", err)
+	}
+	if be.writes != 0 {
+		t.Fatalf("a refused Create wrote %d objects", be.writes)
+	}
+	if err := f.Create(ctx, "o", fits); err != nil {
+		t.Fatalf("Create of a record of exactly max: %v", err)
+	}
+	if round, payload := read(t, f, "o"); round != 0 || !bytes.Equal([]byte(payload), fits) {
+		t.Fatal("a record of exactly max does not read back")
+	}
+	writes := be.writes
+
+	if err := f.Put(ctx, "o", over, 1); !errors.Is(err, backend.ErrTooLarge) {
+		t.Fatalf("Put of a record one byte over = %v, want ErrTooLarge", err)
+	}
+	if err := f.Claim(ctx, "o", 2, nil); err != nil {
+		t.Fatalf("Claim of a record of exactly max: %v", err)
+	}
+	if err := f.Rewrite(ctx, "o", 3, func(payload []byte, _ uint64) ([]byte, error) { return over, nil }); !errors.Is(err, backend.ErrTooLarge) {
+		t.Fatalf("Rewrite to a record one byte over = %v, want ErrTooLarge", err)
+	}
+	if be.writes != writes+1 { // the Claim alone
+		t.Fatalf("refused writes changed the object: %d writes, want %d", be.writes, writes+1)
+	}
+	if round, payload := read(t, f, "o"); round != 2 || !bytes.Equal([]byte(payload), fits) {
+		t.Fatalf("the object is at round %d after refused writes, want 2 and the payload it had", round)
+	}
+	if err := f.Put(ctx, "o", fits, 2); err != nil {
+		t.Fatalf("a Put that fits after the refusals: %v", err)
+	}
+}

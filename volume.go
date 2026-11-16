@@ -265,17 +265,21 @@ func Reseal(ctx context.Context, cfg Config, from string) error {
 		}
 		var plain []byte
 		var err error
+		var sealedHere bool // the Head is already sealed to this place
 		if from == "" {
 			plain, err = unsealAny(cfg.Cipher, payload)
 		} else if plain, err = unseal(cfg.Cipher, headAAD(from), payload); errors.Is(err, errContext) {
 			if plain, err = unseal(cfg.Cipher, headAAD(here), payload); err == nil {
-				return payload, nil // already sealed to this place
+				sealedHere = true
+			} else {
+				err = fmt.Errorf("%w (from %s)", errContext, from)
 			}
-			err = fmt.Errorf("%w (from %s)", errContext, from)
 		}
 		if err != nil {
 			return nil, fmt.Errorf("vfs: open head: %w", err)
 		}
+		// Whichever way the Head was opened it is read like any other, so a Head that needs
+		// a feature this build lacks is refused and nothing is claimed.
 		h, err := unmarshalHead(plain)
 		if err != nil {
 			return nil, fmt.Errorf("vfs: head: %w", err)
@@ -285,6 +289,9 @@ func Reseal(ctx context.Context, cfg Config, from string) error {
 		w.adopt(h)
 		if err := w.checkTree(ctx, cfg.Verify); err != nil {
 			return nil, fmt.Errorf("vfs: the copy at %s is not whole: %w", here, err)
+		}
+		if sealedHere {
+			return payload, nil // left as it is: only the Round is claimed
 		}
 		return seal(cfg.Cipher, headAAD(here), plain)
 	})
