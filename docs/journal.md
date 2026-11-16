@@ -202,12 +202,13 @@ damage to a record. Damage to the *header* of a segment is another matter: its m
 are in the same block and need the header's life to be read, so the records of that
 segment are lost, even after a clean `Close` (the tail segment's, too), and `Open`
 succeeds; the warning in `Recovery()` names the segment and its size, and the loss is
-accepted as that of a block of the disk. The warning is raised when the first record
-behind the damaged header names a sequence the store does not hold; a header torn on
-its way into a segment (a new file, or a recycled one whose records are an older
-life's, all published) and one torn in the wipe that frees a segment (all its records
-published) raise none, for the first record behind them is zeros or a sequence the
-store holds. A false alarm remains possible for a directory opened under a Head older
+accepted as that of a block of the disk. The warning is raised when the records
+behind the damaged header, followed through their own headers (each one's length leads
+to the next, whose sequence is the previous plus one), reach a sequence the store does
+not hold; a header torn on its way into a segment (a new file, or a recycled one whose
+records are an older life's, all published) and one torn in the wipe that frees a
+segment (all its records published) raise none, for what is behind them is zeros or
+sequences the store holds. A false alarm remains possible for a directory opened under a Head older
 than the one it was reclaimed under, which `Open` refuses before it gets there. This is a residual of the design, not a bug to be fixed by a caller: a journal that must
 not lose an acknowledged record to media damage in its last rounds has to write a
 mark with every round, and pays a second block flush for it.
