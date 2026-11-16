@@ -1,6 +1,7 @@
 package journal
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"sort"
@@ -58,15 +59,20 @@ func inventory(disk Disk, want *lineage) (all, live []*slot, err error) {
 		switch kindOf(pre[:]) {
 		case headerFree:
 			if !allZero(pre[4:8]) && s.size > dataStart {
-				// Ours, with a header that fails its checksum. If nothing follows
-				// the header block it is a header torn on its way in. If something
-				// does, it is a segment that held records, or one that is being
-				// freed; either way its records cannot be read, and it is said.
+				// Ours, with a header that fails its checksum. If it is a header
+				// torn on its way in or a wipe torn on its way through, no record
+				// that the store lacks is behind it: the file is new, or its
+				// records are an older life's and were all published. What is
+				// behind it names the sequence of its first record in the clear,
+				// and a sequence the store does not hold is a record that is
+				// lost with the header: it is said.
 				rec := make([]byte, min(recordHeader, s.size-dataStart))
 				if _, err := f.ReadAt(rec, dataStart); err != nil {
 					return all, nil, err
 				}
-				s.damaged = !allZero(rec)
+				if len(rec) >= 16 {
+					s.damagedSeq = binary.LittleEndian.Uint64(rec[8:])
+				}
 			}
 			continue
 		case headerForeign:
@@ -175,7 +181,7 @@ func (j *Journal) recover(published uint64) error {
 		// store the records in between are lost; if not, the start of the log was
 		// lost with the tail in a power cut and nothing in it was acknowledged.
 		if through > published {
-			return fmt.Errorf("%w: the store holds %d, the log begins at %d, and records through %d were made durable", ErrCorrupt, published, first, through)
+			return fmt.Errorf("%w: the store holds %d, the first record of the log is %d, and records through %d were made durable", ErrCorrupt, published, first, through)
 		}
 		orphans = append(append([]*slot(nil), chain...), orphans...)
 		chain, last = nil, 0
@@ -206,8 +212,8 @@ func (j *Journal) recover(published uint64) error {
 		}
 	}
 	for _, s := range all {
-		if s.damaged {
-			j.report.Warnings = append(j.report.Warnings, fmt.Sprintf("%s (%d bytes): its header is damaged and something follows it; its records could not be read", s.name, s.size))
+		if s.damagedSeq > published {
+			j.report.Warnings = append(j.report.Warnings, fmt.Sprintf("%s (%d bytes): its header is damaged and its first record names sequence %d, which the store does not hold; its records could not be read", s.name, s.size, s.damagedSeq))
 		}
 	}
 	if n := len(chain); n > 0 {

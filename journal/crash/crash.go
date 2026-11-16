@@ -434,7 +434,7 @@ func image(base map[string][]byte, volatile []pending, v Variant) *Disk {
 			if i < v.N-1 {
 				copy(b[w.off:], w.data)
 			} else if i == v.N-1 {
-				copy(b[w.off:], w.data[:v.Keep])
+				copy(b[w.off:], w.data[:min(v.Keep, len(w.data))])
 			}
 		case Subset:
 			if i < 64 && v.Mask>>i&1 == 1 {
