@@ -27,16 +27,16 @@ lose, and the sequence the store reports is a fact `Open` can rely on.
 
 | Call | Guarantees |
 |---|---|
-| `Open(dir, Options)` | Takes an exclusive lock on the directory (`ErrLocked`), refuses a directory on memory (`ErrVolatile`), recovers the longest valid prefix of the log, makes it durable, and starts a fresh segment for new records. `Options.Published` is the highest sequence the store holds (the Head's journal sequence, 0 for a store with none): it is the truth, and Open **refuses**, and writes nothing, when it does not fit: `ErrMismatch` (the store is behind what the journal reclaimed, behind its first record, or ahead of its last), `ErrLineage` (the directory belongs to another identity), `ErrCorrupt` (records that were made durable are gone or damaged). See [Recovery](#recovery). |
-| `Recovery()` | What Open kept (`First`..`Last`), what a surviving mark proves was durable (`Proven`), the intact segments it dropped because they follow a gap (`Dropped`), and warnings about the file system. Nothing Open discards is silent. |
-| `Discard(dir, Options, first, last)` | The only way to give records up. It removes the journal's records if and only if they are exactly `first` through `last`, and returns `ErrRange`, changing nothing, otherwise. It does not check the lineage: it exists to remove what `Open` refused. |
-| `Append(ctx, p) (seq, err)` | The record is **visible** when it returns, in order, with `seq = previous + 1`. It is **not durable**. Near capacity it slows; at capacity, or when no segment file can be made, it returns `ErrFull` and changes nothing. A payload larger than a segment less 76 bytes gives `ErrTooLarge`. |
+| `Open(dir, Options)` | Takes an exclusive lock on the directory (`ErrLocked`), refuses a directory on memory (`ErrVolatile`), recovers the longest valid prefix of the log, makes it durable, and starts a fresh segment for new records. `Options.Published` is the highest sequence the store holds (the Head's journal sequence, 0 for a store with none): it is the truth, and Open **refuses**, and writes nothing, when it does not fit: `ErrMismatch` (the store is behind what the journal reclaimed, behind its first record, or ahead of its last), `ErrLineage` (the directory belongs to another identity), `ErrCorrupt` (records that were made durable are gone or damaged), `ErrFormat` (a segment file that is not in this layout). See [Recovery](#recovery). |
+| `Recovery()` | What Open kept (`First`..`Last`), what a surviving mark proves was durable (`Proven`), the valid records it gave up (`Dropped`: the intact segments that follow a gap, and the records behind a damaged payload), and warnings about the file system. Damage to a record's header ends the log there without a trace: what follows it cannot be found, because its length is not to be believed. |
+| `Discard(dir, Options, first, last)` | The only way to give records up. It removes the journal's records if and only if they are exactly `first` through `last` (with any copy of a segment inside that range), and returns `ErrRange`, changing nothing, if anything else is there, such as intact segments beyond a hole. It does not check the lineage: it exists to remove what `Open` refused. |
+| `Append(ctx, p) (seq, err)` | The record is **visible** when it returns, in order, with `seq = previous + 1`. It is **not durable**. Near capacity it slows; at capacity, or when no segment file can be made, it returns `ErrFull` and changes nothing. A payload larger than a segment less 80 bytes gives `ErrTooLarge`. |
 | `Sync(ctx, seq)` | Returns `nil` only when record `seq` and every record before it are durable. Concurrent calls share one fsync. A call is released only by an fsync that **began after** its record was written; an fsync already in flight never releases it. After a failed write or sync it returns the error for anything not yet durable, forever. |
 | `Marks()` | The three watermarks. |
 | `Publish(seq)` | Records that the store holds `seq` and everything before it. Monotonic (a lower value is ignored). `seq` must be durable: otherwise `ErrAhead` and nothing changes. Moves the `Due` deadline to the next unpublished record. Does no I/O. |
 | `Replay(fn)` | Calls `fn` for every record after `Published`, in order, with no gaps, then returns. It changes nothing: replaying twice yields the same records. Records of the current run are included. It blocks `Reclaim` while it runs. |
-| `Reclaim()` | Makes the space of fully published segments available again. Does file I/O, so the publisher calls it after `Publish`, off the path of `Append` and `Sync`. Never touches an unpublished record or the tail segment. |
-| `State()` | `Backlog` (bytes acknowledged and unpublished), `Age` (how long the oldest unpublished record has been acknowledged; later writes never reset it, and a restart never lengthens it), `Degraded`, and the `Err` that stopped the journal, if any. |
+| `Reclaim()` | Makes the space of fully published segments available again. Does file I/O, so the publisher calls it after `Publish`, off the path of `Append` and `Sync`. Never touches an unpublished record or the tail segment. A failed write of the floor is made again by the next call; a failed sync of it fails the journal, because a sync that is repeated after a failure can succeed without the data. |
+| `State()` | `Backlog` (bytes acknowledged and unpublished), `Age` (how long the oldest unpublished record has been acknowledged; later writes never reset it; a restart counts a record as acknowledged no later than the restart, so against a clock found behind where it was the age starts again), `Degraded`, and the `Err` that stopped the journal, if any. |
 | `Due(ctx, age)` | A channel closed when the oldest unpublished record has been acknowledged for `age`. One timer set for the exact deadline; no polling. Cancelling `ctx` releases it. Two firings are at least `Options.Retry` apart. It also closes when the journal closes or fails. See below. |
 | `Close()` | Makes everything appended durable, writes the final mark, releases the directory, then stops. |
 
@@ -93,8 +93,11 @@ Acknowledgement times come from the injected `Clock`. In the process they are
 read from the clock's monotonic reading, so a step of the wall clock does not
 change an age. On disk they are wall-clock nanoseconds, because that is all that
 survives a restart; a restarted journal clamps a record that appears to be from
-the future (the clock is behind what it was) to the time of the restart, so a
-restart can shorten the time a record has left but never lengthen it. Times are
+the future (the clock is behind what it was) to the time of the restart. That
+bounds the time a record has left by the whole bound, counted from the restart; it
+does not keep the time it had. A record acknowledged 4.9 s before a restart on a 5 s
+bound has 0.1 s left, and a restart that finds the clock an hour behind gives it 5 s
+again; a clock ahead of where it was gives it less. Times are
 kept to a millisecond: records acknowledged within a millisecond of each other
 share a deadline, which can make `Due` fire up to a millisecond early, never late.
 
@@ -127,6 +130,8 @@ journal keeps accepting writes within its capacity, `Degraded` is true, and
 | OS crash or power loss | A **prefix** of the appended records that contains every record whose `Sync` returned. Which unsynced records survive is up to the disk; they survive as a prefix, never with a gap. |
 | Torn write (partial sector) | The valid prefix before the damaged record. The damaged record and everything after it are dropped, and `Recovery` says what was. |
 | Damage to a record a mark proves durable | `ErrCorrupt`; nothing is dropped. The disk lost something that was acknowledged; the Volume falls back to the store, as for a lost disk. |
+| Damage to a record that no surviving mark covers: any record `Sync` acknowledged in the last sixteen rounds, or the last megabyte, before a kill | Treated as a torn tail, and **dropped although its `Sync` had returned**: the marks are spaced out, so the proof lags. This is a documented residual, the price of not flushing a second block on every round; a clean `Close` leaves no such window. |
+| A directory holding a segment that is not in this layout | `ErrFormat`; nothing is read, reused or deleted. |
 | Permanent disk loss | Nothing. The unpublished tail is lost. The journal cannot know what it lost; the caller knows the last published sequence and must report that an unpublished tail may be missing. A takeover must not report those writes as durable. |
 | A new disk for a volume with history | `Open` on an empty directory with `Published` set to the store's sequence numbers on from it. |
 
@@ -148,14 +153,24 @@ before it writes anything.
 | the log begins after the store, with a proof of a finished sync past it | `ErrCorrupt` |
 | the log begins after the store, with no such proof | the start of the log was lost with the tail in a power cut; nothing in it was acknowledged. Open drops it and reports it |
 | a hole in the log, with intact segments after it, with no proof past the hole | those segments follow a gap and nothing there was acknowledged. Open wipes them (`Recovery().Dropped`) |
+| a segment file that is not in this layout (its first bytes are neither a header of ours, nor zeros, nor a header of ours that was torn) | `ErrFormat`; nothing touched |
 | an empty directory | a fresh journal; numbering continues after `Published` |
 
-A segment file is *live* if its header checksum is valid. Live segments are
+A segment file is *live* if its magic and its header checksum are valid, *free* if
+its magic field is zero (a wiped or never-written header) or is ours with a checksum
+that fails (a header torn by a crash), and *foreign* otherwise: a directory with a
+foreign segment is refused, whatever its size, so that a build that does not know a
+layout cannot reuse or delete a file written in it. A write of a sector reaches the
+media whole or not at all; a tear that leaves part of the magic is not one the media
+makes, and is not told apart from a foreign file. Live segments are
 ordered by the sequence of their first record, then by name, and kept while each
 begins exactly where the one before ended and holds at least one valid record.
 The valid records of a segment are the run, from its first, in which each
 record's checksum (seeded by the segment's life and the lineage) is valid and its
-sequence is the previous plus one. The first byte that fails ends the log.
+sequence is the previous plus one. The first byte that fails ends the log. The length in a record header is read
+only after the header's own checksum has held; a payload whose checksum fails ends
+the log too, and the valid records behind it, whose positions the intact header
+gives, are listed in `Recovery().Dropped`.
 
 What is *proven* comes from the marks. A **through** mark says every record up to
 a sequence had been made durable by a completed sync. It is written after the
@@ -166,10 +181,14 @@ a SATA SSD when it was written every round, so it is written every sixteenth rou
 after a megabyte of synced records, whichever comes first. A **floor** says the store held every record up to a sequence;
 `Reclaim` makes it durable in the oldest segment that stays before it wipes any
 header, so a log that begins after the store always says why. The lag is real:
-the records of the last sync rounds of a journal that was killed are covered by no
-surviving mark, and damage to them is indistinguishable from a torn tail. They are
-dropped and reported (`Recovery().Proven < Recovery().Last`); a clean `Close`
-leaves no such window.
+the records of the last sync rounds of a journal that was killed (up to sixteen
+rounds, or a megabyte of them) are covered by no surviving mark, and damage to them
+is indistinguishable from a torn tail. **They are dropped even though their `Sync`
+returned**, and the report says what lies behind the damage where it can
+(`Recovery().Proven < Recovery().Last`); a clean `Close` leaves no such window. This
+is a residual of the design, not a bug to be fixed by a caller: a journal that must
+not lose an acknowledged record to media damage in its last rounds has to write a
+mark with every round, and pays a second block flush for it.
 
 The segments after the end of the log are wiped (their header zeroed) and the wipe
 is made durable **before** any new record is written. New records always go to a
@@ -228,7 +247,11 @@ What decides the design:
    1.22 ms) and loses at 4 KiB (1.74 ms against 1.21 ms); on the SATA SSD
    all five are within a few percent at 4 KiB and 64 KiB. `O_DIRECT` with `fdatasync`
    is within 1 % of the buffered path at 4 KiB. They cost alignment and padding
-   in the record format and cannot share a page cache. The journal uses buffered
+   in the record format and cannot share a page cache. That is the choice made here,
+   and it has a price that is stated: the records begin at byte 80, which is not a
+   block boundary, and the marks share the first block of a segment with the first
+   records, so direct I/O (1.7 times faster at 64 KiB on the NVMe disk above) is closed
+   off, and so is a mark on every round without a second block flush. The journal uses buffered
    `pwrite` and `fdatasync`; the group-sync queue makes one `fdatasync` serve every
    waiter.
 
@@ -257,6 +280,9 @@ one-minute load average is below 20, and the load average seen by each run is
 recorded in `journal/bench`'s output; the range over each table is given with it.
 The latency tables are single runs; the bulk and sequential tables give every
 round. Runs on these machines vary by several percent.
+The tables were measured before the header gained its four bytes of magic and
+before a mark's in-memory record moved after its write; neither changes what a sync
+round writes.
 
 ### Small synchronous writes
 
@@ -410,15 +436,16 @@ default 64 MiB, at most 4 GiB). Integers are little endian; checksums are CRC-32
 
 ```
 segment  header | mark | mark | record | record | ... | (unused)
-header   checksum u32 | first u64 | life u64 | lineage [16]byte       36 bytes
+header   checksum u32 | magic [4]byte | first u64 | life u64 | lineage [16]byte   40 bytes
 mark     checksum u32 | through u64 | floor u64                       20 bytes, two slots
 record   checksum u32 | length u32 | sequence u64 | acknowledged i64 | payload checksum u32 | payload
 ```
 
-* The header checksum covers `first` (the sequence of the segment's first record,
-  at least 1), `life` (random, new each time the file is reused) and `lineage` (the
-  first 16 bytes of the SHA-256 of `Options.Lineage`). A zero header is a free
-  segment. The records begin at byte 76.
+* The header checksum covers the `magic` (the four bytes `JRNL`, which are not a
+  version and mean nothing else), `first` (the sequence of the segment's first
+  record, at least 1), `life` (random, new each time the file is reused) and
+  `lineage` (the first 16 bytes of the SHA-256 of `Options.Lineage`). A header whose
+  magic is zero is a free segment. The records begin at byte 80.
 * The seed of every record and mark checksum is the CRC-32C of `life` followed by
   `lineage`. The record checksum covers the record header after itself. The payload
   checksum is computed before the journal's lock is taken; the record checksum binds
@@ -432,15 +459,22 @@ record   checksum u32 | length u32 | sequence u64 | acknowledged i64 | payload c
 * Records do not span segments. Many records are written by one `pwrite` (group
   commit); the first write into a segment starts at its header and carries the
   first mark.
+* **One layout, no versions.** The format has no version number, no upgrade path
+  and no compatibility with any other. The magic exists so that this code can tell
+  a file it wrote from a file it did not, and refuse the latter. The journal's
+  contents are transient: every record is published and then reclaimed. A change of
+  layout is therefore never an in-place upgrade; it is *publish everything, `Close`,
+  delete the directory*, and start the new build on an empty one.
 * The payload is stored as given. **The journal does not encrypt**: every write of
   the volume is in the clear on the node's disk. The directory is created `0700`
-  and the files `0600`; the Volume seals what it appends.
+  and the files `0600`; a directory that already exists is used with the mode it
+  has. The Volume seals what it appends.
 
 ## The file layer
 
 The journal writes only through the `Disk` and `File` interfaces. `Files(dir)` is
-the operating system's: it creates the directory (`0700`) and makes its entry in
-the parent durable; takes an exclusive `flock` on the directory, held until the
+the operating system's: it creates the directory (`0700`, and every directory above
+it that did not exist) and makes the entry of each one in its parent durable; takes an exclusive `flock` on the directory, held until the
 journal closes or the process dies (`ErrLocked` for a second journal on the
 directory); and reads the file system type (`statfs`), refusing tmpfs and ramfs
 (`ErrVolatile`: an fsync there makes nothing durable) and warning about overlay,
@@ -449,15 +483,21 @@ only if the layer below passes it on; check before relying on a journal in a
 sandbox). A `File`'s `WriteAt` writes all of its bytes or returns an error; a short
 write with no error fails the journal. On macOS Go's `File.Sync` is `F_FULLFSYNC`,
 which asks the drive to flush its own cache; it is slower than `fdatasync` on Linux
-and is what durable means there.
+and is what durable means there. The directory syncs are `fsync` of a directory
+descriptor; on macOS that call is not `F_FULLFSYNC` and this layer has not been run
+there to see what reaches the media. Only Linux is a supported platform, and of its
+architectures `amd64` and `arm64`: 32-bit ARM does not build (the writeback hint
+uses a system call it does not have).
 
 Two tests keep this layer honest. The journal's logic runs against `journal/crash`,
 a `Disk` in memory that logs every write, sync, create and remove, and rebuilds the
 disk a crash would leave after any prefix of that log: nothing persisted,
 everything persisted, each prefix, every subset of a few writes, torn writes inside
-and across sectors, random scatters. `crash.Disk.Explore` checks every such state,
-in the manner of CrashMonkey and ACE, and a crash of the recovery itself is
-explored the same way. It models `Create` and `Remove` as durable when they
+and across sectors, random scatters. `crash.Disk.Explore` checks every such state, and a crash of the recovery itself is
+explored the same way. The workloads run at several mark cadences (a mark every
+round, every third, every sixteenth, and none but the ones a segment starts with),
+because the order of a mark and the sync that carries it, and the lag of the proof,
+are only in the model when marks are as rare as they are in production. It models `Create` and `Remove` as durable when they
 return, which is the contract; whether the real layer meets it is what the second
 test checks: the test binary runs again as its own child, traced with `ptrace`
 (a process may trace its child with no privileges, and nothing is installed), and
@@ -529,9 +569,31 @@ The integration change does the following.
    [measurements](#a-bulk-writer-beside-fsync-writers) show why: with the bulk in the
    same log, the p50 of small fsyncs behind two bulk writers was 2.3 times that
    of plain per-file fsyncs on NVMe and 51 times on a SATA SSD (8 writers). The Volume change must do this, or measure
-   fsync-heavy phases (git, dpkg, SQLite) beside bulk writes first.
+   fsync-heavy phases (a source checkout, a package install, a database) beside bulk writes first.
 9. **Do not enable the journal on SATA-class disks** without that split and that
    measurement.
+10. **A directory per volume and fencing round**, whose lineage is the volume and
+    the round. Never restore a journal directory from a backup, never copy one
+    between nodes, and never reuse one for another history: a restored directory
+    opens under its lineage and a newer Head and replays an older timeline with no
+    sign that records are missing. If a node's disk is lost or doubtful, delete the
+    directory and treat the unpublished tail as lost.
+11. **The Head's sequence on every `Open`**, 0 included, and never retried with
+    another value. `ErrMismatch`, `ErrCorrupt`, `ErrLineage` and `ErrFormat` mean
+    fall back to the Head and report that an unpublished tail may be missing;
+    `ErrLocked` is a fence (another journal has the directory) and is not retried
+    either.
+12. **Order of the publisher**: commit the Head, then `Publish(g)` with `g` no more
+    than `Marks().Durable`, then `Reclaim()`. The publisher is stopped before
+    `Close` and before a `Replay` it must not race with.
+13. **Bulk payloads** (over about 64 KiB) bypass the ordered log, as in item 8: a
+    second journal or a spool of files, durable first, and only then the record in
+    the ordered log that names them, so that a record never names bulk data that a
+    crash could lose. The two journals have distinct lineages.
+14. **Errors to the mount**: `ErrFull` is `ENOSPC` or `EAGAIN`; a journal failure
+    (`State().Err`) makes the mount read-only, since no later write can be made
+    durable.
+15. **Seal before `Append`.** The journal stores the payload as given.
 
 The trap to test in that change: with a writeback page cache the kernel can
 acknowledge a `write(2)` before the daemon sees it, so the 5 s bound is measured
@@ -571,8 +633,15 @@ what a Volume needs and a loop does not have:
   beside fsync callers delays them (measured below); the cure is to keep the bulk
   out of the log, in the Volume.
 * **The proof lags.** A mark is written with a later sync round (every sixteenth, or
-  every megabyte, and at `Close`), so damage to the records of the last rounds of a
-  killed journal is treated as a torn tail, and reported.
+  every megabyte, and at `Close`). Damage to a record written in the last sixteen
+  rounds, or the last megabyte, before a kill is treated as a torn tail and dropped
+  although its `Sync` returned. Plainly: a journal that is killed and then found with
+  a damaged sector in its last rounds loses those acknowledged records, and `Open`
+  succeeds.
+* **A restored directory is invisible.** A journal directory restored from a backup
+  opens under its lineage and a newer Head, and replays the older history. Nothing
+  can tell. Never restore one: delete the directory and treat the node's disk as
+  lost.
 * **Plaintext at rest.** The journal does not encrypt. The Volume seals what it
   appends.
 * **Namespace durability is pinned, not simulated.** The crash harness treats
@@ -580,8 +649,12 @@ what a Volume needs and a loop does not have:
   real layer's order of file sync, rename and directory sync is pinned by the
   system-call tests. A model that loses a directory entry the layer failed to sync
   is not built.
-* **A failed `Reclaim`** returns its error and changes nothing in memory; the next
-  call repeats the work, and every step of it can be repeated.
+* **A failed `Reclaim`** returns its error. A failed write of the floor leaves the
+  journal as it was and the next call writes it again; a failed sync of it fails the
+  journal, since a sync repeated after a failure may succeed without the data. The
+  wipes of headers can be repeated.
+* **One platform.** Linux on `amd64` and `arm64`. 32-bit ARM does not build, and
+  macOS has not been run (see the file layer).
 * **One process, one directory.** The lock is advisory and per directory; a platform
   without `flock` has none.
 
@@ -593,7 +666,7 @@ be tested from outside, with a file layer that can hold, fail and crash.
 
 ### Model
 
-A *journal* is a sequence of *records*. A record has a *payload* of 0 to `S - 76 - 28`
+A *journal* is a sequence of *records*. A record has a *payload* of 0 to `S - 80 - 28`
 bytes (`S` is the segment size), a *sequence* and an *acknowledgement time*. The
 journal has a fixed *capacity* of at least two segments. It is used by one process
 at a time. The caller supplies a clock, a file layer, a *lineage* (an opaque
@@ -641,7 +714,9 @@ of the volatile writes, each possibly torn at any byte.
    unavailable, and MUST NOT free the segment new records are being added to. It
    MUST make the store's sequence durable in the oldest segment that stays (the
    *floor*) before it wipes any header, and MUST NOT wipe a header until that
-   segment's own header is on the disk. It MUST wipe oldest first, each durable
+   segment's own header is on the disk. A mark MUST NOT be taken for written until
+   its write has succeeded, so that a failed write is made again; a failed sync of
+   the floor MUST fail the journal. It MUST wipe oldest first, each durable
    before the next. It MUST NOT run concurrently with a `replay` that is reading
    the segment.
 8. **Deadline.** `due(a)` MUST complete when the oldest unpublished record has been
@@ -653,8 +728,10 @@ of the volatile writes, each possibly torn at any byte.
    closes or fails, and MUST release its timer and its registration when its context
    ends. Ages within the process MUST be measured on a monotonic clock; a record
    recovered from disk whose acknowledgement time is later than the time of the
-   restart MUST be treated as acknowledged at the restart, so a restart never
-   lengthens the time a record has left. The implementation MAY fire up to 1 ms
+   restart MUST be treated as acknowledged at the restart, so that after a restart
+   no record has more than the whole bound left. (It can have more than it had
+   before the restart when the clock is found behind where it was; a restart does
+   not keep the time left.) The implementation MAY fire up to 1 ms
    early and MUST NOT fire late by more than the clock's resolution.
 9. **State.** `state` MUST report the bytes of unpublished records, the age of the
    oldest, and the error that stopped the journal. It MUST report `degraded` when
@@ -667,9 +744,10 @@ of the volatile writes, each possibly torn at any byte.
     "full" error. No record is ever dropped. When the publisher publishes and
     reclaims, appends MUST succeed again and replay MUST return the older records
     first.
-11. **Format.** A segment is a file holding a 36-byte header, two 20-byte marks and
-    records back to back. The header is `checksum(4) first(8) life(8) lineage(16)`:
-    the CRC-32C of the last 32 bytes, the sequence of the segment's first record (at
+11. **Format.** A segment is a file holding a 40-byte header, two 20-byte marks and
+    records back to back. The header is `checksum(4) magic(4) first(8) life(8)
+    lineage(16)`: the CRC-32C of the last 36 bytes, four fixed bytes (`JRNL`, which
+    are not a version), the sequence of the segment's first record (at
     least 1), a random value fresh each time the file is used, and the first 16
     bytes of the SHA-256 of the caller's lineage. A mark is `checksum(4) through(8)
     floor(8)`, its checksum the CRC-32C of the last 16 bytes seeded with the seed
@@ -678,7 +756,11 @@ of the volatile writes, each possibly torn at any byte.
     it seeded with the seed below; the payload checksum is the CRC-32C of the
     payload; `acknowledged` is Unix nanoseconds. The seed is the CRC-32C of the
     segment's `life` (8 bytes) followed by its `lineage`. Integers are little endian.
-    Records do not span segments. A header of zeros marks a free segment.
+    Records do not span segments. A header whose magic is zero marks a free segment,
+    as does one whose magic is the fixed bytes and whose checksum fails. There is one
+    layout and no version: an implementation MUST NOT read, reuse or delete a segment
+    file whose first bytes are none of these (see 13), and a change of layout MUST be
+    made by publishing everything, closing the journal and deleting its directory.
 12. **Marks.** A mark's `through` MUST be a sequence that a completed sync had
     covered before the mark was written; its `floor` MUST be a sequence the store
     held. A mark MUST be written after the sync it describes (in a later sync round,
@@ -689,7 +771,7 @@ of the volatile writes, each possibly torn at any byte.
     alternately. A reader takes the highest `through` and `floor` of the slots that
     validate.
 13. **Recovery.** `open` MUST decide before it writes. It MUST fail, and MUST NOT
-    write, when: a segment's lineage is not the caller's; the store's sequence is
+    write, when: a segment file is not in this layout; a segment's lineage is not the caller's; the store's sequence is
     below the highest floor; the store's sequence is above the last record of a
     non-empty log; or a `through` is above both the last record and the store's
     sequence (records that were made durable are gone); or the log begins after the
@@ -699,13 +781,16 @@ of the volatile writes, each possibly torn at any byte.
     ordered by `first` then name and linked only where `first` equals the previous
     segment's last sequence plus one. It MAY drop what follows the first byte that
     fails, and a log that begins after the store's sequence when no `through`
-    proves a sync past it; it MUST report what it dropped, MUST make the dropped
+    proves a sync past it; it MUST report what it dropped (the intact segments that follow a gap, and the
+    valid records behind a record whose payload fails its checksum, where the
+    header's length can be believed), MUST make the dropped
     segments free durably before any new record is written, MUST make the records it
     keeps durable before it returns, and MUST write new records to a segment that
     holds no kept record.
 14. **Discard.** The only operation that gives records up is a separate one that
     names the first and last sequence; it MUST do nothing, and fail, unless the
-    journal holds exactly that range.
+    journal holds exactly that range: intact records beyond a hole are a different
+    range, and a copy of a segment inside the range goes with it.
 15. **Exclusion and placement.** The journal MUST hold an exclusive lock on its
     directory for as long as it is open and MUST refuse a second journal on the
     directory. It MUST refuse a directory on volatile memory. It SHOULD create the
@@ -802,19 +887,45 @@ Each criterion is a test that fails if the requirement is removed.
   write, at most 20 MiB are admitted. Appending 6 MiB in 1 MiB records requests
   writeback for 5 to 7 MiB, and 3 KiB of small records requests none.
 * **A19 clock**: reopening with a clock an hour behind makes a record count as just
-  acknowledged and `due` fires `age` after the restart; with the clock right the
-  age carries across the restart.
-* **A20 system calls** (under a tracer, with no strace or root): `create` issues `fdatasync` of the new
-  file, then the rename, then `fsync` of the directory; `remove` is followed by
-  `fsync` of the directory; the parent of the journal's directory is synced and the
-  lock taken before the first segment; `sync` issues `fdatasync` of the segment; an
+  acknowledged and `due` fires a whole `age` after the restart, and not before; with
+  the clock right the age carries across the restart.
+* **A20 system calls** (under a system-call tracer, with no root): `create` issues
+  `fdatasync` of the new file, then the rename, then `fsync` of the directory;
+  `remove` is followed by `fsync` of the directory; the parent of the journal's
+  directory, and of every directory made for it, is synced and the lock taken before
+  the first segment; `sync` issues `fdatasync` of the segment; an
   injected `EIO` on that `fdatasync` fails the `sync` and the next `append`.
+* **A21 format**: a directory holding a segment file of any other layout (the same
+  size as a segment, another size, shorter than a preamble) is refused by `open`
+  and by `discard`, and the file is neither read, nor reused, nor deleted; a
+  header torn by a crash (its checksum damaged, or its magic zeroed) is free and is
+  reused.
+* **A22 floor**: with the write of the floor failing once, the next `reclaim`
+  writes it again before wiping, and a power loss then leaves a floor that refuses a
+  stale store; with the sync of the floor failing, the journal fails and no header
+  is wiped.
+* **A23 discard**: `discard` of the range that is the log, with intact segments
+  beyond a hole, fails with the range error and wipes neither; a copy of a segment
+  inside the range goes with it.
+* **A24 report**: damage to the payload of record 6 of 10, the marks lost, leaves 1
+  to 5 and lists 6 to 10; damage to a header lists nothing.
+* **A25 cadence**: the crash exploration of A4 and A6 is repeated with a mark every
+  round, every third, every sixteenth and every thousandth round; a mark is
+  written once a megabyte has been synced however few the rounds; a segment starts
+  with the floor and the proof of the journal at that time, and those alone refuse a
+  stale store and call damage before them corruption; after `close` returns the final
+  mark is on the media.
+* **A26 scan**: a record header that fails its checksum, however long it says its
+  payload is, is not followed: recovery reads no more than the header.
+* **A27 order of segments**: with twenty segments, each copied under a higher name,
+  recovery keeps the lower names.
 
 ## References
 
 * J. Mohan, A. Martinez, S. Ponnapalli, P. Raju, V. Chidambaram. Finding
-  Crash-Consistency Bugs with Bounded Black-Box Crash Testing. OSDI 2018 (CrashMonkey
-  and ACE).
-* Wang et al. NVLog. FAST 2025,
+  Crash-Consistency Bugs with Bounded Black-Box Crash Testing. OSDI 2018.
+* J. Bornholt, A. Kaufmann, J. Li, A. Krishnamurthy, E. Torlak, X. Wang. Specifying
+  and Checking File System Crash-Consistency Models. ASPLOS 2016.
+* Wang et al., FAST 2025,
   <https://www.usenix.org/conference/fast25/presentation/wang> (byte-granularity
   records, absorbing small synchronous writes, systematic crash testing).
