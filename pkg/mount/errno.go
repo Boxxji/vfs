@@ -206,8 +206,10 @@ const finishGrace = 3 * time.Second
 // what a holder wrote after the commit that SIGTERM made, and it is small. A commit that
 // the store does not answer keeps the Volume's lock, and anything that asks for the lock
 // waits as long, a Stats as much as a Flush: so all of it runs apart and the wait for it
-// ends after finishGrace, with an error that says what was not committed, and the process
-// can end. A supervisor that waits longer for a stalled store gets nothing more.
+// ends after finishGrace, with an error that says what may not have been committed, and
+// the process can end. The commit is not known to have failed: its request may be at the
+// store already, so what it held may be lost, not is. When Serve failed as well, both are
+// returned. A supervisor that waits longer for a stalled store gets nothing more.
 func finish(vol *vfs.Volume, serveErr error) error {
 	done := make(chan error, 1)
 	go func() {
@@ -221,12 +223,9 @@ func finish(vol *vfs.Volume, serveErr error) error {
 	select {
 	case err = <-done:
 	case <-time.After(finishGrace):
-		err = fmt.Errorf("the last commit did not finish in %s: what the mount held and had not committed is lost", finishGrace)
+		err = fmt.Errorf("the last commit did not finish in %s: what the mount held and had not committed may be lost", finishGrace)
 	}
-	if err != nil && serveErr == nil {
-		return err
-	}
-	return serveErr
+	return errors.Join(serveErr, err)
 }
 
 // unsupported is what the mount answers for an operation it does not implement:

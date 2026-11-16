@@ -67,8 +67,8 @@ func TestFinishReportsWhatWentWrong(t *testing.T) {
 		t.Fatalf("finish with a failing store = %v, want the store's error", err)
 	}
 	served := errors.New("serve failed")
-	if err := finish(v, served); !errors.Is(err, served) {
-		t.Fatalf("finish after a serve error = %v, want that error", err)
+	if err := finish(v, served); !errors.Is(err, served) || !errors.Is(err, boom) {
+		t.Fatalf("finish after a serve error = %v, want that error and the store's", err)
 	}
 }
 
