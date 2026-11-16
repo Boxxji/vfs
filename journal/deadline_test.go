@@ -40,7 +40,7 @@ func TestDueTimerRunningDuringCloseDoesNotDoubleClose(t *testing.T) {
 	mustAppend(t, j, []byte("x"))
 	due := j.Due(ctx, 5*time.Second)
 	clk.Advance(5 * time.Second) // the deadline passes; the callback is "running"
-	if err := j.Close(); err != nil {
+	if err := closeBounded(t, j); err != nil {
 		t.Fatal(err)
 	}
 	if !fired(due) {
@@ -74,7 +74,7 @@ func TestDueCloseRaceWithTheWallClock(t *testing.T) {
 		}
 		_ = j.Due(ctx, 200*time.Microsecond)
 		time.Sleep(time.Duration(150+i%100) * time.Microsecond)
-		j.Close()
+		closeWithin(t, j)
 	}
 }
 
@@ -88,12 +88,12 @@ func TestRestartWithTheClockBehindKeepsTheBound(t *testing.T) {
 	clk1 := newClock()
 	j := open(t, journal.Options{Capacity: 1 << 20, Segment: 64 << 10, Disk: d, Clock: clk1})
 	mustSync(t, j, mustAppend(t, j, []byte("old")))
-	j.Close()
+	closeWithin(t, j)
 
 	clk2 := newClock()
 	clk2.Advance(-time.Hour) // the clock after the restart reads an hour earlier
 	j = open(t, journal.Options{Capacity: 1 << 20, Segment: 64 << 10, Disk: d, Clock: clk2})
-	defer j.Close()
+	defer closeWithin(t, j)
 	if s := j.State(); s.Age != 0 || s.Backlog == 0 {
 		t.Fatalf("state %+v: the record is unpublished and, as far as the clock says, just acknowledged", s)
 	}
@@ -116,9 +116,9 @@ func TestRestartKeepsTheAgeOfARecord(t *testing.T) {
 	j := open(t, journal.Options{Capacity: 1 << 20, Segment: 64 << 10, Disk: d, Clock: clk})
 	mustSync(t, j, mustAppend(t, j, []byte("old")))
 	clk.Advance(4 * time.Second)
-	j.Close()
+	closeWithin(t, j)
 	j = open(t, journal.Options{Capacity: 1 << 20, Segment: 64 << 10, Disk: d, Clock: clk})
-	defer j.Close()
+	defer closeWithin(t, j)
 	if s := j.State(); s.Age != 4*time.Second {
 		t.Fatalf("age %v after a restart, want 4 s", s.Age)
 	}
@@ -147,14 +147,16 @@ func TestDueIsClosedWhenTheJournalFails(t *testing.T) {
 	})
 	clk := newClock()
 	j := open(t, journal.Options{Capacity: 1 << 20, Segment: 64 << 10, Disk: d, Clock: clk})
-	defer j.Close()
+	defer closeWithin(t, j)
 	seq := mustAppend(t, j, []byte("x"))
 	due := j.Due(ctx, time.Hour)
 	mu.Lock()
 	boom = true
 	mu.Unlock()
-	if err := j.Sync(ctx, seq); err == nil {
-		t.Fatal("sync succeeded")
+	c, cancel := within() // a waiter the failure does not release waits for ever
+	defer cancel()
+	if err := j.Sync(c, seq); err == nil || errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("sync: %v, want the journal's failure", err)
 	}
 	if !fired(due) {
 		t.Fatal("Due stayed open after the journal failed")
@@ -168,7 +170,7 @@ func TestDueIsClosedWhenTheJournalFails(t *testing.T) {
 func TestAbandonedDueIsReleased(t *testing.T) {
 	clk := newClock()
 	j := open(t, journal.Options{Capacity: 1 << 20, Segment: 64 << 10, Disk: crash.New(), Clock: clk})
-	defer j.Close()
+	defer closeWithin(t, j)
 	mustAppend(t, j, []byte("x"))
 	for i := 0; i < 1000; i++ {
 		c, cancel := context.WithCancel(ctx)
@@ -189,7 +191,7 @@ func TestAbandonedDueIsReleased(t *testing.T) {
 func TestCancelledDueNeverFires(t *testing.T) {
 	clk := newClock()
 	j := open(t, journal.Options{Capacity: 1 << 20, Segment: 64 << 10, Disk: crash.New(), Clock: clk})
-	defer j.Close()
+	defer closeWithin(t, j)
 	mustAppend(t, j, []byte("x"))
 	c, cancel := context.WithCancel(ctx)
 	due := j.Due(c, time.Second)
@@ -207,7 +209,7 @@ func TestCancelledDueNeverFires(t *testing.T) {
 func TestDueDoesNotSpinOnAnOverdueRecord(t *testing.T) {
 	clk := newClock()
 	j := open(t, journal.Options{Capacity: 1 << 20, Segment: 64 << 10, Retry: 250 * time.Millisecond, Disk: crash.New(), Clock: clk})
-	defer j.Close()
+	defer closeWithin(t, j)
 	mustAppend(t, j, []byte("x"))
 	clk.Advance(time.Hour) // the record is far overdue
 	fires := 0

@@ -125,7 +125,7 @@ func runModel(t *testing.T, seed int64, steps int) {
 			}
 			log = append(log, "replay")
 		case n < 95:
-			if err := j.Close(); err != nil {
+			if err := closeBounded(t, j); err != nil {
 				fail("Close: %v", err)
 			}
 			j = open(t, opts())
@@ -135,7 +135,7 @@ func runModel(t *testing.T, seed int64, steps int) {
 			vs := d.Variants(d.Len(), 2, seed*1000+int64(step))
 			v := vs[rng.Intn(len(vs))]
 			img := d.Image(d.Len(), v)
-			j.Close()
+			closeWithin(t, j)
 			d = img
 			j = open(t, opts())
 			tail := j.Marks().Visible
@@ -343,7 +343,7 @@ func TestConcurrentWriters(t *testing.T) {
 				}
 			}
 			check(j)
-			if err := j.Close(); err != nil {
+			if err := closeBounded(t, j); err != nil {
 				t.Fatal(err)
 			}
 			if onDisk {

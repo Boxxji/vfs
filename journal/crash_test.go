@@ -308,7 +308,7 @@ func TestCrashSequential(t *testing.T) {
 				}
 			}
 			r.sync(t, j, visible)
-			if err := j.Close(); err != nil {
+			if err := closeBounded(t, j); err != nil {
 				t.Fatal(err)
 			}
 			if r.activate <= r.creates {
@@ -352,7 +352,7 @@ func TestCrashConcurrent(t *testing.T) {
 	wg.Wait()
 	m := j.Marks()
 	r.sync(t, j, m.Visible)
-	if err := j.Close(); err != nil {
+	if err := closeBounded(t, j); err != nil {
 		t.Fatal(err)
 	}
 	r.explore(t, 2)
@@ -379,7 +379,7 @@ func TestCrashSessions(t *testing.T) {
 			}
 		}
 		r.sync(t, j, seq)
-		if err := j.Close(); err != nil {
+		if err := closeBounded(t, j); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -407,7 +407,7 @@ func TestCrashReclaim(t *testing.T) {
 			}
 			r.publish(t, j, 6) // the first two segments; 7 to 9 are synced and unpublished
 			r.reclaim(t, j)
-			if err := j.Close(); err != nil {
+			if err := closeBounded(t, j); err != nil {
 				t.Fatal(err)
 			}
 			r.explore(t, 2)

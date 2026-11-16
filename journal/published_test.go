@@ -24,7 +24,7 @@ func TestWrongPublishedDoesNotDestroyAcknowledgedRecords(t *testing.T) {
 	if err := j.Reclaim(); err != nil { // the segments of 1 to 6 are gone; 7 to 9 are unpublished
 		t.Fatal(err)
 	}
-	j.Close()
+	closeWithin(t, j)
 
 	// The Volume mounts with the wrong Head sequence (0 is the classic).
 	if j2, err := journal.Open("", small(d, newClock(), 0)); !errors.Is(err, journal.ErrMismatch) {
@@ -58,14 +58,14 @@ func TestStaleLineageIsNotReplayedOnANewerHead(t *testing.T) {
 		last = mustAppend(t, j, []byte{byte('A'), byte(i)})
 	}
 	mustSync(t, j, last)
-	j.Close()
+	closeWithin(t, j)
 
 	// The Head says 8: B committed 6, 7, 8. A's journal knows nothing of B.
 	second := small(a, newClock(), 8)
 	second.Lineage = []byte("volume 7 round 2")
 	if j, err := journal.Open("", second); !errors.Is(err, journal.ErrLineage) {
 		if err == nil {
-			j.Close()
+			closeWithin(t, j)
 		}
 		t.Fatalf("A's records were opened under the newer round: %v", err)
 	}

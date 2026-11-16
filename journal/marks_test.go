@@ -60,7 +60,7 @@ func cleanJournal(t testing.TB, n int) *crash.Disk {
 		mustAppend(t, j, bytes.Repeat([]byte{byte('a' + i)}, 100))
 	}
 	mustSync(t, j, uint64(n))
-	if err := j.Close(); err != nil {
+	if err := closeBounded(t, j); err != nil {
 		t.Fatal(err)
 	}
 	return d
@@ -78,7 +78,7 @@ func TestMarkWithABadChecksumIsIgnored(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open believed a mark whose checksum does not hold: %v", err)
 	}
-	j.Close()
+	closeWithin(t, j)
 }
 
 // Of two valid marks the higher through and the higher floor
@@ -100,7 +100,7 @@ func TestTheHigherMarkCountsWhicheverSlotHoldsIt(t *testing.T) {
 	putMark(t, d, "000000.seg", 1, seed, 10, 1, true)
 	if j, err := journal.Open("", small(d, newClock(), 2)); !errors.Is(err, journal.ErrMismatch) {
 		if err == nil {
-			j.Close()
+			closeWithin(t, j)
 		}
 		t.Fatalf("store at 2 under a floor of 4 (slot 0) and 1 (slot 1): %v, want ErrMismatch", err)
 	}
@@ -144,7 +144,7 @@ func TestAFreshSegmentCarriesTheFloorAndTheProof(t *testing.T) {
 func TestAcknowledgementTimesDoNotGoBackwards(t *testing.T) {
 	c := newClock()
 	j := open(t, small(crash.New(), c, 0))
-	defer j.Close()
+	defer closeWithin(t, j)
 	mustAppend(t, j, []byte("a"))
 	c.Advance(10 * time.Second)
 	mustAppend(t, j, []byte("b"))
@@ -174,7 +174,7 @@ func TestRefusedOpenReleasesTheDirectory(t *testing.T) {
 	}
 	seq, _ := j.Append(ctx, []byte("x"))
 	j.Sync(ctx, seq)
-	if err := j.Close(); err != nil {
+	if err := closeBounded(t, j); err != nil {
 		t.Fatal(err)
 	}
 	wrong := opt
@@ -186,7 +186,7 @@ func TestRefusedOpenReleasesTheDirectory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open after a refused Open (right Head): %v", err)
 	}
-	j.Close()
+	closeWithin(t, j)
 }
 
 type countedDisk struct {
@@ -210,7 +210,7 @@ func TestRefusedOptionsCloseTheDisk(t *testing.T) {
 // context it cancels each round must not grow the journal.
 func TestCancelledDueIsForgotten(t *testing.T) {
 	j := open(t, journal.Options{Capacity: 1 << 20, Segment: 64 << 10, Disk: crash.New()})
-	defer j.Close()
+	defer closeWithin(t, j)
 	mustAppend(t, j, []byte("x"))
 	var m0, m1 runtime.MemStats
 	runtime.GC()
@@ -267,7 +267,7 @@ func TestTheFinalMarkIsDurableWhenCloseReturns(t *testing.T) {
 		mustAppend(t, j, bigRecord(i))
 	}
 	mustSync(t, j, 3)
-	if err := j.Close(); err != nil {
+	if err := closeBounded(t, j); err != nil {
 		t.Fatal(err)
 	}
 	img := d.Image(d.Len(), crash.Variant{Kind: crash.Lost}) // power loss the instant Close returns

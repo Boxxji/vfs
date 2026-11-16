@@ -59,7 +59,7 @@ func TestCapacityOnRealFiles(t *testing.T) {
 		}
 		b, n := dirBytes(t, dir)
 		t.Logf("round %d: full with %d bytes in %d files (capacity %d)", round, b, n, opt.Capacity)
-		if err := j.Close(); err != nil {
+		if err := closeBounded(t, j); err != nil {
 			t.Fatal(err)
 		}
 		if round == 1 { // a restart that finds a full journal and a Head that has caught up

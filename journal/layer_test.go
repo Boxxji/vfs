@@ -20,7 +20,7 @@ func (layered) Warnings() []string { return []string{"this is an overlay"} }
 // Open passes on what the file layer says about its file system.
 func TestRecoveryCarriesTheDiskWarnings(t *testing.T) {
 	j := open(t, small(layered{crash.New()}, newClock(), 0))
-	defer j.Close()
+	defer closeWithin(t, j)
 	if got := j.Recovery().Warnings; !reflect.DeepEqual(got, []string{"this is an overlay"}) {
 		t.Fatalf("warnings %v", got)
 	}
@@ -39,7 +39,7 @@ func TestSegmentCreationFailureIsFullNotFatal(t *testing.T) {
 		return nil
 	})
 	j := open(t, small(d, newClock(), 0)) // the first segment exists, the spare is made at once
-	defer j.Close()
+	defer closeWithin(t, j)
 	fail.Store(true)
 	// Fill the tail and the spare that already exists, then need one more.
 	var sawFull bool
@@ -107,11 +107,13 @@ func (d shortDisk) Open(name string) (journal.File, error) {
 func TestShortWriteFailsTheJournal(t *testing.T) {
 	var on atomic.Bool
 	j := open(t, small(shortDisk{crash.New(), &on}, newClock(), 0))
-	defer j.Close()
+	defer closeWithin(t, j)
 	mustSync(t, j, mustAppend(t, j, []byte("fine")))
 	on.Store(true)
 	seq := mustAppend(t, j, []byte("this write comes up short"))
-	if err := j.Sync(ctx, seq); !errors.Is(err, io.ErrShortWrite) {
+	c, cancel := within() // a short write that is not reported leaves the waiter waiting
+	defer cancel()
+	if err := j.Sync(c, seq); !errors.Is(err, io.ErrShortWrite) {
 		t.Fatalf("Sync after a short write: %v, want io.ErrShortWrite", err)
 	}
 	if _, err := j.Append(ctx, []byte("x")); err == nil {
@@ -129,7 +131,7 @@ func TestSegmentsClaimingTheSameFirstAreOrdered(t *testing.T) {
 		mustAppend(t, j, []byte{byte('0' + i)})
 	}
 	mustSync(t, j, 3)
-	j.Close()
+	closeWithin(t, j)
 
 	src, err := d.Open("000000.seg")
 	if err != nil {
@@ -155,7 +157,7 @@ func TestSegmentsClaimingTheSameFirstAreOrdered(t *testing.T) {
 		if r := j.Recovery(); !reflect.DeepEqual(r.Dropped, []journal.Range{{First: 1, Last: 3}}) && try == 0 {
 			t.Fatalf("recovery %+v: the twin was not reported", r)
 		}
-		j.Close()
+		closeWithin(t, j)
 		// The log is the lower name's: its header still says it begins at 1.
 		f, err := d.Open("000000.seg")
 		if err != nil {
@@ -179,9 +181,9 @@ func TestRecoveryReportsWhatWasProven(t *testing.T) {
 		mustAppend(t, j, []byte{byte('0' + i)})
 	}
 	mustSync(t, j, 5)
-	j.Close()
+	closeWithin(t, j)
 	j = open(t, small(d, newClock(), 0))
-	defer j.Close()
+	defer closeWithin(t, j)
 	if r := j.Recovery(); r.First != 1 || r.Last != 5 || r.Proven != 5 || len(r.Dropped) != 0 {
 		t.Fatalf("recovery %+v", r)
 	}

@@ -24,7 +24,7 @@ func TestRecordsOfAnotherLineageDoNotValidateUnderAForgedHeader(t *testing.T) {
 		last = mustAppend(t, j, []byte{byte('A'), byte(i)})
 	}
 	mustSync(t, j, last)
-	j.Close()
+	closeWithin(t, j)
 
 	other := sha256.Sum256([]byte("volume 7, round 2"))
 	names, err := d.List()
@@ -64,7 +64,7 @@ func TestRecordsOfAnotherLineageDoNotValidateUnderAForgedHeader(t *testing.T) {
 	if err != nil {
 		return // refusing is as good as reading nothing
 	}
-	defer j.Close()
+	defer closeWithin(t, j)
 	if got := replayed(t, j); len(got) != 0 {
 		t.Fatalf("records written under another lineage replayed: %v", seqs(got))
 	}

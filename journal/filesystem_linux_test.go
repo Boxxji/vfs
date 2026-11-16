@@ -33,7 +33,7 @@ func TestOpenRefusesMemory(t *testing.T) {
 	defer os.RemoveAll(dir)
 	j, err := journal.Open(dir, journal.Options{Capacity: 4 * 65536, Segment: 65536})
 	if err == nil {
-		j.Close()
+		closeWithin(t, j)
 		t.Fatal("Open accepted a tmpfs directory: Sync would return with nothing on stable storage")
 	}
 	if !errors.Is(err, journal.ErrVolatile) {
@@ -83,7 +83,7 @@ func TestFilesAreNotReadableByOthers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer j.Close()
+	defer closeWithin(t, j)
 	mustSync(t, j, mustAppend(t, j, []byte("secret")))
 	names, _ := filepath.Glob(filepath.Join(dir, "*"))
 	if len(names) == 0 {

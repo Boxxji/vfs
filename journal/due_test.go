@@ -26,7 +26,7 @@ func newDue(t testing.TB) (*journal.Journal, *clock) {
 // given age, to the millisecond, and not before.
 func TestDueFiresAtTheDeadline(t *testing.T) {
 	j, clk := newDue(t)
-	defer j.Close()
+	defer closeWithin(t, j)
 	mustAppend(t, j, []byte("a"))
 	due := j.Due(ctx, 5*time.Second)
 	clk.Advance(5*time.Second - time.Millisecond)
@@ -42,7 +42,7 @@ func TestDueFiresAtTheDeadline(t *testing.T) {
 // Later writes never move the deadline of an older record.
 func TestDueIsNotResetByLaterWrites(t *testing.T) {
 	j, clk := newDue(t)
-	defer j.Close()
+	defer closeWithin(t, j)
 	mustAppend(t, j, []byte("old"))
 	due := j.Due(ctx, 5*time.Second)
 	for i := 0; i < 4; i++ {
@@ -61,7 +61,7 @@ func TestDueIsNotResetByLaterWrites(t *testing.T) {
 // Publishing retires the oldest record; the deadline moves to the next one.
 func TestDueMovesWhenOldestIsPublished(t *testing.T) {
 	j, clk := newDue(t)
-	defer j.Close()
+	defer closeWithin(t, j)
 	mustAppend(t, j, []byte("one"))
 	clk.Advance(3 * time.Second)
 	mustAppend(t, j, []byte("two"))
@@ -86,7 +86,7 @@ func TestDueMovesWhenOldestIsPublished(t *testing.T) {
 // deadline starts with the next write.
 func TestDueWaitsForTheNextWrite(t *testing.T) {
 	j, clk := newDue(t)
-	defer j.Close()
+	defer closeWithin(t, j)
 	due := j.Due(ctx, 5*time.Second)
 	clk.Advance(time.Hour)
 	if fired(due) || clk.Pending() != 0 {
@@ -123,7 +123,7 @@ func TestDueWaitsForTheNextWrite(t *testing.T) {
 func TestDueUsesOneTimer(t *testing.T) {
 	clk := newClock()
 	j := open(t, journal.Options{Capacity: 1 << 20, Segment: 64 << 10, Disk: crash.New(), Clock: clk})
-	defer j.Close()
+	defer closeWithin(t, j)
 	j.Due(ctx, 5*time.Second)
 	for i := 0; i < 1000; i++ {
 		mustAppend(t, j, []byte("x"))
@@ -137,7 +137,7 @@ func TestDueUsesOneTimer(t *testing.T) {
 func TestDueEndsWithTheJournal(t *testing.T) {
 	j, _ := newDue(t)
 	due := j.Due(ctx, 5*time.Second)
-	j.Close()
+	closeWithin(t, j)
 	if !fired(due) {
 		t.Fatal("Close left a Due channel open")
 	}
@@ -154,7 +154,7 @@ func TestBoundHoldsUnderContinuousWrites(t *testing.T) {
 	const bound = 5 * time.Second
 	clk := newClock()
 	j := open(t, journal.Options{Capacity: 1 << 20, Segment: 64 << 10, Bound: bound, Disk: crash.New(), Clock: clk})
-	defer j.Close()
+	defer closeWithin(t, j)
 
 	var worst time.Duration
 	step := 10 * time.Millisecond

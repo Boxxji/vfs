@@ -19,7 +19,7 @@ func TestBackpressure(t *testing.T) {
 	clk := newClock()
 	d := crash.New()
 	j := open(t, journal.Options{Capacity: 32 * seg, Segment: seg, Disk: d, Clock: clk})
-	defer j.Close()
+	defer closeWithin(t, j)
 	chunk := bytes.Repeat([]byte("c"), 20<<10) // three to a segment
 
 	var seqs []uint64
@@ -113,7 +113,7 @@ func TestBackpressure(t *testing.T) {
 func TestNoSlowdownWhenEmpty(t *testing.T) {
 	clk := newClock()
 	j := open(t, journal.Options{Capacity: 64 << 20, Segment: 16 << 20, Disk: crash.New(), Clock: clk})
-	defer j.Close()
+	defer closeWithin(t, j)
 	chunk := bytes.Repeat([]byte("c"), 1<<20)
 	for i := 0; i < 20; i++ {
 		mustAppend(t, j, chunk) // blocks forever on the fake clock if it slows
@@ -131,7 +131,7 @@ func TestSlowedAppendCancels(t *testing.T) {
 	const seg = 64 << 10
 	clk := newClock()
 	j := open(t, journal.Options{Capacity: 32 * seg, Segment: seg, Disk: crash.New(), Clock: clk})
-	defer j.Close()
+	defer closeWithin(t, j)
 	chunk := bytes.Repeat([]byte("c"), 20<<10)
 	for i := 0; i < 200; i++ {
 		c, cancel := context.WithCancel(ctx)
@@ -161,7 +161,7 @@ func TestSlowedAppendCancels(t *testing.T) {
 func TestOutageIsReported(t *testing.T) {
 	clk := newClock()
 	j := open(t, journal.Options{Capacity: 64 << 20, Segment: 1 << 20, Bound: 5 * time.Second, Disk: crash.New(), Clock: clk})
-	defer j.Close()
+	defer closeWithin(t, j)
 	if s := j.State(); s.Degraded || s.Age != 0 || s.Backlog != 0 {
 		t.Fatalf("idle state %+v", s)
 	}
@@ -186,7 +186,7 @@ func TestOutageIsReported(t *testing.T) {
 
 func TestStateBacklogIsExact(t *testing.T) {
 	j := open(t, small(crash.New(), ticking{newClock(), 2e6}, 0))
-	defer j.Close()
+	defer closeWithin(t, j)
 	sizes := []int{0, 1, 77, 300, 5}
 	var total int64
 	for _, n := range sizes {

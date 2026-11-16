@@ -203,13 +203,36 @@ var _ = crash.Sector
 // waiter registered, a timer set), so it ends as soon as the state is reached.
 func waitFor(t testing.TB, what string, cond func() bool) {
 	t.Helper()
-	for i := 0; i < 50_000_000; i++ {
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
 		if cond() {
 			return
 		}
 		runtime.Gosched()
 	}
 	t.Fatalf("gave up waiting for %s", what)
+}
+
+// closeWithin closes j, and fails the test if Close does not return: a journal
+// stuck behind a file layer that a failed test left held would otherwise hang
+// the deferred Close for ever.
+func closeWithin(t testing.TB, j *journal.Journal) {
+	t.Helper()
+	closeBounded(t, j) // what Close reports is the test's business, when it asks
+}
+
+// closeBounded is Close, ending the test if it does not return in five seconds.
+func closeBounded(t testing.TB, j *journal.Journal) error {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() { done <- j.Close() }()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close did not return in 5 s")
+		return nil
+	}
 }
 
 // parked counts syncs and holds each one in the file layer until the test

@@ -14,7 +14,7 @@ import (
 // The exact limit of a payload is the segment less its preamble (40 + 40) and the record header (28).
 func TestPayloadLimitIsExact(t *testing.T) {
 	j := open(t, small(crash.New(), newClock(), 0))
-	defer j.Close()
+	defer closeWithin(t, j)
 	if _, err := j.Append(ctx, make([]byte, 4096-dataStart-28)); err != nil {
 		t.Fatalf("the largest payload: %v", err)
 	}
@@ -31,7 +31,7 @@ func TestShortSegmentFileIsDropped(t *testing.T) {
 		t.Fatal(err)
 	}
 	j := open(t, small(d, newClock(), 0))
-	defer j.Close()
+	defer closeWithin(t, j)
 	mustSync(t, j, mustAppend(t, j, []byte("x")))
 }
 
@@ -39,7 +39,7 @@ func TestShortSegmentFileIsDropped(t *testing.T) {
 func TestRecordLargerThanTheQueueCap(t *testing.T) {
 	d := crash.New()
 	j := open(t, journal.Options{Capacity: 256 << 20, Segment: 64 << 20, Disk: d, Clock: newClock()})
-	defer j.Close()
+	defer closeWithin(t, j)
 	big := bytes.Repeat([]byte{7}, 40<<20)
 	done := make(chan struct{})
 	go func() {
@@ -62,9 +62,9 @@ func TestZeroLengthRecord(t *testing.T) {
 	a := mustAppend(t, j, nil)
 	b := mustAppend(t, j, []byte{})
 	mustSync(t, j, b)
-	j.Close()
+	closeWithin(t, j)
 	j = open(t, small(d, newClock(), 0))
-	defer j.Close()
+	defer closeWithin(t, j)
 	got := replayed(t, j)
 	if len(got) != 2 || got[0].Seq != a || got[1].Seq != b || got[0].Data != "" || got[1].Data != "" {
 		t.Fatalf("replay of empty records: %v", got)
@@ -125,7 +125,7 @@ func TestCloseWithWaiters(t *testing.T) {
 func TestReplayDetectsRuntimeCorruption(t *testing.T) {
 	d := crash.New()
 	j := open(t, small(d, newClock(), 0))
-	defer j.Close()
+	defer closeWithin(t, j)
 	const size = 100
 	for i := 1; i <= 6; i++ {
 		mustAppend(t, j, bytes.Repeat([]byte{byte('a' + i)}, size))
@@ -142,7 +142,7 @@ func TestReplayDetectsRuntimeCorruption(t *testing.T) {
 // record whose length does not fit, so it is refused before anything is made.
 func TestSegmentLargerThan4GiBIsRefused(t *testing.T) {
 	if j, err := journal.Open("", journal.Options{Capacity: 20 << 30, Segment: 5 << 30, Disk: crash.New()}); err == nil {
-		j.Close()
+		closeWithin(t, j)
 		t.Fatal("Open accepted a segment of 5 GiB")
 	}
 }

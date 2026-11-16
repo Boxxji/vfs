@@ -27,7 +27,7 @@ func TestSyncGroupsWaiters(t *testing.T) {
 		return nil
 	})
 	j := open(t, small(d, newClock(), 0))
-	defer j.Close()
+	defer closeWithin(t, j)
 
 	var wg sync.WaitGroup
 	first := mustAppend(t, j, []byte("first"))
@@ -70,7 +70,7 @@ func TestSyncGenerationOrder(t *testing.T) {
 	d := crash.New()
 	p := park(d)
 	j := open(t, small(d, newClock(), 0))
-	defer j.Close()
+	defer closeWithin(t, j)
 
 	a := mustAppend(t, j, []byte("a"))
 	doneA := make(chan struct{})
@@ -129,20 +129,22 @@ func TestPublishRefusesWhatIsNotDurable(t *testing.T) {
 	if m := j.Marks(); m != (journal.Marks{Visible: a, Durable: a, Published: a}) {
 		t.Fatalf("marks %+v", m)
 	}
-	j.Close()
+	closeWithin(t, j)
 }
 
 func TestSyncArguments(t *testing.T) {
 	j := open(t, small(crash.New(), newClock(), 0))
-	defer j.Close()
-	if err := j.Sync(ctx, 0); err != nil {
+	defer closeWithin(t, j)
+	c, cancel := within() // a Sync that waits for a record never appended waits for ever
+	defer cancel()
+	if err := j.Sync(c, 0); err != nil {
 		t.Fatalf("Sync(0): %v", err)
 	}
-	if err := j.Sync(ctx, 1); !errors.Is(err, journal.ErrAhead) {
+	if err := j.Sync(c, 1); !errors.Is(err, journal.ErrAhead) {
 		t.Fatalf("Sync of a record not appended: %v", err)
 	}
 	seq := mustAppend(t, j, []byte("x"))
-	if err := j.Sync(ctx, seq+1); !errors.Is(err, journal.ErrAhead) {
+	if err := j.Sync(c, seq+1); !errors.Is(err, journal.ErrAhead) {
 		t.Fatalf("Sync past the last record: %v", err)
 	}
 	if err := j.Publish(seq + 1); !errors.Is(err, journal.ErrAhead) {
@@ -166,7 +168,7 @@ func TestSyncCancel(t *testing.T) {
 	}
 	close(p.release)
 	mustSync(t, j, a)
-	j.Close()
+	closeWithin(t, j)
 }
 
 // After a failed write or sync the file is in an unknown state: nothing is
@@ -216,10 +218,10 @@ func TestFailureIsFinal(t *testing.T) {
 func TestClosedJournal(t *testing.T) {
 	j := open(t, small(crash.New(), newClock(), 0))
 	a := mustAppend(t, j, []byte("a"))
-	if err := j.Close(); err != nil {
+	if err := closeBounded(t, j); err != nil {
 		t.Fatal(err)
 	}
-	if err := j.Close(); err != nil {
+	if err := closeBounded(t, j); err != nil {
 		t.Fatalf("second Close: %v", err)
 	}
 	if _, err := j.Append(ctx, []byte("b")); !errors.Is(err, journal.ErrClosed) {
@@ -250,7 +252,9 @@ func TestAppendWaitsForTheWriter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer j.Close()
+	defer closeWithin(t, j)
+	releaseOnce := sync.OnceFunc(func() { close(hold) })
+	defer releaseOnce() // before the Close, on every way out
 	chunk := make([]byte, 1<<20)
 	var appended atomic.Int32
 	finished := make(chan struct{})
@@ -275,7 +279,7 @@ func TestAppendWaitsForTheWriter(t *testing.T) {
 	if n := appended.Load(); n > 20 {
 		t.Fatalf("%d MiB queued behind a stuck writer", n)
 	}
-	close(hold)
+	releaseOnce()
 	<-finished
 }
 
@@ -284,7 +288,7 @@ func TestAppendWaitsForTheWriter(t *testing.T) {
 // durable watermark moves.
 func TestBackgroundSync(t *testing.T) {
 	j := open(t, journal.Options{Capacity: 64 << 20, Segment: 16 << 20, Disk: crash.New(), Clock: newClock()})
-	defer j.Close()
+	defer closeWithin(t, j)
 	chunk := make([]byte, 1<<20)
 	for i := 0; i < 12; i++ {
 		mustAppend(t, j, chunk)
@@ -311,7 +315,7 @@ func TestCancelledSyncStartsNoSync(t *testing.T) {
 		return nil
 	})
 	j := open(t, small(d, newClock(), 0))
-	defer j.Close()
+	defer closeWithin(t, j)
 	a := mustAppend(t, j, []byte("a"))
 	waitFor(t, "the write to be held", held.Load)
 	c, cancel := context.WithCancel(ctx)
@@ -356,7 +360,9 @@ func TestWriterStopsAheadOfASlowSync(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer j.Close()
+	defer closeWithin(t, j)
+	releaseOnce := sync.OnceFunc(func() { close(release) })
+	defer releaseOnce() // before the Close, on every way out
 	chunk := make([]byte, 1<<20)
 	go func() {
 		for i := 0; i < 60; i++ {
@@ -371,7 +377,7 @@ func TestWriterStopsAheadOfASlowSync(t *testing.T) {
 	if n := written.Load(); n > 28<<20 {
 		t.Fatalf("%d MiB written ahead of a sync that has not finished", n>>20)
 	}
-	close(release)
+	releaseOnce()
 }
 
 // Bulk data is handed to the system for writeback as it is written, so a
@@ -391,7 +397,7 @@ func TestWritebackIsRequestedForBulkData(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer j.Close()
+	defer closeWithin(t, j)
 	for i := 0; i < 100; i++ {
 		mustAppend(t, j, []byte("small"))
 	}
@@ -428,7 +434,7 @@ func TestWritebackStartsOverInARecycledSegment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer j.Close()
+	defer closeWithin(t, j)
 	chunk := make([]byte, 1<<20)
 	var last uint64
 	for i := 0; i < 9; i++ { // three segments
@@ -469,7 +475,7 @@ func TestMarksAreSpacedOutByRounds(t *testing.T) {
 	if n := marks.Load(); n != 2 {
 		t.Fatalf("%d marks written in 8 sync rounds, want 2", n)
 	}
-	j.Close()
+	closeWithin(t, j)
 	if n := marks.Load(); n != 3 {
 		t.Fatalf("%d marks after Close, want the final one too", n)
 	}

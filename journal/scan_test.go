@@ -46,7 +46,7 @@ func TestScanReadsWhatAnUnverifiedHeaderAnnounces(t *testing.T) {
 		last, _ = j.Append(ctx, []byte("data"))
 	}
 	j.Sync(ctx, last)
-	j.Close()
+	closeWithin(t, j)
 	// Plant, right after the last record, a header whose checksum is wrong
 	// and whose length says 7 MiB.
 	f, _ := d.Open("000000.seg")
@@ -59,7 +59,7 @@ func TestScanReadsWhatAnUnverifiedHeaderAnnounces(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	j.Close()
+	closeWithin(t, j)
 	if n.Load() > 4<<20 {
 		t.Fatalf("recovery read %d MiB to find that a 28-byte header with a bad checksum ends the log", n.Load()>>20)
 	}

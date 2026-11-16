@@ -30,7 +30,7 @@ func TestLockSameProcessLinkAndDiscard(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer j.Close()
+	defer closeWithin(t, j)
 	if _, err := journal.Open(dir, realOptions(dir)); !errors.Is(err, journal.ErrLocked) {
 		t.Fatalf("second Open: %v, want ErrLocked", err)
 	}
@@ -87,7 +87,7 @@ func TestLockHeldByAChildDiesWithIt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open after the holder was killed: %v", err)
 	}
-	j.Close()
+	closeWithin(t, j)
 }
 
 func TestLockHoldHelper(t *testing.T) {
@@ -120,14 +120,14 @@ func TestLockIsNotInheritedByChildren(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { child.Process.Kill(); child.Wait() }()
-	if err := j.Close(); err != nil {
+	if err := closeBounded(t, j); err != nil {
 		t.Fatal(err)
 	}
 	j, err = journal.Open(dir, realOptions(dir))
 	if err != nil {
 		t.Fatalf("a child process kept the directory locked after Close: %v", err)
 	}
-	j.Close()
+	closeWithin(t, j)
 }
 
 // tmpfs is refused with ErrVolatile (nothing is created in it), a
@@ -156,7 +156,7 @@ func TestPlacementAndModes(t *testing.T) {
 	}
 	seq, _ := j.Append(ctx, []byte("x"))
 	j.Sync(ctx, seq)
-	j.Close()
+	closeWithin(t, j)
 	fi, _ := os.Stat(dir)
 	t.Logf("pre-existing directory mode after Open: %v (the docs say the directory is 0700)", fi.Mode().Perm())
 	entries, _ := os.ReadDir(dir)
@@ -172,7 +172,7 @@ func TestPlacementAndModes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	j.Close()
+	closeWithin(t, j)
 	for _, p := range []string{filepath.Join(base, "a"), filepath.Join(base, "a", "b"), nested} {
 		fi, _ := os.Stat(p)
 		if fi.Mode().Perm() != 0o700 {
@@ -199,7 +199,7 @@ func TestDueCloseRaceWithRealClock(t *testing.T) {
 		if i%3 == 0 {
 			cancel() // the context ends as the deadline falls due
 		}
-		j.Close()
+		closeWithin(t, j)
 		select {
 		case <-ch:
 		default:
@@ -219,7 +219,7 @@ func TestFailingPublisherDoesNotSpin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer j.Close()
+	defer closeWithin(t, j)
 	if _, err := j.Append(ctx, []byte("x")); err != nil {
 		t.Fatal(err)
 	}
@@ -245,7 +245,7 @@ func TestFailingPublisherDoesNotSpin(t *testing.T) {
 func TestCancelledDueLeavesNothingBehind(t *testing.T) {
 	clk := newClock()
 	j := open(t, small(crash.New(), clk, 0))
-	defer j.Close()
+	defer closeWithin(t, j)
 	mustAppend(t, j, []byte("x"))
 	before := runtime.NumGoroutine()
 	var wg sync.WaitGroup

@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -69,7 +70,7 @@ func TestTornTail(t *testing.T) {
 		mustAppend(t, j, bytes.Repeat([]byte{byte('a' + i)}, size))
 	}
 	mustSync(t, j, 10)
-	j.Close()
+	closeWithin(t, j)
 
 	corrupt(t, d, "000000.seg", recordOffset(5, size)+40) // record 6, inside its payload
 	forgetMarks(t, d)                                     // no later sync finished: nothing proves record 6 was durable
@@ -86,10 +87,10 @@ func TestTornTail(t *testing.T) {
 		t.Fatalf("numbering after damage: %d, want 6", seq)
 	}
 	mustSync(t, j, 6)
-	j.Close()
+	closeWithin(t, j)
 
 	j = open(t, small(d, newClock(), 0))
-	defer j.Close()
+	defer closeWithin(t, j)
 	got = replayed(t, j)
 	if len(got) != 6 || got[5] != (entry{6, "new six"}) {
 		t.Fatalf("replay after the new record %v: the old record 6 or 7 came back", seqs(got))
@@ -108,7 +109,7 @@ func TestDamageBeforeTheMarkIsCorruption(t *testing.T) {
 		mustAppend(t, j, bytes.Repeat([]byte{byte('a' + i)}, size))
 	}
 	mustSync(t, j, 10)
-	j.Close() // writes the mark that proves 10
+	closeWithin(t, j) // writes the mark that proves 10
 
 	corrupt(t, d, "000000.seg", recordOffset(5, size)+40)
 	for try := 0; try < 2; try++ { // the refusal changes nothing, so it is the same every time
@@ -130,7 +131,7 @@ func TestHoleDiscardsLaterSegments(t *testing.T) {
 		mustAppend(t, j, bigRecord(i))
 	}
 	mustSync(t, j, 9)
-	j.Close()
+	closeWithin(t, j)
 
 	corrupt(t, d, "000001.seg", recordOffset(1, len(big))+500) // record 5, the middle of segment two
 	if _, err := journal.Open("", small(d, newClock(), 0)); !errors.Is(err, journal.ErrCorrupt) {
@@ -150,10 +151,10 @@ func TestHoleDiscardsLaterSegments(t *testing.T) {
 		mustAppend(t, j, []byte{byte('0' + i)})
 	}
 	mustSync(t, j, 8)
-	j.Close()
+	closeWithin(t, j)
 
 	j = open(t, small(d, newClock(), 0))
-	defer j.Close()
+	defer closeWithin(t, j)
 	got = replayed(t, j)
 	if len(got) != 8 {
 		t.Fatalf("replay %v, want 1 to 8", seqs(got))
@@ -177,7 +178,7 @@ func TestStoreAheadOfTheLog(t *testing.T) {
 		mustAppend(t, j, []byte{byte('0' + i)})
 	}
 	mustSync(t, j, 5)
-	j.Close()
+	closeWithin(t, j)
 
 	if _, err := journal.Open("", small(d, newClock(), 9)); !errors.Is(err, journal.ErrMismatch) {
 		t.Fatalf("Open with the store at 9 and a log ending at 5: %v", err)
@@ -186,7 +187,7 @@ func TestStoreAheadOfTheLog(t *testing.T) {
 	if got := replayed(t, j); len(got) != 5 {
 		t.Fatalf("the refusal cost records: %v", seqs(got))
 	}
-	j.Close()
+	closeWithin(t, j)
 
 	fresh := crash.New()
 	j = open(t, small(fresh, newClock(), 9))
@@ -200,10 +201,10 @@ func TestStoreAheadOfTheLog(t *testing.T) {
 		t.Fatalf("seq %d, want 10", seq)
 	}
 	mustSync(t, j, 10)
-	j.Close()
+	closeWithin(t, j)
 
 	j = open(t, small(fresh, newClock(), 9))
-	defer j.Close()
+	defer closeWithin(t, j)
 	if got := replayed(t, j); !reflect.DeepEqual(got, []entry{{10, "ten"}}) {
 		t.Fatalf("replay %v", got)
 	}
@@ -224,7 +225,7 @@ func TestWrongPublishedIsRefusedAndHarmless(t *testing.T) {
 	if err := j.Reclaim(); err != nil { // the segments of 1 to 6 are gone
 		t.Fatal(err)
 	}
-	j.Close()
+	closeWithin(t, j)
 
 	for _, wrong := range []uint64{0, 2, 5} {
 		if _, err := journal.Open("", small(d, newClock(), wrong)); !errors.Is(err, journal.ErrMismatch) {
@@ -235,7 +236,7 @@ func TestWrongPublishedIsRefusedAndHarmless(t *testing.T) {
 	if got, want := seqs(replayed(t, j)), []uint64{7, 8, 9}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("records 7 to 9 after the wrong mounts and the right one: %v", got)
 	}
-	j.Close()
+	closeWithin(t, j)
 
 	// Giving the records up is a separate, named act, and says what it gives up.
 	if err := journal.Discard("", small(d, newClock(), 0), 7, 8); !errors.Is(err, journal.ErrRange) {
@@ -245,12 +246,12 @@ func TestWrongPublishedIsRefusedAndHarmless(t *testing.T) {
 	if got := replayed(t, j); len(got) != 3 {
 		t.Fatalf("a refused Discard cost records: %v", seqs(got))
 	}
-	j.Close()
+	closeWithin(t, j)
 	if err := journal.Discard("", small(d, newClock(), 0), 7, 9); err != nil {
 		t.Fatal(err)
 	}
 	j = open(t, small(d, newClock(), 6))
-	defer j.Close()
+	defer closeWithin(t, j)
 	if got := replayed(t, j); len(got) != 0 {
 		t.Fatalf("Discard left %v", seqs(got))
 	}
@@ -273,7 +274,7 @@ func TestAnotherLineageIsRefused(t *testing.T) {
 		last = mustAppend(t, j, []byte{byte('A'), byte(i)})
 	}
 	mustSync(t, j, last)
-	j.Close()
+	closeWithin(t, j)
 
 	newer := small(d, newClock(), 8)
 	newer.Lineage = []byte("volume 7, round 2")
@@ -289,13 +290,13 @@ func TestAnotherLineageIsRefused(t *testing.T) {
 	if got := replayed(t, j); len(got) != 10 {
 		t.Fatalf("the refusals cost records: %v", seqs(got))
 	}
-	j.Close()
+	closeWithin(t, j)
 
 	if err := journal.Discard("", newer, 1, 10); err != nil {
 		t.Fatal(err)
 	}
 	j = open(t, newer)
-	defer j.Close()
+	defer closeWithin(t, j)
 	if got := replayed(t, j); len(got) != 0 {
 		t.Fatalf("the old lineage's records %v are in the new one", seqs(got))
 	}
@@ -307,7 +308,7 @@ func TestAnotherLineageIsRefused(t *testing.T) {
 // Records of this run are visible to Replay before any Sync.
 func TestReplaySeesUnsyncedRecords(t *testing.T) {
 	j := open(t, small(crash.New(), newClock(), 0))
-	defer j.Close()
+	defer closeWithin(t, j)
 	for i := 1; i <= 3; i++ {
 		mustAppend(t, j, []byte{byte('0' + i)})
 	}
@@ -320,7 +321,7 @@ func TestReplaySeesUnsyncedRecords(t *testing.T) {
 // from the callback stops it.
 func TestReplayAfterPublished(t *testing.T) {
 	j := open(t, small(crash.New(), newClock(), 0))
-	defer j.Close()
+	defer closeWithin(t, j)
 	for i := 1; i <= 6; i++ {
 		mustAppend(t, j, []byte{byte('0' + i)})
 	}
@@ -347,7 +348,7 @@ func TestReplayBlocksReclaim(t *testing.T) {
 		return nil
 	})
 	j := open(t, small(d, newClock(), 0))
-	defer j.Close()
+	defer closeWithin(t, j)
 	for i := 1; i <= 12; i++ {
 		mustAppend(t, j, bigRecord(i))
 	}
@@ -399,12 +400,12 @@ func TestCloseIsDurable(t *testing.T) {
 	for i := 1; i <= 5; i++ {
 		mustAppend(t, j, []byte{byte('0' + i)})
 	}
-	if err := j.Close(); err != nil {
+	if err := closeBounded(t, j); err != nil {
 		t.Fatal(err)
 	}
 	img := d.Image(d.Len(), crash.Variant{Kind: crash.Lost})
 	j = open(t, small(img, newClock(), 0))
-	defer j.Close()
+	defer closeWithin(t, j)
 	if got := replayed(t, j); len(got) != 5 {
 		t.Fatalf("after Close and a crash that keeps only synced data: %v", seqs(got))
 	}
@@ -439,7 +440,7 @@ func TestProcessCrashKeepsSyncedRecords(t *testing.T) {
 		}
 		r.Close()
 	}
-	j.Close()
+	closeWithin(t, j)
 }
 
 func TestOpenOptions(t *testing.T) {
@@ -451,7 +452,7 @@ func TestOpenOptions(t *testing.T) {
 	} {
 		opt.Disk = crash.New()
 		if j, err := journal.Open("", opt); err == nil {
-			j.Close()
+			closeWithin(t, j)
 			t.Errorf("%s: Open accepted %+v", name, opt)
 		}
 	}
@@ -459,7 +460,7 @@ func TestOpenOptions(t *testing.T) {
 
 func TestPayloadLimits(t *testing.T) {
 	j := open(t, small(crash.New(), newClock(), 0))
-	defer j.Close()
+	defer closeWithin(t, j)
 	if _, err := j.Append(ctx, make([]byte, 4096)); !errors.Is(err, journal.ErrTooLarge) {
 		t.Fatalf("payload of a segment: %v", err)
 	}
@@ -490,7 +491,7 @@ func TestForeignFiles(t *testing.T) {
 	}
 	j := open(t, small(d, newClock(), 0))
 	mustSync(t, j, mustAppend(t, j, []byte("kept")))
-	j.Close()
+	closeWithin(t, j)
 	names, _ := d.List()
 	found := false
 	for _, n := range names {
@@ -503,7 +504,7 @@ func TestForeignFiles(t *testing.T) {
 	other := small(d, newClock(), 0)
 	other.Segment, other.Capacity = 8192, 6*8192
 	j = open(t, other)
-	defer j.Close()
+	defer closeWithin(t, j)
 	if got := replayed(t, j); !reflect.DeepEqual(got, []entry{{1, "kept"}}) {
 		t.Fatalf("records of a segment of another size: %v", got)
 	}
@@ -511,7 +512,7 @@ func TestForeignFiles(t *testing.T) {
 
 func TestStatsCountWhatHappened(t *testing.T) {
 	j := open(t, small(crash.New(), newClock(), 0))
-	defer j.Close()
+	defer closeWithin(t, j)
 	a := mustAppend(t, j, []byte("abc"))
 	mustSync(t, j, a)
 	s := j.Stats()
@@ -561,7 +562,7 @@ func TestOpenMakesRecoveredRecordsDurable(t *testing.T) {
 	for i := 1; i <= 5; i++ {
 		mustAppend(t, j, []byte{byte('0' + i)})
 	}
-	j.Close()
+	closeWithin(t, j)
 	v := volatile(t, d)
 
 	j = open(t, small(v, newClock(), 0))
@@ -569,7 +570,7 @@ func TestOpenMakesRecoveredRecordsDurable(t *testing.T) {
 		t.Fatalf("marks %+v", m)
 	}
 	img := v.Image(v.Len(), crash.Variant{Kind: crash.Lost})
-	j.Close()
+	closeWithin(t, j)
 	r := open(t, small(img, newClock(), 0))
 	defer r.Close()
 	if got := replayed(t, r); len(got) != 5 {
@@ -591,7 +592,7 @@ func TestStaleRecordsOfAnEarlierLifeAreNotRevived(t *testing.T) {
 		mustAppend(t, j, bigRecord(i))
 	}
 	mustSync(t, j, 9)
-	j.Close()
+	closeWithin(t, j)
 
 	corrupt(t, d, "000001.seg", recordOffset(1, len(big))+500) // record 5: nothing after it counts
 	forgetMarks(t, d)
@@ -604,10 +605,10 @@ func TestStaleRecordsOfAnEarlierLifeAreNotRevived(t *testing.T) {
 		mustAppend(t, j, p)
 	}
 	mustSync(t, j, 7)
-	j.Close()
+	closeWithin(t, j)
 
 	j = open(t, opt)
-	defer j.Close()
+	defer closeWithin(t, j)
 	got := replayed(t, j)
 	if len(got) != 7 || !reflect.DeepEqual(got[4:], fresh) {
 		t.Fatalf("replay is %v: old records 8 and 9 were revived", seqs(got))
@@ -617,7 +618,7 @@ func TestStaleRecordsOfAnEarlierLifeAreNotRevived(t *testing.T) {
 // Nothing is waiting once everything is published: no timer is left behind.
 func TestDueLeavesNoTimerWhenDrained(t *testing.T) {
 	j, clk := newDue(t)
-	defer j.Close()
+	defer closeWithin(t, j)
 	mustAppend(t, j, []byte("a"))
 	j.Due(ctx, 5*time.Second)
 	if clk.Pending() != 1 {
@@ -645,7 +646,7 @@ func TestOpenTrimsToCapacity(t *testing.T) {
 	if err := j.Reclaim(); err != nil {
 		t.Fatal(err)
 	}
-	j.Close()
+	closeWithin(t, j)
 	before, _ := d.List()
 	if len(before) < 5 {
 		t.Fatalf("only %d files: %v", len(before), before)
@@ -653,7 +654,7 @@ func TestOpenTrimsToCapacity(t *testing.T) {
 
 	opt.Capacity, opt.Published = 3*4096, last
 	j = open(t, opt)
-	defer j.Close()
+	defer closeWithin(t, j)
 	if after, _ := d.List(); len(after) > 3 {
 		t.Fatalf("%d files for a capacity of 3 segments: %v", len(after), after)
 	}
@@ -669,7 +670,7 @@ func TestRecordOutOfSequenceEndsTheLog(t *testing.T) {
 		mustAppend(t, j, bytes.Repeat([]byte{byte('a' + i)}, size))
 	}
 	mustSync(t, j, 6)
-	j.Close()
+	closeWithin(t, j)
 
 	f, err := d.Open("000000.seg")
 	if err != nil {
@@ -685,7 +686,7 @@ func TestRecordOutOfSequenceEndsTheLog(t *testing.T) {
 	forgetMarks(t, d)
 
 	j = open(t, small(d, newClock(), 0))
-	defer j.Close()
+	defer closeWithin(t, j)
 	if got, want := seqs(replayed(t, j)), []uint64{1, 2, 3}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("replay %v, want %v", got, want)
 	}
@@ -712,7 +713,9 @@ func TestReclaimWaitsForTheAnchor(t *testing.T) {
 		return nil
 	})
 	j := open(t, small(d, newClock(), 0))
-	defer j.Close()
+	defer closeWithin(t, j)
+	releaseOnce := sync.OnceFunc(func() { close(hold) })
+	defer releaseOnce()       // before the Close, on every way out
 	for i := 1; i <= 3; i++ { // the first segment, full
 		mustAppend(t, j, bigRecord(i))
 	}
@@ -728,7 +731,7 @@ func TestReclaimWaitsForTheAnchor(t *testing.T) {
 	default:
 	}
 	parked.Store(false)
-	close(hold)
+	releaseOnce()
 	if got := seqs(replayed(t, j)); !reflect.DeepEqual(got, []uint64{4}) { // returns once the record is written
 		t.Fatalf("replay %v", got)
 	}

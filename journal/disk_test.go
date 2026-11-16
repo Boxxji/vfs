@@ -79,7 +79,7 @@ func TestFilesDiskRemovesLeftovers(t *testing.T) {
 		t.Fatal(err)
 	}
 	mustSync(t, j, mustAppend(t, j, []byte("x")))
-	j.Close()
+	closeWithin(t, j)
 	if _, err := os.Stat(filepath.Join(dir, "000007.seg.tmp")); !os.IsNotExist(err) {
 		t.Fatalf("the leftover is still there: %v", err)
 	}

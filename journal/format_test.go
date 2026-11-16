@@ -111,7 +111,7 @@ func TestDiscardRefusesWhatItWasNotToldAbout(t *testing.T) {
 		mustAppend(t, j, bigRecord(i))
 	}
 	mustSync(t, j, 9)
-	j.Close()
+	closeWithin(t, j)
 	// Lose the header of the middle segment: 1 to 3 are the log, 7 to 9 follow a hole.
 	f, _ := d.Open("000001.seg")
 	f.WriteAt(make([]byte, headerSize), 0)
@@ -137,7 +137,7 @@ func TestDiscardTakesTheCopyOfASegmentWithTheRange(t *testing.T) {
 		mustAppend(t, j, bigRecord(i))
 	}
 	mustSync(t, j, 3)
-	j.Close()
+	closeWithin(t, j)
 	src, _ := d.Open("000000.seg")
 	data := make([]byte, src.Size())
 	src.ReadAt(data, 0)
@@ -166,12 +166,12 @@ func TestReportListsValidRecordsBehindInSegmentDamage(t *testing.T) {
 		mustAppend(t, j, bytes.Repeat([]byte{byte('a' + i)}, size))
 	}
 	mustSync(t, j, 10)
-	j.Close()
+	closeWithin(t, j)
 	corrupt(t, d, "000000.seg", recordOffset(5, size)+40) // record 6
 	forgetMarks(t, d)                                     // the proof lags: nothing vouches for 6
 
 	j = open(t, small(d, newClock(), 0))
-	defer j.Close()
+	defer closeWithin(t, j)
 	r := j.Recovery()
 	if r.Last != 5 || !reflect.DeepEqual(r.Dropped, []journal.Range{{First: 6, Last: 10}}) {
 		t.Fatalf("recovery %+v: want 1 through 5 kept and 6 through 10 dropped", r)
@@ -188,12 +188,12 @@ func TestReportCannotListWhatLiesBehindADamagedHeader(t *testing.T) {
 		mustAppend(t, j, bytes.Repeat([]byte{byte('a' + i)}, size))
 	}
 	mustSync(t, j, 10)
-	j.Close()
+	closeWithin(t, j)
 	corrupt(t, d, "000000.seg", recordOffset(5, size)+10) // inside the header of record 6
 	forgetMarks(t, d)
 
 	j = open(t, small(d, newClock(), 0))
-	defer j.Close()
+	defer closeWithin(t, j)
 	if r := j.Recovery(); r.Last != 5 || len(r.Dropped) != 0 {
 		t.Fatalf("recovery %+v: want the log to end at 5 with nothing listed", r)
 	}
@@ -216,7 +216,7 @@ func TestUnknownFormatIsRefusedAndKept(t *testing.T) {
 		j, err := journal.Open("", small(d, newClock(), 0))
 		if !errors.Is(err, journal.ErrFormat) {
 			if err == nil {
-				j.Close()
+				closeWithin(t, j)
 			}
 			t.Fatalf("size %d: Open of a directory with a segment of another layout: %v, want ErrFormat", size, err)
 		}
@@ -245,7 +245,7 @@ func TestTornHeadersAreFreeNotForeign(t *testing.T) {
 		mustAppend(t, j, bigRecord(i))
 	}
 	mustSync(t, j, 3)
-	j.Close()
+	closeWithin(t, j)
 	// A wipe torn after its first byte; a header with its checksum damaged; a
 	// header whose magic was zeroed by a wipe that went further.
 	for name, damage := range map[string]func(f []byte){
@@ -264,7 +264,7 @@ func TestTornHeadersAreFreeNotForeign(t *testing.T) {
 	if j, err := journal.Open("", small(d, newClock(), 0)); err != nil {
 		t.Fatalf("Open with torn headers: %v", err)
 	} else {
-		j.Close()
+		closeWithin(t, j)
 	}
 }
 
@@ -279,12 +279,12 @@ func TestRestartWithTheClockBehindStartsTheBoundAgain(t *testing.T) {
 	seq := mustAppend(t, j, []byte("x"))
 	mustSync(t, j, seq)
 	c1.Advance(4900 * time.Millisecond) // 4.9 s of the 5 s have passed: 0.1 s left
-	j.Close()
+	closeWithin(t, j)
 
 	c2 := newClock() // a restart with the clock an hour behind what it was
 	c2.now = c1.Now().Add(-time.Hour)
 	j = open(t, small(d, c2, 0))
-	defer j.Close()
+	defer closeWithin(t, j)
 	ch := j.Due(ctx, 5*time.Second)
 	c2.Advance(4900 * time.Millisecond)
 	select {
@@ -314,7 +314,7 @@ func TestRestoredBackupIsInvisible(t *testing.T) {
 		mustAppend(t, j, []byte{byte('A'), byte(i)})
 	}
 	mustSync(t, j, 5)
-	j.Close()
+	closeWithin(t, j)
 	backup := d.Image(d.Len(), crash.Variant{Kind: crash.Lost}) // the operator's backup
 
 	j = open(t, small(d, newClock(), 0))
@@ -322,13 +322,13 @@ func TestRestoredBackupIsInvisible(t *testing.T) {
 		mustAppend(t, j, []byte{byte('B'), byte(i)})
 	}
 	mustSync(t, j, 9)
-	j.Close() // 6 to 9 acknowledged, unpublished; the disk dies; the backup is restored
+	closeWithin(t, j) // 6 to 9 acknowledged, unpublished; the disk dies; the backup is restored
 
 	j, err := journal.Open("", small(backup, newClock(), 0))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer j.Close()
+	defer closeWithin(t, j)
 	if got := replayed(t, j); !reflect.DeepEqual(seqs(got), []uint64{1, 2, 3, 4, 5}) {
 		t.Fatalf("restored backup replayed %v", seqs(got))
 	}

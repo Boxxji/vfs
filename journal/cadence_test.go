@@ -36,7 +36,7 @@ func TestCrashExplorationWithProductionCadence(t *testing.T) {
 					r.reclaim(t, j)
 				}
 			}
-			if err := j.Close(); err != nil {
+			if err := closeBounded(t, j); err != nil {
 				t.Fatal(err)
 			}
 			r.explore(t, 2)
@@ -62,7 +62,7 @@ func TestAMarkIsWrittenAfterAMegabyteWhateverTheRounds(t *testing.T) {
 	if first != 1 || through != 3 {
 		t.Fatalf("after four rounds of 300 KiB the mark says through %d (first %d), want 3", through, first)
 	}
-	j.Close()
+	closeWithin(t, j)
 }
 
 // The order of segments that claim the same first sequence is by name however
@@ -77,7 +77,7 @@ func TestManySegmentsWithCopiesKeepTheLowerName(t *testing.T) {
 		last = mustAppend(t, j, bigRecord(i))
 	}
 	mustSync(t, j, last)
-	j.Close()
+	closeWithin(t, j)
 	names, _ := d.List()
 	firsts := map[string]uint64{}
 	for _, name := range names {
@@ -103,7 +103,7 @@ func TestManySegmentsWithCopiesKeepTheLowerName(t *testing.T) {
 	}
 	opt.Disk = d
 	j = open(t, opt)
-	defer j.Close()
+	defer closeWithin(t, j)
 	for name, first := range firsts {
 		if live, got, _, _ := preamble(t, d, name); !live || got != first {
 			t.Errorf("%s began at %d and the copy of it was kept instead (live %v, now %d)", name, first, live, got)

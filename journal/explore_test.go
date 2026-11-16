@@ -47,7 +47,7 @@ func crashDuringRecovery(t *testing.T, seed int64, ops int) {
 		}
 	}
 	r.sync(t, j, visible)
-	j.Close()
+	closeWithin(t, j)
 
 	states, second := 0, 0
 	distinct := map[state]bool{}
@@ -103,7 +103,7 @@ func TestHeadAheadOfPublish(t *testing.T) {
 		}
 	}
 	r.sync(t, j, visible)
-	j.Close()
+	closeWithin(t, j)
 
 	distinct := map[state]bool{}
 	err := r.d.Explore(1, 3, func(img *crash.Disk, n int, v crash.Variant) error {
@@ -158,7 +158,7 @@ func TestDamageFuzz(t *testing.T) {
 			last = s
 		}
 		mustSync(t, j, last)
-		j.Close()
+		closeWithin(t, j)
 		names, _ := d.List()
 		for k := 0; k < 1+rng.Intn(4); k++ {
 			name := names[rng.Intn(len(names))]

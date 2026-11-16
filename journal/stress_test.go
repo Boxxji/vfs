@@ -158,7 +158,7 @@ func TestStress(t *testing.T) {
 		t.Fatal(f)
 	default:
 	}
-	if err := j.Close(); err != nil {
+	if err := closeBounded(t, j); err != nil {
 		t.Fatal(err)
 	}
 }

@@ -30,7 +30,7 @@ func TestAppendSyncReplayReopen(t *testing.T) {
 	if got := replayed(t, j); !reflect.DeepEqual(got, want) {
 		t.Fatalf("replay in the same run: %v records, want %v", len(got), len(want))
 	}
-	if err := j.Close(); err != nil {
+	if err := closeBounded(t, j); err != nil {
 		t.Fatal(err)
 	}
 
@@ -38,7 +38,7 @@ func TestAppendSyncReplayReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer j.Close()
+	defer closeWithin(t, j)
 	if got := replayed(t, j); !reflect.DeepEqual(got, want) {
 		t.Fatalf("replay after reopen: %d records, want %d", len(got), len(want))
 	}
@@ -65,12 +65,12 @@ func TestRotationReclaimAndNumbering(t *testing.T) {
 	if err := j.Reclaim(); err != nil {
 		t.Fatal(err)
 	}
-	if err := j.Close(); err != nil {
+	if err := closeBounded(t, j); err != nil {
 		t.Fatal(err)
 	}
 	// everything survives a clean close: replay is everything after the published mark
 	j = open(t, small(d, newClock(), last-10))
-	defer j.Close()
+	defer closeWithin(t, j)
 	got := replayed(t, j)
 	if len(got) != 10 || got[0].Seq != last-9 || got[9].Seq != last {
 		t.Fatalf("replay after publish %v", seqs(got))

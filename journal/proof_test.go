@@ -87,7 +87,7 @@ func TestATornMarkLeavesTheOtherSlot(t *testing.T) {
 	for i := 1; i <= 3; i++ {
 		mustSync(t, j, mustAppend(t, j, []byte{byte('0' + i)}))
 	}
-	j.Close()
+	closeWithin(t, j)
 
 	name := segmentStarting(t, d, 1)
 	a, b := through(t, d, name, 0), through(t, d, name, 1)
@@ -114,7 +114,7 @@ func TestAnEmptyLogAfterAMarkIsCorruption(t *testing.T) {
 	for i := 1; i <= 3; i++ {
 		mustSync(t, j, mustAppend(t, j, []byte{byte('0' + i)}))
 	}
-	j.Close()
+	closeWithin(t, j)
 	flip(t, d, segmentStarting(t, d, 1), recordsAt+recordHead)
 	if _, err := journal.Open("", small(d, newClock(), 0)); !errors.Is(err, journal.ErrCorrupt) {
 		t.Fatalf("every record unreadable under a mark: %v", err)
@@ -133,7 +133,7 @@ func TestALogThatBeginsLateAfterAcknowledgedRecordsIsCorruption(t *testing.T) {
 		last = mustAppend(t, j, bytes.Repeat([]byte{byte(i)}, 1000))
 	}
 	mustSync(t, j, last)
-	j.Close()
+	closeWithin(t, j)
 	poke(t, d, segmentStarting(t, d, 1), headerAt, make([]byte, 40))
 	if _, err := journal.Open("", small(d, newClock(), 0)); !errors.Is(err, journal.ErrCorrupt) {
 		t.Fatalf("the start of the log gone, records through %d acknowledged: %v", last, err)
@@ -155,7 +155,7 @@ func TestAStaleHeadAfterReclaimIsNeverReadAsAnEmptyLog(t *testing.T) {
 	r.sync(t, j, last)
 	r.publish(t, j, 3)
 	r.reclaim(t, j)
-	if err := j.Close(); err != nil {
+	if err := closeBounded(t, j); err != nil {
 		t.Fatal(err)
 	}
 	refused := 0
