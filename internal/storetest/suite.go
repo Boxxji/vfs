@@ -243,11 +243,12 @@ func Run(t *testing.T, open func(t *testing.T) backend.Backend) {
 		if got["pack/aa/one"].Size != 5 || got["pack/aa/two"].Size != 70000 {
 			t.Fatalf("sizes %+v", got)
 		}
-		// The time is the store's own: a store on this machine agrees with its clock to the
-		// second, and one elsewhere with the store's; either way it is a time, recent, and
-		// not before the first write by more than the clocks disagree.
+		// The time is the store's own, and every store the suite runs on is on this machine
+		// (a directory, a server in a test process, a server started for the tests): it is the
+		// time of the write to within the second that an S3 store truncates to, and so within
+		// two. A collector's grace must be longer than that second (SPECIFICATION 11.1).
 		for k, o := range got {
-			if o.Modified.IsZero() || o.Modified.Before(before.Add(-time.Hour)) || o.Modified.After(time.Now().Add(time.Hour)) {
+			if o.Modified.IsZero() || o.Modified.Before(before.Add(-2*time.Second)) || o.Modified.After(time.Now().Add(2*time.Second)) {
 				t.Errorf("%s: modified at %v, written at %v", k, o.Modified, before)
 			}
 		}

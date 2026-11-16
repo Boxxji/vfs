@@ -214,3 +214,62 @@ func TestResealRefusesAGarbageHead(t *testing.T) {
 		t.Error("a refused Reseal changed the Head")
 	}
 }
+
+// forgeTagged is an age file of plaintext followed by exactly the tag given, which a holder of
+// the key (here, the test) can make.
+func forgeTagged(t *testing.T, k *age.HybridIdentity, plain, tag []byte) []byte {
+	t.Helper()
+	r, err := age.ParseHybridRecipient(k.Recipient().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	w, err := age.Encrypt(&buf, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.Write(plain)
+	w.Write(tag)
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	id := ageKeyID(k)
+	return append(append([]byte{byte(len(id))}, id...), buf.Bytes()...)
+}
+
+// 4.1: the tag is 32 bytes and every one of them is checked: a tag that is right in its first
+// half and wrong anywhere in its second does not open. The tag of the key and of the plaintext is
+// recomputed from the text (BLAKE3 keyed, key = DeriveKey of the identity string).
+func TestEveryByteOfTheTagIsChecked(t *testing.T) {
+	k, _ := age.GenerateHybridIdentity()
+	c := Hybrid(k)
+	aad := headAAD("s3://b/p")
+	plain := append(append([]byte{}, aad...), Head{Seq: 4}.marshal()...)
+	var key [32]byte
+	blake3.DeriveKey("hanzoai/vfs seal tag", []byte(k.String()), key[:])
+	h, _ := blake3.NewKeyed(key[:])
+	h.Write(plain)
+	good := h.Sum(nil)
+	if len(good) != tagLen || tagLen != 32 {
+		t.Fatalf("the tag is %d bytes, the text says 32", len(good))
+	}
+	if _, err := unseal(c, aad, forgeTagged(t, k, plain, good)); err != nil {
+		t.Fatalf("the right tag does not open: %v", err)
+	}
+	for i := range good {
+		for _, bit := range []byte{1, 0x80} {
+			bad := append([]byte{}, good...)
+			bad[i] ^= bit
+			if _, err := unseal(c, aad, forgeTagged(t, k, plain, bad)); err == nil {
+				t.Errorf("a tag that differs in byte %d (bit %#x) opened", i, bit)
+			}
+		}
+	}
+	// a short tag, and a long one, are not the tag
+	for _, n := range []int{0, 16, 31, 33} {
+		tag := append(append([]byte{}, good...), make([]byte, 40)...)[:n]
+		if _, err := unseal(c, aad, forgeTagged(t, k, plain, tag)); err == nil {
+			t.Errorf("a tag of %d bytes opened", n)
+		}
+	}
+}
