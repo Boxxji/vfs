@@ -196,34 +196,8 @@ func Run(t *testing.T, open func(t *testing.T) backend.Backend) {
 				t.Fatalf("Stat %.40q: %d %v", k, n, err)
 			}
 		}
-		// What is outside the grammar is refused by every operation, and nothing happens.
-		bad := []string{"", "Head", "a b", "a%2e", "a.b", ".", "..", "a/../b", "a//b", "/a", "a/", "a\\b", "a:b", "caf\u00e9",
-			strings.Repeat("a", 256), strings.Repeat("a", 255) + "/" + strings.Repeat("b", 256), strings.Repeat("a/", 256)}
-		for _, k := range bad {
-			if err := be.Put(ctx, k, []byte("x")); !errors.Is(err, backend.ErrKey) {
-				t.Errorf("Put %.30q: %v, want ErrKey", k, err)
-			}
-			if _, _, err := be.Get(ctx, k, backend.Unbounded); !errors.Is(err, backend.ErrKey) {
-				t.Errorf("Get %.30q: %v, want ErrKey", k, err)
-			}
-			if _, err := be.PutIfAbsent(ctx, k, []byte("x")); !errors.Is(err, backend.ErrKey) {
-				t.Errorf("PutIfAbsent %.30q: %v, want ErrKey", k, err)
-			}
-			if _, err := be.PutIfVersion(ctx, k, []byte("x"), "v"); !errors.Is(err, backend.ErrKey) {
-				t.Errorf("PutIfVersion %.30q: %v, want ErrKey", k, err)
-			}
-			if _, err := be.GetRange(ctx, k, 0, 1); !errors.Is(err, backend.ErrKey) {
-				t.Errorf("GetRange %.30q: %v, want ErrKey", k, err)
-			}
-			if _, err := be.Stat(ctx, k); !errors.Is(err, backend.ErrKey) {
-				t.Errorf("Stat %.30q: %v, want ErrKey", k, err)
-			}
-			if err := be.Delete(ctx, k); !errors.Is(err, backend.ErrKey) {
-				t.Errorf("Delete %.30q: %v, want ErrKey", k, err)
-			}
-		}
 		if got := listKeys(t, be, ""); len(got) != len(good) {
-			t.Fatalf("after refused keys the store holds %d keys, want %d", len(got), len(good))
+			t.Fatalf("the store holds %d keys, want %d", len(got), len(good))
 		}
 	})
 
@@ -245,15 +219,6 @@ func Run(t *testing.T, open func(t *testing.T) backend.Backend) {
 		} {
 			if got := listKeys(t, be, prefix); !slices.Equal(got, want) {
 				t.Errorf("List(%q) = %v, want %v", prefix, got, want)
-			}
-		}
-		for _, prefix := range []string{"A", "a.", "/a", "a//b", "a b"} {
-			ch, errCh := be.List(ctx, prefix)
-			for range ch {
-				t.Errorf("List(%q) returned an object", prefix)
-			}
-			if err := <-errCh; !errors.Is(err, backend.ErrKey) {
-				t.Errorf("List(%q) = %v, want ErrKey", prefix, err)
 			}
 		}
 	})

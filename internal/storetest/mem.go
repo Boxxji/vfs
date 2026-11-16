@@ -87,9 +87,6 @@ func (m *Mem) Count() int {
 }
 
 func (m *Mem) Get(_ context.Context, key string, max int64) ([]byte, backend.Version, error) {
-	if err := backend.ValidKey(key); err != nil {
-		return nil, "", err
-	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	b, ok := m.objs[key]
@@ -103,9 +100,6 @@ func (m *Mem) Get(_ context.Context, key string, max int64) ([]byte, backend.Ver
 }
 
 func (m *Mem) GetRange(_ context.Context, key string, off, n int64) ([]byte, error) {
-	if err := backend.ValidKey(key); err != nil {
-		return nil, err
-	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	b, ok := m.objs[key]
@@ -119,9 +113,6 @@ func (m *Mem) GetRange(_ context.Context, key string, off, n int64) ([]byte, err
 }
 
 func (m *Mem) store(key string, data []byte, cond func(cur []byte, ok bool) bool) (backend.Version, error) {
-	if err := backend.ValidKey(key); err != nil {
-		return "", err
-	}
 	m.mu.Lock()
 	cur, ok := m.objs[key]
 	if cond != nil && !cond(cur, ok) {
@@ -149,9 +140,6 @@ func (m *Mem) PutIfVersion(_ context.Context, key string, data []byte, v backend
 }
 
 func (m *Mem) Delete(_ context.Context, key string) error {
-	if err := backend.ValidKey(key); err != nil {
-		return err
-	}
 	m.mu.Lock()
 	delete(m.objs, key)
 	delete(m.mod, key)
@@ -161,33 +149,24 @@ func (m *Mem) Delete(_ context.Context, key string) error {
 
 func (m *Mem) List(_ context.Context, prefix string) (<-chan backend.Object, <-chan error) {
 	var out []backend.Object
-	err := backend.ValidKeyPrefix(prefix)
-	if err == nil {
-		m.mu.Lock()
-		for k, b := range m.objs {
-			if strings.HasPrefix(k, prefix) {
-				out = append(out, backend.Object{Key: k, Size: int64(len(b)), Modified: m.mod[k]})
-			}
+	m.mu.Lock()
+	for k, b := range m.objs {
+		if strings.HasPrefix(k, prefix) {
+			out = append(out, backend.Object{Key: k, Size: int64(len(b)), Modified: m.mod[k]})
 		}
-		m.mu.Unlock()
 	}
+	m.mu.Unlock()
 	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
-	ch, errCh := make(chan backend.Object, len(out)), make(chan error, 1)
+	ch, errCh := make(chan backend.Object, len(out)), make(chan error)
 	for _, o := range out {
 		ch <- o
 	}
 	close(ch)
-	if err != nil {
-		errCh <- err
-	}
 	close(errCh)
 	return ch, errCh
 }
 
 func (m *Mem) Stat(_ context.Context, key string) (int64, error) {
-	if err := backend.ValidKey(key); err != nil {
-		return 0, err
-	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	b, ok := m.objs[key]

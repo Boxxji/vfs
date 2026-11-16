@@ -2,11 +2,12 @@
 // suitable for production: writes are atomic (temp file + rename) but not
 // durable against power loss.
 //
-// A key is a path under the directory. The grammar of backend.ValidKey (lower case
-// letters, digits and "-", segments of at most 255 bytes) is the one a file system keeps
-// as written, so every key a Backend must accept is kept as given and listed by its
-// string prefix. Two names are the store's own and are never listed: ".lock" and ".tmp"
-// at the top of the directory, which no key can name (a key has no ".").
+// A key is a path under the directory. Every key of the grammar of backend.ValidKey (lower
+// case letters, digits and "-", segments of at most 255 bytes) is kept as given and listed
+// by its string prefix. A key outside it is kept if the file system keeps it (the replica
+// package names its objects "orgs/acme/kv.db"), and refused with backend.ErrKey if it would
+// leave the directory (an empty, "." or ".." segment), contains NUL, or names the store's
+// own: ".lock" and ".tmp" at the top of the directory, which are never listed.
 //
 // Conditional writes are atomic: every mutation runs under one flock on the
 // store directory, so a PutIfAbsent or PutIfVersion decides and writes with no
@@ -101,9 +102,29 @@ func missing(err error) bool {
 	return errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOTDIR)
 }
 
-// keyPath is where a key is kept, or "" for a key outside the grammar.
+// safe reports whether key (or, for a listing, a prefix whose last segment may be partial
+// or empty) names a path inside the directory that is not the store's own.
+func safe(key string, prefix bool) error {
+	if key == "" && !prefix || strings.ContainsRune(key, 0) {
+		return fmt.Errorf("%w: %q", backend.ErrKey, key)
+	}
+	segs := strings.Split(key, "/")
+	for i, seg := range segs {
+		last := i == len(segs)-1
+		switch {
+		case seg == "" && prefix && last:
+		case seg == "", seg == ".", seg == "..":
+			return fmt.Errorf("%w: %q has an empty, \".\" or \"..\" segment", backend.ErrKey, key)
+		case i == 0 && (seg == ".lock" || seg == ".tmp"):
+			return fmt.Errorf("%w: %q is a name of the store's own", backend.ErrKey, key)
+		}
+	}
+	return nil
+}
+
+// keyPath is where a key is kept, or "" for a key that is not safe.
 func (f *fileBackend) keyPath(key string) string {
-	if backend.ValidKey(key) != nil {
+	if safe(key, false) != nil {
 		return ""
 	}
 	return filepath.Join(f.root, filepath.FromSlash(key))
@@ -112,10 +133,13 @@ func (f *fileBackend) keyPath(key string) string {
 // invalid is the error for a key keyPath refused, or for a key that a path cannot hold
 // beside the others (one that is a directory of another).
 func invalid(key string, err error) error {
-	if kerr := backend.ValidKey(key); kerr != nil {
+	if kerr := safe(key, false); kerr != nil {
 		return kerr
 	}
-	if errors.Is(err, syscall.ENOTDIR) || errors.Is(err, syscall.EISDIR) {
+	if errors.Is(err, syscall.ENAMETOOLONG) {
+		return fmt.Errorf("%w: %s has a segment the file system cannot name", backend.ErrKey, key)
+	}
+	if errors.Is(err, syscall.ENOTDIR) || errors.Is(err, syscall.EISDIR) || errors.Is(err, syscall.EEXIST) || errors.Is(err, syscall.ENOTEMPTY) {
 		return fmt.Errorf("%w: %s is a path prefix of another key, or has one as its prefix", backend.ErrKey, key)
 	}
 	return err
@@ -299,7 +323,7 @@ func (f *fileBackend) Delete(_ context.Context, key string) error {
 func (f *fileBackend) List(ctx context.Context, prefix string) (<-chan backend.Object, <-chan error) {
 	objs := make(chan backend.Object, 64)
 	errCh := make(chan error, 1)
-	if err := backend.ValidKeyPrefix(prefix); err != nil {
+	if err := safe(prefix, true); err != nil {
 		errCh <- err
 		close(objs)
 		close(errCh)

@@ -29,8 +29,9 @@ var (
 	// is not the expected one, or it is absent (PutIfVersion). Nothing was written.
 	ErrConflict = errors.New("backend: conditional write lost")
 
-	// ErrKey is returned by every operation that is given a key outside the grammar
-	// of ValidKey. Nothing was read or written.
+	// ErrKey is returned by an operation that is given a key the Backend cannot keep: a
+	// directory-backed one refuses a key that would leave its directory, and keeps no two
+	// keys of which one is a directory of the other. Nothing was read or written.
 	ErrKey = errors.New("backend: invalid key")
 )
 
@@ -38,14 +39,15 @@ var (
 // key by one "/", so the whole is at most 1024, the longest key an S3 store keeps.
 const MaxKey = 511
 
-// ValidKey reports whether key is one every Backend must keep, exactly as given: 1 to
-// MaxKey bytes of "a" to "z", "0" to "9" and "-", in segments of 1 to 255 bytes
-// separated by "/". The alphabet is the one every store keeps without folding it,
-// normalising it or giving it another meaning (a case-insensitive file system, a path
-// segment of "." or ".."), and a segment is as long as a file name may be. The keys a
-// Volume writes (SPECIFICATION 3) are all of this grammar and every key of one kind has
-// the same number of segments, so no key is a prefix of another at a "/", which a store
-// that keeps keys as files could not hold.
+// ValidKey reports whether key is of the grammar of every key a Volume writes, which every
+// Backend MUST keep exactly as given: 1 to MaxKey bytes of "a" to "z", "0" to "9" and "-",
+// in segments of 1 to 255 bytes separated by "/". The alphabet is the one every store keeps
+// without folding it, normalising it or giving it another meaning (a case-insensitive file
+// system, a path segment of "." or ".."), and a segment is as long as a file name may be.
+// The keys a Volume writes (SPECIFICATION 3) are all of this grammar and every key of one
+// kind has the same number of segments, so no key is a prefix of another at a "/", which
+// a store that keeps keys as files could not hold. A Backend MAY keep other keys (the
+// replica package's "orgs/acme/kv.db"); nothing is promised for them.
 func ValidKey(key string) error {
 	if key == "" || len(key) > MaxKey {
 		return fmt.Errorf("%w: %d bytes, want 1 to %d", ErrKey, len(key), MaxKey)

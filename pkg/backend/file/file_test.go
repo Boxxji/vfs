@@ -187,3 +187,50 @@ func TestFileOfADirectoryNotYetThere(t *testing.T) {
 		t.Fatalf("places %q and %q", a.String(), b.String())
 	}
 }
+
+// TestFileKeys: a key that would leave the directory, or names the store's own files, is
+// refused and touches nothing; one that the grammar of a Volume's keys does not cover (a dot,
+// a capital) is kept if the file system keeps it, as the replica package needs.
+func TestFileKeys(t *testing.T) {
+	be, dir := newFileBE(t)
+	ctx := context.Background()
+	for _, bad := range []string{"", "/a", "a/", "a//b", ".", "..", "a/../b", "../x", "a/./b", ".lock", ".tmp/x", "a\x00b"} {
+		if err := be.Put(ctx, bad, []byte("x")); !errors.Is(err, backend.ErrKey) {
+			t.Errorf("Put %q = %v, want ErrKey", bad, err)
+		}
+		if _, _, err := be.Get(ctx, bad, backend.Unbounded); !errors.Is(err, backend.ErrKey) {
+			t.Errorf("Get %q = %v, want ErrKey", bad, err)
+		}
+	}
+	for _, prefix := range []string{"/a", "a//b", "..", "../x", "a/../b", ".lock"} {
+		ch, errCh := be.List(ctx, prefix)
+		for range ch {
+			t.Errorf("List(%q) returned an object", prefix)
+		}
+		if err := <-errCh; !errors.Is(err, backend.ErrKey) {
+			t.Errorf("List(%q) = %v, want ErrKey", prefix, err)
+		}
+	}
+	for _, ok := range []string{"orgs/acme/kv.db", "orgs/acme/kv.db.ver", "Upper", "a..b", ".hidden", "a b", "a%2e"} {
+		if err := be.Put(ctx, ok, []byte("v:"+ok)); err != nil {
+			t.Errorf("Put %q: %v", ok, err)
+			continue
+		}
+		if got, _, err := be.Get(ctx, ok, backend.Unbounded); err != nil || string(got) != "v:"+ok {
+			t.Errorf("Get %q: %q %v", ok, got, err)
+		}
+	}
+	// a key that is a directory of another cannot be kept beside it, and says so
+	if err := be.Put(ctx, "orgs/acme", []byte("x")); !errors.Is(err, backend.ErrKey) {
+		t.Errorf("Put of a directory's name = %v, want ErrKey", err)
+	}
+	if err := be.Put(ctx, "Upper/under", []byte("x")); !errors.Is(err, backend.ErrKey) {
+		t.Errorf("Put under a file = %v, want ErrKey", err)
+	}
+	if _, _, err := be.Get(ctx, "orgs/acme", backend.Unbounded); !errors.Is(err, backend.ErrNotFound) {
+		t.Errorf("Get of a directory of keys = %v, want ErrNotFound", err)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(dir), "x")); err == nil {
+		t.Error("a key left the directory")
+	}
+}

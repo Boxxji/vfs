@@ -133,9 +133,10 @@ the Head compare-and-swap is the only mutation of the tree.
   `Volume.PutExt` and `GetExt` keep one at `ext/<name>/<BLAKE3 of the key, hex>`, sealed
   to the Volume, the name and the key, outside the Round's fence. Readers ignore keys
   they do not know and a collector never deletes them (11.1 says how collection will go).
-* A key of any backend is 1 to 511 bytes of `a-z`, `0-9`, `-` in segments of at most 255,
-  separated by `/`; every backend refuses another (`backend.ErrKey`). `List` returns
-  objects with size and modification time, by string prefix.
+* Every key a Volume writes is 1 to 511 bytes of `a-z`, `0-9`, `-` in segments of at most
+  255, separated by `/`; every backend keeps those as written (a backend may keep more: the
+  replica package's `orgs/acme/kv.db`), and `storetest.Strict` refuses any other from the
+  Volume. `List` returns objects with size and modification time, by string prefix.
 * On error the changes stay in memory for the next Flush and the outcome of that
   attempt is unknown. `ErrStaleRound` means this Volume was fenced; if the store's
   Head is exactly its tree, Flush says nil (the commit landed, the reply was lost).

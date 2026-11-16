@@ -48,17 +48,18 @@ relative to the Volume's prefix, which is joined to them with one `/`.
 A Volume reads and writes with the first six. `List` and `Stat` are for tools: a
 collector (11.1), and the check of a copied Volume (5.4).
 
-A key is 1 to 511 bytes of `a-z`, `0-9` and `-`, in segments of 1 to 255 bytes separated
-by `/`, and every operation MUST refuse another (`InvalidKey`) without effect. That is
-the alphabet that every store keeps as written: a case-insensitive file system, one that
-normalises names, one that gives `.` and `..` a meaning, or one that reads `%2e` as a dot
-would each keep a wider one differently, and a file backend would need a name it cannot
-make. The longest key leaves a 512-byte prefix room in the 1,024 bytes that an object
-store keeps. The keys of this text are all of the grammar, and all of one kind have the
+Every key of this text is 1 to 511 bytes of `a-z`, `0-9` and `-`, in segments of 1 to 255
+bytes separated by `/`. A store MUST keep every key of that grammar exactly as given, and
+`List` it by its string prefix with none hidden; it MAY keep other keys (the SQLite
+replica of this repository names objects `orgs/acme/kv.db`) and this text promises nothing
+for them. The grammar is the alphabet that every store keeps as written: a case-insensitive
+file system, one that normalises names, one that gives `.` and `..` a meaning, or one that
+reads `%2e` as a dot would each keep a wider one differently, and a store that keeps keys
+as files has a name for a segment only up to 255 bytes. The longest key leaves a 512-byte
+prefix room in the 1,024 bytes that an object store keeps. All keys of one kind have the
 same number of segments, so no key is a prefix of another at a `/`, which a store that
-keeps keys as files could not hold; a key written that is not of that shape (an
-extension's, by mistake) MAY be refused by such a store, and a read of one that is only
-the directory of other keys answers as absent or empty, whichever the store does.
+keeps keys as files could not hold: it refuses a key that is the directory of another
+(`InvalidKey`), and a read of such a name answers absent or empty, whichever the store does.
 
 A version token is opaque and compared only for equality: two reads of an unchanged
 object return the same token, and any write by anyone changes it. A store that cannot
