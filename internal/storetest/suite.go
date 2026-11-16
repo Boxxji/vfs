@@ -5,9 +5,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/hanzoai/vfs/pkg/backend"
 )
@@ -160,14 +163,128 @@ func Run(t *testing.T, open func(t *testing.T) backend.Backend) {
 		}
 		ch, errCh := be.List(ctx, "pack/aa")
 		var got []string
-		for k := range ch {
-			got = append(got, k)
+		for o := range ch {
+			got = append(got, o.Key)
 		}
 		if err := <-errCh; err != nil {
 			t.Fatal(err)
 		}
 		if len(got) != 2 {
 			t.Fatalf("List(pack/aa) = %v, want 2 keys", got)
+		}
+	})
+
+	t.Run("keys", func(t *testing.T) {
+		be := open(t)
+		long255 := strings.Repeat("a", 255)
+		deep := strings.Repeat("b", 250) + "/" + strings.Repeat("c", 250)    // 501 bytes
+		longest := strings.Repeat("d", 255) + "/" + strings.Repeat("e", 255) // 511 bytes
+		good := []string{
+			"head", "ext/x/a", "ext/x/ab", "ext/x/a-b-0", "k0/" + long255, deep, longest,
+			"ext/trace/" + strings.Repeat("0123456789abcdef", 4),
+		}
+		for _, k := range good {
+			if err := be.Put(ctx, k, []byte("v:"+k)); err != nil {
+				t.Fatalf("Put %.40q (%d bytes): %v", k, len(k), err)
+			}
+		}
+		for _, k := range good {
+			if got, _, err := be.Get(ctx, k, backend.Unbounded); err != nil || string(got) != "v:"+k {
+				t.Fatalf("Get %.40q: %q %v", k, got, err)
+			}
+			if n, err := be.Stat(ctx, k); err != nil || n != int64(2+len(k)) {
+				t.Fatalf("Stat %.40q: %d %v", k, n, err)
+			}
+		}
+		// What is outside the grammar is refused by every operation, and nothing happens.
+		bad := []string{"", "Head", "a b", "a%2e", "a.b", ".", "..", "a/../b", "a//b", "/a", "a/", "a\\b", "a:b", "caf\u00e9",
+			strings.Repeat("a", 256), strings.Repeat("a", 255) + "/" + strings.Repeat("b", 256), strings.Repeat("a/", 256)}
+		for _, k := range bad {
+			if err := be.Put(ctx, k, []byte("x")); !errors.Is(err, backend.ErrKey) {
+				t.Errorf("Put %.30q: %v, want ErrKey", k, err)
+			}
+			if _, _, err := be.Get(ctx, k, backend.Unbounded); !errors.Is(err, backend.ErrKey) {
+				t.Errorf("Get %.30q: %v, want ErrKey", k, err)
+			}
+			if _, err := be.PutIfAbsent(ctx, k, []byte("x")); !errors.Is(err, backend.ErrKey) {
+				t.Errorf("PutIfAbsent %.30q: %v, want ErrKey", k, err)
+			}
+			if _, err := be.PutIfVersion(ctx, k, []byte("x"), "v"); !errors.Is(err, backend.ErrKey) {
+				t.Errorf("PutIfVersion %.30q: %v, want ErrKey", k, err)
+			}
+			if _, err := be.GetRange(ctx, k, 0, 1); !errors.Is(err, backend.ErrKey) {
+				t.Errorf("GetRange %.30q: %v, want ErrKey", k, err)
+			}
+			if _, err := be.Stat(ctx, k); !errors.Is(err, backend.ErrKey) {
+				t.Errorf("Stat %.30q: %v, want ErrKey", k, err)
+			}
+			if err := be.Delete(ctx, k); !errors.Is(err, backend.ErrKey) {
+				t.Errorf("Delete %.30q: %v, want ErrKey", k, err)
+			}
+		}
+		if got := listKeys(t, be, ""); len(got) != len(good) {
+			t.Fatalf("after refused keys the store holds %d keys, want %d", len(got), len(good))
+		}
+	})
+
+	t.Run("list is by string prefix", func(t *testing.T) {
+		be := open(t)
+		for _, k := range []string{"ext/y/ab", "ext/y/a/c", "ext/y/b", "ext/yy/a", "head"} {
+			if err := be.Put(ctx, k, []byte("12345")); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for prefix, want := range map[string][]string{
+			"ext/y/a":  {"ext/y/a/c", "ext/y/ab"},
+			"ext/y/a/": {"ext/y/a/c"},
+			"ext/y":    {"ext/y/a/c", "ext/y/ab", "ext/y/b", "ext/yy/a"},
+			"ext/y/":   {"ext/y/a/c", "ext/y/ab", "ext/y/b"},
+			"h":        {"head"},
+			"nothing":  nil,
+			"":         {"ext/y/a/c", "ext/y/ab", "ext/y/b", "ext/yy/a", "head"},
+		} {
+			if got := listKeys(t, be, prefix); !slices.Equal(got, want) {
+				t.Errorf("List(%q) = %v, want %v", prefix, got, want)
+			}
+		}
+		for _, prefix := range []string{"A", "a.", "/a", "a//b", "a b"} {
+			ch, errCh := be.List(ctx, prefix)
+			for range ch {
+				t.Errorf("List(%q) returned an object", prefix)
+			}
+			if err := <-errCh; !errors.Is(err, backend.ErrKey) {
+				t.Errorf("List(%q) = %v, want ErrKey", prefix, err)
+			}
+		}
+	})
+
+	t.Run("list tells size and time", func(t *testing.T) {
+		be := open(t)
+		before := time.Now()
+		if err := be.Put(ctx, "pack/aa/one", []byte("12345")); err != nil {
+			t.Fatal(err)
+		}
+		if err := be.Put(ctx, "pack/aa/two", make([]byte, 70000)); err != nil {
+			t.Fatal(err)
+		}
+		ch, errCh := be.List(ctx, "pack/aa/")
+		got := map[string]backend.Object{}
+		for o := range ch {
+			got[o.Key] = o
+		}
+		if err := <-errCh; err != nil {
+			t.Fatal(err)
+		}
+		if got["pack/aa/one"].Size != 5 || got["pack/aa/two"].Size != 70000 {
+			t.Fatalf("sizes %+v", got)
+		}
+		// The time is the store's own: a store on this machine agrees with its clock to the
+		// second, and one elsewhere with the store's; either way it is a time, recent, and
+		// not before the first write by more than the clocks disagree.
+		for k, o := range got {
+			if o.Modified.IsZero() || o.Modified.Before(before.Add(-time.Hour)) || o.Modified.After(time.Now().Add(time.Hour)) {
+				t.Errorf("%s: modified at %v, written at %v", k, o.Modified, before)
+			}
 		}
 	})
 
@@ -199,4 +316,19 @@ func Run(t *testing.T, open func(t *testing.T) backend.Backend) {
 			t.Fatalf("large object range failed: %v", err)
 		}
 	})
+}
+
+// listKeys returns the keys List gives for a prefix, sorted.
+func listKeys(t *testing.T, be backend.Backend, prefix string) []string {
+	t.Helper()
+	ch, errCh := be.List(context.Background(), prefix)
+	var out []string
+	for o := range ch {
+		out = append(out, o.Key)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("List(%q): %v", prefix, err)
+	}
+	slices.Sort(out)
+	return out
 }

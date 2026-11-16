@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // S3 is an S3 protocol server over memory, path-style, one bucket: the subset a
@@ -28,6 +29,7 @@ type S3 struct {
 
 	mu       sync.Mutex
 	objs     map[string][]byte
+	mod      map[string]time.Time
 	requests int
 }
 
@@ -40,7 +42,7 @@ func (s *S3) Requests() int {
 
 // NewS3 starts the server for the life of the test. Endpoint is its host:port.
 func NewS3(t *testing.T, bucket string) *S3 {
-	s := &S3{Bucket: bucket, objs: map[string][]byte{}}
+	s := &S3{Bucket: bucket, objs: map[string][]byte{}, mod: map[string]time.Time{}}
 	s.srv = httptest.NewServer(http.HandlerFunc(s.serve))
 	t.Cleanup(s.srv.Close)
 	return s
@@ -141,6 +143,7 @@ func (s *S3) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.objs[key] = data
+		s.mod[key] = time.Now()
 		w.Header().Set("ETag", quoted(data))
 	case http.MethodGet, http.MethodHead:
 		if !exists {
@@ -148,7 +151,7 @@ func (s *S3) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.Header().Set("ETag", quoted(cur))
-		w.Header().Set("Last-Modified", "Mon, 02 Jan 2006 15:04:05 GMT")
+		w.Header().Set("Last-Modified", s.mod[key].UTC().Format(http.TimeFormat))
 		w.Header().Set("Accept-Ranges", "bytes")
 		data, status := cur, http.StatusOK
 		if rg := r.Header.Get("Range"); rg != "" {
@@ -168,6 +171,7 @@ func (s *S3) serve(w http.ResponseWriter, r *http.Request) {
 		}
 	case http.MethodDelete:
 		delete(s.objs, key)
+		delete(s.mod, key)
 		w.WriteHeader(http.StatusNoContent)
 	default:
 		s.fail(w, http.StatusMethodNotAllowed, "MethodNotAllowed")
@@ -183,8 +187,10 @@ func (s *S3) list(w http.ResponseWriter, prefix string) {
 		}
 	}
 	sizes := map[string]int{}
+	mods := map[string]time.Time{}
 	for _, k := range keys {
 		sizes[k] = len(s.objs[k])
+		mods[k] = s.mod[k]
 	}
 	s.mu.Unlock()
 	sort.Strings(keys)
@@ -194,7 +200,7 @@ func (s *S3) list(w http.ResponseWriter, prefix string) {
 	for _, k := range keys {
 		var esc bytes.Buffer
 		_ = xml.EscapeText(&esc, []byte(k))
-		fmt.Fprintf(&out, "<Contents><Key>%s</Key><Size>%d</Size><LastModified>2006-01-02T15:04:05.000Z</LastModified></Contents>", esc.String(), sizes[k])
+		fmt.Fprintf(&out, "<Contents><Key>%s</Key><Size>%d</Size><LastModified>%s</LastModified></Contents>", esc.String(), sizes[k], mods[k].UTC().Format("2006-01-02T15:04:05.000Z"))
 	}
 	out.WriteString("</ListBucketResult>")
 	w.Header().Set("Content-Type", "application/xml")

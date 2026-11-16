@@ -66,8 +66,8 @@ func (d *discard) PutIfVersion(_ context.Context, k string, b []byte, v backend.
 	return "v", nil
 }
 func (d *discard) Delete(context.Context, string) error { return nil }
-func (d *discard) List(context.Context, string) (<-chan string, <-chan error) {
-	c, e := make(chan string), make(chan error)
+func (d *discard) List(context.Context, string) (<-chan backend.Object, <-chan error) {
+	c, e := make(chan backend.Object), make(chan error)
 	close(c)
 	close(e)
 	return c, e

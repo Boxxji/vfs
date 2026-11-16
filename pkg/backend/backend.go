@@ -12,6 +12,7 @@ import (
 	"math"
 	"net/url"
 	"strings"
+	"time"
 )
 
 var (
@@ -27,7 +28,73 @@ var (
 	// precondition failed: the key exists (PutIfAbsent), or its stored version
 	// is not the expected one, or it is absent (PutIfVersion). Nothing was written.
 	ErrConflict = errors.New("backend: conditional write lost")
+
+	// ErrKey is returned by every operation that is given a key outside the grammar
+	// of ValidKey. Nothing was read or written.
+	ErrKey = errors.New("backend: invalid key")
 )
+
+// MaxKey is the longest key, in bytes. A prefix is at most 512 bytes and is joined to a
+// key by one "/", so the whole is at most 1024, the longest key an S3 store keeps.
+const MaxKey = 511
+
+// ValidKey reports whether key is one every Backend must keep, exactly as given: 1 to
+// MaxKey bytes of "a" to "z", "0" to "9" and "-", in segments of 1 to 255 bytes
+// separated by "/". The alphabet is the one every store keeps without folding it,
+// normalising it or giving it another meaning (a case-insensitive file system, a path
+// segment of "." or ".."), and a segment is as long as a file name may be. The keys a
+// Volume writes (SPECIFICATION 3) are all of this grammar and every key of one kind has
+// the same number of segments, so no key is a prefix of another at a "/", which a store
+// that keeps keys as files could not hold.
+func ValidKey(key string) error {
+	if key == "" || len(key) > MaxKey {
+		return fmt.Errorf("%w: %d bytes, want 1 to %d", ErrKey, len(key), MaxKey)
+	}
+	if err := validAlphabet(key); err != nil {
+		return err
+	}
+	for _, seg := range strings.Split(key, "/") {
+		if seg == "" || len(seg) > 255 {
+			return fmt.Errorf("%w: %q has an empty segment or one over 255 bytes", ErrKey, key)
+		}
+	}
+	return nil
+}
+
+// ValidKeyPrefix reports whether p can be the prefix of a listing: the alphabet of a key,
+// ending anywhere, in the middle of a segment or at a "/", or empty.
+func ValidKeyPrefix(p string) error {
+	if len(p) > MaxKey {
+		return fmt.Errorf("%w: a prefix of %d bytes", ErrKey, len(p))
+	}
+	if err := validAlphabet(p); err != nil {
+		return err
+	}
+	if strings.Contains(p, "//") || strings.HasPrefix(p, "/") {
+		return fmt.Errorf("%w: the prefix %q has an empty segment", ErrKey, p)
+	}
+	return nil
+}
+
+func validAlphabet(s string) error {
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; {
+		case c >= 'a' && c <= 'z', c >= '0' && c <= '9', c == '-', c == '/':
+		default:
+			return fmt.Errorf("%w: byte %#x of %q is not a-z, 0-9, - or /", ErrKey, c, s)
+		}
+	}
+	return nil
+}
+
+// Object is one entry of a listing: the key, its size, and when the store last modified
+// it, by the store's own clock. A collector decides what is old by this time and never
+// by a writer's.
+type Object struct {
+	Key      string
+	Size     int64
+	Modified time.Time
+}
 
 // Unbounded is the max argument of Get for a caller that accepts any size.
 const Unbounded int64 = math.MaxInt64
@@ -85,11 +152,11 @@ func ValidPrefix(p string) error {
 	for _, seg := range strings.Split(p, "/") {
 		switch seg {
 		case "", ".", "..":
-			return fmt.Errorf("backend: prefix %q has an empty, \".\" or \"..\" segment", p)
+			return fmt.Errorf("backend: prefix %q has an empty, \".\" or \"..\" segment", redact(p))
 		}
 		for _, r := range seg {
 			if r < 0x20 || r == 0x7f {
-				return fmt.Errorf("backend: prefix %q has a control character", p)
+				return fmt.Errorf("backend: prefix %q has a control character", redact(p))
 			}
 		}
 	}
@@ -144,10 +211,11 @@ type Backend interface {
 	// Delete removes the key. Removing a non-existent key MUST NOT error.
 	Delete(ctx context.Context, key string) error
 
-	// List returns keys with the given prefix. The returned channel is
-	// closed when the listing completes; on error the channel is closed
-	// after the error is sent on errCh.
-	List(ctx context.Context, prefix string) (keys <-chan string, errCh <-chan error)
+	// List returns the objects whose keys begin with prefix, as a string and not as a
+	// directory: List("ext/y/a") returns "ext/y/ab" as well as "ext/y/a/c". It hides
+	// none. The returned channel is closed when the listing completes; on error the
+	// channel is closed after the error is sent on errCh.
+	List(ctx context.Context, prefix string) (objects <-chan Object, errCh <-chan error)
 
 	// Stat returns the size in bytes for key without fetching the body.
 	// ErrNotFound is returned if the key is absent.

@@ -12,6 +12,9 @@ import (
 // excludes other open file descriptions, so it orders writers across goroutines
 // and across processes sharing the directory.
 func (f *fileBackend) lock() (func(), error) {
+	if err := os.MkdirAll(f.root, 0o755); err != nil {
+		return nil, err
+	}
 	l, err := os.OpenFile(filepath.Join(f.root, ".lock"), os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, err

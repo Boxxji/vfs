@@ -151,6 +151,9 @@ func conflict(err error, key string) error {
 }
 
 func (s *s3Backend) Get(ctx context.Context, key string, max int64) ([]byte, backend.Version, error) {
+	if err := backend.ValidKey(key); err != nil {
+		return nil, "", err
+	}
 	obj, err := s.client.GetObject(ctx, s.bucket, s.k(key), hs3.GetObjectOptions{})
 	if err != nil {
 		return nil, "", notFound(err, key)
@@ -177,6 +180,9 @@ func (s *s3Backend) Get(ctx context.Context, key string, max int64) ([]byte, bac
 }
 
 func (s *s3Backend) GetRange(ctx context.Context, key string, off, n int64) ([]byte, error) {
+	if err := backend.ValidKey(key); err != nil {
+		return nil, err
+	}
 	var opts hs3.GetObjectOptions
 	if err := opts.SetRange(off, off+n-1); err != nil {
 		return nil, err
@@ -197,6 +203,9 @@ func (s *s3Backend) GetRange(ctx context.Context, key string, off, n int64) ([]b
 }
 
 func (s *s3Backend) Put(ctx context.Context, key string, data []byte) error {
+	if err := backend.ValidKey(key); err != nil {
+		return err
+	}
 	_, err := s.client.PutObject(ctx, s.bucket, s.k(key),
 		bytes.NewReader(data), int64(len(data)), hs3.PutObjectOptions{PartSize: partSize})
 	return err
@@ -210,6 +219,9 @@ func tooLarge(key string, n int) error {
 }
 
 func (s *s3Backend) PutIfAbsent(ctx context.Context, key string, data []byte) (backend.Version, error) {
+	if err := backend.ValidKey(key); err != nil {
+		return "", err
+	}
 	if len(data) > partSize {
 		return "", tooLarge(key, len(data))
 	}
@@ -223,6 +235,9 @@ func (s *s3Backend) PutIfAbsent(ctx context.Context, key string, data []byte) (b
 }
 
 func (s *s3Backend) PutIfVersion(ctx context.Context, key string, data []byte, v backend.Version) (backend.Version, error) {
+	if err := backend.ValidKey(key); err != nil {
+		return "", err
+	}
 	if len(data) > partSize {
 		return "", tooLarge(key, len(data))
 	}
@@ -241,15 +256,24 @@ func (s *s3Backend) PutIfVersion(ctx context.Context, key string, data []byte, v
 }
 
 func (s *s3Backend) Delete(ctx context.Context, key string) error {
+	if err := backend.ValidKey(key); err != nil {
+		return err
+	}
 	// Idempotent by contract — an absent key is not an error.
 	return s.client.RemoveObject(ctx, s.bucket, s.k(key), hs3.RemoveObjectOptions{})
 }
 
-func (s *s3Backend) List(ctx context.Context, prefix string) (<-chan string, <-chan error) {
-	keys := make(chan string, 256)
+func (s *s3Backend) List(ctx context.Context, prefix string) (<-chan backend.Object, <-chan error) {
+	objs := make(chan backend.Object, 256)
 	errCh := make(chan error, 1)
+	if err := backend.ValidKeyPrefix(prefix); err != nil {
+		errCh <- err
+		close(objs)
+		close(errCh)
+		return objs, errCh
+	}
 	go func() {
-		defer close(keys)
+		defer close(objs)
 		defer close(errCh)
 		for obj := range s.client.ListObjects(ctx, s.bucket, hs3.ListObjectsOptions{
 			Prefix:    s.k(prefix),
@@ -266,14 +290,17 @@ func (s *s3Backend) List(ctx context.Context, prefix string) (<-chan string, <-c
 			select {
 			case <-ctx.Done():
 				return
-			case keys <- k:
+			case objs <- backend.Object{Key: k, Size: obj.Size, Modified: obj.LastModified}:
 			}
 		}
 	}()
-	return keys, errCh
+	return objs, errCh
 }
 
 func (s *s3Backend) Stat(ctx context.Context, key string) (int64, error) {
+	if err := backend.ValidKey(key); err != nil {
+		return 0, err
+	}
 	info, err := s.client.StatObject(ctx, s.bucket, s.k(key), hs3.StatObjectOptions{})
 	if err != nil {
 		return 0, notFound(err, key)

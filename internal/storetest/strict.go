@@ -50,7 +50,7 @@ func (s Strict) Delete(ctx context.Context, key string) error {
 	return s.Backend.Delete(ctx, key)
 }
 
-func (s Strict) List(ctx context.Context, prefix string) (<-chan string, <-chan error) {
+func (s Strict) List(ctx context.Context, prefix string) (<-chan backend.Object, <-chan error) {
 	need(ctx)
 	return s.Backend.List(ctx, prefix)
 }

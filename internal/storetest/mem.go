@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/hanzoai/vfs/pkg/backend"
 )
@@ -22,10 +23,22 @@ import (
 type Mem struct {
 	mu   sync.Mutex
 	objs map[string][]byte
+	mod  map[string]time.Time
 	puts map[string]int
+	now  func() time.Time
 }
 
-func NewMem() *Mem { return &Mem{objs: map[string][]byte{}, puts: map[string]int{}} }
+func NewMem() *Mem {
+	return &Mem{objs: map[string][]byte{}, mod: map[string]time.Time{}, puts: map[string]int{}, now: time.Now}
+}
+
+// SetClock replaces the clock that stamps the modification time of what is written, so a
+// test can make an object old without waiting.
+func (m *Mem) SetClock(now func() time.Time) {
+	m.mu.Lock()
+	m.now = now
+	m.mu.Unlock()
+}
 
 func etag(b []byte) backend.Version {
 	sum := md5.Sum(b)
@@ -74,6 +87,9 @@ func (m *Mem) Count() int {
 }
 
 func (m *Mem) Get(_ context.Context, key string, max int64) ([]byte, backend.Version, error) {
+	if err := backend.ValidKey(key); err != nil {
+		return nil, "", err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	b, ok := m.objs[key]
@@ -87,6 +103,9 @@ func (m *Mem) Get(_ context.Context, key string, max int64) ([]byte, backend.Ver
 }
 
 func (m *Mem) GetRange(_ context.Context, key string, off, n int64) ([]byte, error) {
+	if err := backend.ValidKey(key); err != nil {
+		return nil, err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	b, ok := m.objs[key]
@@ -100,6 +119,9 @@ func (m *Mem) GetRange(_ context.Context, key string, off, n int64) ([]byte, err
 }
 
 func (m *Mem) store(key string, data []byte, cond func(cur []byte, ok bool) bool) (backend.Version, error) {
+	if err := backend.ValidKey(key); err != nil {
+		return "", err
+	}
 	m.mu.Lock()
 	cur, ok := m.objs[key]
 	if cond != nil && !cond(cur, ok) {
@@ -107,6 +129,7 @@ func (m *Mem) store(key string, data []byte, cond func(cur []byte, ok bool) bool
 		return "", fmt.Errorf("%w: %s", backend.ErrConflict, key)
 	}
 	m.objs[key] = append([]byte(nil), data...)
+	m.mod[key] = m.now()
 	m.puts[class(key)]++
 	m.mu.Unlock()
 	return etag(data), nil
@@ -126,32 +149,45 @@ func (m *Mem) PutIfVersion(_ context.Context, key string, data []byte, v backend
 }
 
 func (m *Mem) Delete(_ context.Context, key string) error {
+	if err := backend.ValidKey(key); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	delete(m.objs, key)
+	delete(m.mod, key)
 	m.mu.Unlock()
 	return nil
 }
 
-func (m *Mem) List(_ context.Context, prefix string) (<-chan string, <-chan error) {
-	m.mu.Lock()
-	var keys []string
-	for k := range m.objs {
-		if strings.HasPrefix(k, prefix) {
-			keys = append(keys, k)
+func (m *Mem) List(_ context.Context, prefix string) (<-chan backend.Object, <-chan error) {
+	var out []backend.Object
+	err := backend.ValidKeyPrefix(prefix)
+	if err == nil {
+		m.mu.Lock()
+		for k, b := range m.objs {
+			if strings.HasPrefix(k, prefix) {
+				out = append(out, backend.Object{Key: k, Size: int64(len(b)), Modified: m.mod[k]})
+			}
 		}
+		m.mu.Unlock()
 	}
-	m.mu.Unlock()
-	sort.Strings(keys)
-	ch, errCh := make(chan string, len(keys)), make(chan error)
-	for _, k := range keys {
-		ch <- k
+	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+	ch, errCh := make(chan backend.Object, len(out)), make(chan error, 1)
+	for _, o := range out {
+		ch <- o
 	}
 	close(ch)
+	if err != nil {
+		errCh <- err
+	}
 	close(errCh)
 	return ch, errCh
 }
 
 func (m *Mem) Stat(_ context.Context, key string) (int64, error) {
+	if err := backend.ValidKey(key); err != nil {
+		return 0, err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	b, ok := m.objs[key]
