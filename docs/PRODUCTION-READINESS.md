@@ -112,18 +112,21 @@ Mount tests run only with `-tags fuse`, from a child process that serves the mou
 while the test acts as its client; a process that mounts a Volume and also opens a
 file on that mount deadlocks. The real-server tests need an `s3` binary on `PATH`.
 
-CI (`hanzo.yml`, `.github/workflows/cicd.yml`) runs eleven gates as parallel jobs, each
-under five minutes on the runner (measured on the run of the head this round: `check`
-4 m 25 s, `race` 4 m 28 s, `realserver` 4 m 24 s, `unit` 3 m 22 s, `scale-b` 4 m 47 s,
-`sqlite` 3 m 37 s, `scale-a` 3 m 19 s, `realserver-kill` 3 m 12 s, `model` 2 m 48 s,
-`fuzz` 2 m 25 s, all from a cold Go cache): `check` (build, vet and gofmt of what does
+CI (`hanzo.yml`, `.github/workflows/cicd.yml`) runs eleven gates as jobs, three at a
+time, each under five minutes on the runner. On the run of 13e4705 the longest was
+3 m 21 s (`scale-b`), then `realserver` 3 m 05 s, `race` 2 m 52 s, `scale-a` 2 m 47 s,
+`check` 2 m 41 s, `realserver-kill` 2 m 32 s, `scale-c` 2 m 19 s, `sqlite` 2 m 19 s,
+`fuzz` 2 m 04 s, `model` 2 m 03 s and `unit` 1 m 36 s, all from a cold Go cache. The
+times depend on the node, which other repositories' jobs share: with six gates at
+once the first three took between five and six minutes, which is why it is three.
+The gates are: `check` (build, vet and gofmt of what does
 not need the SQLite engine); `unit`; `race`, the tests that have goroutines under the
 race detector, with the handlers of the mount; `model`, the random tests against a
 plain model, without the race detector (they have no goroutines, and the detector
 multiplies their hashing tenfold); `sqlite`, the only gate that builds the SQLite
 engine; `realserver` and `realserver-kill`, against the real Hanzo S3 server, which
-fail if a test they exist for did not pass; the measurements `scale-a`, `scale-b` and `scale-c`;
-and `fuzz`. The server is the published image of release v1.0.41, pinned by digest and
+fail if a test they exist for did not pass; the measurements `scale-a`, `scale-b` and
+`scale-c`; and `fuzz`. The server is the published image of release v1.0.41, pinned by digest and
 read with `crane`, which needs no docker: building it from its source costs five
 minutes of a cold job, and every real-server test passes against the release as it did
 against a build of the main commit cbf3d650.
