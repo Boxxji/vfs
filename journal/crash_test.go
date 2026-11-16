@@ -84,7 +84,9 @@ func (r *run) append(t testing.TB, j *journal.Journal, p []byte) uint64 {
 }
 
 func (r *run) sync(t testing.TB, j *journal.Journal, seq uint64) {
-	if err := j.Sync(ctx, seq); err != nil {
+	c, cancel := within()
+	defer cancel()
+	if err := j.Sync(c, seq); err != nil {
 		t.Errorf("Sync(%d): %v", seq, err)
 		return
 	}
@@ -285,36 +287,42 @@ func equal(a, b []entry) bool {
 // Sequential: append, sync, publish and reclaim in an order that crosses
 // every segment boundary and recycles every file several times.
 func TestCrashSequential(t *testing.T) {
-	r := newRun()
-	j := open(t, r.opts(0))
-	rng := rand.New(rand.NewSource(7))
-	var visible, published uint64
-	for i := 0; i < 400; i++ {
-		seq := r.append(t, j, payload(uint64(rng.Intn(1000))))
-		visible = seq
-		switch rng.Intn(10) {
-		case 0, 1, 2, 3:
-			r.sync(t, j, seq)
-		case 4, 5:
-			published += uint64(rng.Intn(int(visible-published))) + 1
-			r.publish(t, j, published)
-		case 6, 7:
-			r.reclaim(t, j)
-		}
+	for _, every := range []int{1, 3, 16, 1000} {
+		t.Run(fmt.Sprintf("every%d", every), func(t *testing.T) {
+			defer journal.MarkEvery(every)()
+			r := newRun()
+			j := open(t, r.opts(0))
+			rng := rand.New(rand.NewSource(int64(7 + every)))
+			var visible, published uint64
+			for i := 0; i < 110; i++ {
+				seq := r.append(t, j, payload(uint64(rng.Intn(1000))))
+				visible = seq
+				switch rng.Intn(10) {
+				case 0, 1, 2, 3:
+					r.sync(t, j, seq)
+				case 4, 5:
+					published += uint64(rng.Intn(int(visible-published))) + 1
+					r.publish(t, j, published)
+				case 6, 7:
+					r.reclaim(t, j)
+				}
+			}
+			r.sync(t, j, visible)
+			if err := j.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if r.activate <= r.creates {
+				t.Fatalf("%d segments started over %d files: nothing was recycled", r.activate, r.creates)
+			}
+			r.explore(t, 2)
+		})
 	}
-	r.sync(t, j, visible)
-	if err := j.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if r.activate <= r.creates {
-		t.Fatalf("%d segments started over %d files: nothing was recycled", r.activate, r.creates)
-	}
-	r.explore(t, 2)
 }
 
 // Concurrent: several writers appending and syncing while a publisher
 // publishes and reclaims. The log is whatever order the disk saw.
 func TestCrashConcurrent(t *testing.T) {
+	defer journal.MarkEvery(3)()
 	r := newRun()
 	j := open(t, r.opts(0))
 	var wg sync.WaitGroup
@@ -353,6 +361,7 @@ func TestCrashConcurrent(t *testing.T) {
 // Sessions: close, reopen with the Head's sequence, and carry on, as the
 // Volume does. The files of earlier sessions are still on the disk.
 func TestCrashSessions(t *testing.T) {
+	defer journal.MarkEvery(16)()
 	r := newRun()
 	var published uint64
 	for session := 0; session < 3; session++ {
@@ -382,21 +391,26 @@ func TestCrashSessions(t *testing.T) {
 // that is a prefix: a wipe of a newer segment must never persist without the
 // wipe of an older one, or the synced records after the gap would be lost.
 func TestCrashReclaim(t *testing.T) {
-	r := newRun()
-	j := open(t, r.opts(0))
-	big := bytes.Repeat([]byte("x"), 1000) // three to a segment
-	var last uint64
-	for i := 0; i < 9; i++ {
-		last = r.append(t, j, big)
+	for _, every := range []int{1, 3, 16, 1000} {
+		t.Run(fmt.Sprintf("every%d", every), func(t *testing.T) {
+			defer journal.MarkEvery(every)()
+			r := newRun()
+			j := open(t, r.opts(0))
+			big := bytes.Repeat([]byte("x"), 1000) // three to a segment
+			var last uint64
+			for i := 0; i < 9; i++ {
+				last = r.append(t, j, big)
+			}
+			r.sync(t, j, last)
+			for i := 0; i < 3; i++ {
+				r.append(t, j, big) // 10 to 12, not synced
+			}
+			r.publish(t, j, 6) // the first two segments; 7 to 9 are synced and unpublished
+			r.reclaim(t, j)
+			if err := j.Close(); err != nil {
+				t.Fatal(err)
+			}
+			r.explore(t, 2)
+		})
 	}
-	r.sync(t, j, last)
-	for i := 0; i < 3; i++ {
-		r.append(t, j, big) // 10 to 12, not synced
-	}
-	r.publish(t, j, 6) // the first two segments; 7 to 9 are synced and unpublished
-	r.reclaim(t, j)
-	if err := j.Close(); err != nil {
-		t.Fatal(err)
-	}
-	r.explore(t, 2)
 }

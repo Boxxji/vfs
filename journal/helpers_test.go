@@ -3,8 +3,10 @@ package journal_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"sync"
@@ -16,6 +18,11 @@ import (
 )
 
 var ctx = context.Background()
+
+// A mark every round, so that every crash state has marks in it. Production
+// writes one every sixteenth round or megabyte; the tests that explore crashes
+// run at several cadences, and say so.
+func init() { journal.MarkEvery(1) }
 
 // clock is a clock the test controls. Time moves only when the test moves it.
 type clock struct {
@@ -126,7 +133,9 @@ func open(t testing.TB, opt journal.Options) *journal.Journal {
 
 func mustAppend(t testing.TB, j *journal.Journal, p []byte) uint64 {
 	t.Helper()
-	seq, err := j.Append(ctx, p)
+	c, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	seq, err := j.Append(c, p)
 	if err != nil {
 		t.Fatalf("Append: %v", err)
 	}
@@ -135,7 +144,9 @@ func mustAppend(t testing.TB, j *journal.Journal, p []byte) uint64 {
 
 func mustSync(t testing.TB, j *journal.Journal, seq uint64) {
 	t.Helper()
-	if err := j.Sync(ctx, seq); err != nil {
+	c, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := j.Sync(c, seq); err != nil {
 		t.Fatalf("Sync(%d): %v", seq, err)
 	}
 }
@@ -227,19 +238,37 @@ func publish(t testing.TB, j *journal.Journal, seq uint64) {
 	}
 }
 
-// scratch is a directory for a test that needs the operating system's files.
-// It is made next to the tests, not in the temporary directory: that may be
-// memory (tmpfs), where the journal refuses to run.
+// scratch is a directory for a test that needs the operating system's files:
+// the test's own temporary directory, or, where that is memory (tmpfs), where
+// the journal refuses to run, a directory made next to the tests.
 func scratch(t testing.TB) string {
 	t.Helper()
+	dir := t.TempDir()
+	probe, err := journal.Files(filepath.Join(dir, "probe"))
+	if err == nil {
+		probe.Close()
+		if err := os.Remove(filepath.Join(dir, "probe")); err != nil {
+			t.Fatal(err)
+		}
+		return dir
+	}
+	if !errors.Is(err, journal.ErrVolatile) {
+		t.Fatal(err)
+	}
 	wd, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)
 	}
-	dir, err := os.MkdirTemp(wd, ".scratch-")
+	dir, err = os.MkdirTemp(wd, ".scratch-")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { os.RemoveAll(dir) })
 	return dir
+}
+
+// within bounds a call that a broken journal would wait in for ever, so that
+// a test which hangs fails in seconds. The caller cancels.
+func within() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, 5*time.Second)
 }
