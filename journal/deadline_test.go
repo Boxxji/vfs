@@ -62,6 +62,7 @@ func TestDueTimerRunningDuringCloseDoesNotDoubleClose(t *testing.T) {
 // The same race with the wall clock and real timers: a deadline that falls due
 // while Close holds the mutex. A hit used to kill the test binary.
 func TestDueCloseRaceWithTheWallClock(t *testing.T) {
+	t.Parallel() // real time, not CPU: it runs beside the others once the serial tests are done
 	end := time.Now().Add(1500 * time.Millisecond)
 	for i := 0; time.Now().Before(end); i++ {
 		j, err := journal.Open("", journal.Options{Capacity: 1 << 20, Segment: 64 << 10, Disk: crash.New()})

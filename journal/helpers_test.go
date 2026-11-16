@@ -124,6 +124,10 @@ func small(disk journal.Disk, clk journal.Clock, published uint64) journal.Optio
 
 func open(t testing.TB, opt journal.Options) *journal.Journal {
 	t.Helper()
+	// A journal that deadlocks hangs a Close that no context can end. Name the
+	// test and stop, rather than wait for the test binary's own timeout.
+	hung := time.AfterFunc(20*time.Second, func() { panic(t.Name() + " has not finished in 20 s: the journal is stuck") })
+	t.Cleanup(func() { hung.Stop() })
 	j, err := journal.Open("", opt)
 	if err != nil {
 		t.Fatalf("Open: %v", err)

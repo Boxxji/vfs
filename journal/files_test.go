@@ -54,6 +54,7 @@ func TestLockSameProcessLinkAndDiscard(t *testing.T) {
 // a child process holds the lock and is killed with SIGKILL: the kernel
 // releases it and the next Open works. While the child lives, Open is refused.
 func TestLockHeldByAChildDiesWithIt(t *testing.T) {
+	t.Parallel() // real time, not CPU: it runs beside the others once the serial tests are done
 	if os.Getenv("JOURNAL_HOLD") != "" {
 		return
 	}
@@ -108,6 +109,7 @@ func TestLockHoldHelper(t *testing.T) {
 // a descriptor must not leak into a child that outlives the journal. Start
 // a long-lived child after Open, Close the journal, and open again.
 func TestLockIsNotInheritedByChildren(t *testing.T) {
+	t.Parallel() // real time, not CPU: it runs beside the others once the serial tests are done
 	dir := filepath.Join(scratch(t), "j")
 	j, err := journal.Open(dir, realOptions(dir))
 	if err != nil {
@@ -181,6 +183,7 @@ func TestPlacementAndModes(t *testing.T) {
 
 // the Due/Close race on the wall clock, with a cancellable Due.
 func TestDueCloseRaceWithRealClock(t *testing.T) {
+	t.Parallel() // real time, not CPU: it runs beside the others once the serial tests are done
 	end := time.Now().Add(time.Second)
 	for i := 0; time.Now().Before(end); i++ {
 		j, err := journal.Open("", journal.Options{Capacity: 1 << 20, Segment: 64 << 10, Disk: crash.New()})
@@ -211,6 +214,7 @@ func TestDueCloseRaceWithRealClock(t *testing.T) {
 // A publisher whose publication always fails sees one overdue record. Due must
 // not fire more often than Retry, on the wall clock.
 func TestFailingPublisherDoesNotSpin(t *testing.T) {
+	t.Parallel() // real time, not CPU: it runs beside the others once the serial tests are done
 	j, err := journal.Open("", journal.Options{Capacity: 1 << 20, Segment: 64 << 10, Disk: crash.New(), Retry: 50 * time.Millisecond})
 	if err != nil {
 		t.Fatal(err)

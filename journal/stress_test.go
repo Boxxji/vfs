@@ -23,6 +23,7 @@ import (
 // after the Published it started from and every payload is the one appended;
 // nothing deadlocks. Run with -race.
 func TestStress(t *testing.T) {
+	t.Parallel() // real time, not CPU: it runs beside the others once the serial tests are done
 	d := crash.New()
 	rng := rand.New(rand.NewSource(3))
 	var rmu sync.Mutex
