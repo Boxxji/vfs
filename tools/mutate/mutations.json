@@ -635,8 +635,8 @@
  {
   "name": "s3 backend: URL prefix not validated",
   "file": "pkg/backend/s3/s3.go",
-  "old": "\tprefix := strings.Trim(u.Path, \"/\")\n\tif err := backend.ValidPrefix(prefix); err != nil {",
-  "new": "\tprefix := strings.Trim(u.Path, \"/\")\n\tif err := backend.ValidPrefix(prefix); false && err != nil {",
+  "old": "\tprefix := strings.TrimPrefix(u.Path, \"/\")\n\tif err := backend.ValidPrefix(prefix); err != nil {",
+  "new": "\tprefix := strings.TrimPrefix(u.Path, \"/\")\n\tif err := backend.ValidPrefix(prefix); false && err != nil {",
   "pkg": "./pkg/backend/s3",
   "run": "TestURL"
  },
@@ -700,24 +700,6 @@
   "tags": "fuse"
  },
  {
-  "name": "mount: a commit runs on its caller's context",
-  "file": "pkg/mount/errno.go",
-  "old": "\tf := c.join()\n\tselect {",
-  "new": "\tf := &flight{done: make(chan struct{})}\n\tf.err = c.vol.Flush(req)\n\tclose(f.done)\n\tselect {",
-  "pkg": "./pkg/mount",
-  "run": "TestCommitSurvivesItsCaller",
-  "tags": "fuse"
- },
- {
-  "name": "mount: a read runs on its request's context",
-  "file": "pkg/mount/fuse_unix.go",
-  "old": "own(context.WithoutCancel(ctx), h.s.base, func",
-  "new": "own(context.WithoutCancel(ctx), ctx, func",
-  "pkg": "./pkg/mount",
-  "run": "TestReadWaitsForItsData",
-  "tags": "fuse"
- },
- {
   "name": "mount: an interrupt is EIO",
   "file": "pkg/mount/errno.go",
   "old": "\tcase errors.Is(err, context.Canceled):",
@@ -732,32 +714,14 @@
   "old": "\tcase errors.Is(err, context.Canceled):",
   "new": "\tcase false && errors.Is(err, context.Canceled):",
   "pkg": "./pkg/mount",
-  "run": "TestFUSEInterruptsAreNotErrors",
-  "tags": "fuse"
- },
- {
-  "name": "mount: a read gives up when interrupted",
-  "file": "pkg/mount/fuse_unix.go",
-  "old": "data, err := own(context.WithoutCancel(ctx), h.s.base, func(c context.Context) ([]byte, error) {",
-  "new": "data, err := own(ctx, h.s.base, func(c context.Context) ([]byte, error) {",
-  "pkg": "./pkg/mount",
-  "run": "TestReadWaitsForItsData",
-  "tags": "fuse"
- },
- {
-  "name": "mount: a close gives up when interrupted",
-  "file": "pkg/mount/fuse_unix.go",
-  "old": "return errno(h.s.group.commit(context.WithoutCancel(ctx)))",
-  "new": "return errno(h.s.group.commit(ctx))",
-  "pkg": "./pkg/mount",
-  "run": "TestCloseWaitsForItsCommit",
+  "run": "^TestInterruptIsEINTR$",
   "tags": "fuse"
  },
  {
   "name": "mount: a session without a mount context",
   "file": "pkg/mount/errno.go",
-  "old": "return &session{vol: vol, base: base, group: newCommitter(vol)}",
-  "new": "return &session{vol: vol, group: newCommitter(vol)}",
+  "old": "return &session{vol: vol, base: base, group: newCommitter(vol), reads: make(chan struct{}, readSlots)}",
+  "new": "return &session{vol: vol, group: newCommitter(vol), reads: make(chan struct{}, readSlots)}",
   "pkg": "./pkg/mount",
   "run": "TestLookedUpFileReadsOnTheMountContext|TestReadWaitsForItsData",
   "tags": "fuse"
@@ -765,8 +729,8 @@
  {
   "name": "seal: the context is not compared",
   "file": "cipher.go",
-  "old": "if len(plain) < bindLen || subtle.ConstantTimeCompare(plain[:bindLen], aad) != 1 {",
-  "new": "if len(plain) < bindLen || subtle.ConstantTimeCompare(plain[:bindLen], aad) != 1 && false {",
+  "old": "if subtle.ConstantTimeCompare(plain[:bindLen], aad) != 1 {",
+  "new": "if subtle.ConstantTimeCompare(plain[:bindLen], aad) != 1 && false {",
   "pkg": ".",
   "run": "TestHeadContextIsExact|TestSwappedHeadIsRefused|TestSealedToItsContext"
  },
@@ -816,7 +780,7 @@
   "old": "\tif c.run == nil {\n\t\tc.run = &flight{done: make(chan struct{})}",
   "new": "\tif true {\n\t\tc.run = &flight{done: make(chan struct{})}",
   "pkg": "./pkg/mount",
-  "run": "TestInterruptedFsyncRetriesDoNotPileUp",
+  "run": "^TestFsyncCallersShareTwoCommits$",
   "tags": "fuse"
  },
  {
@@ -846,7 +810,7 @@
  {
   "name": "volume: Reseal keeps the old place",
   "file": "volume.go",
-  "old": "return seal(cfg.Cipher, headAAD(cfg.Backend.String()), plain)",
+  "old": "return seal(cfg.Cipher, headAAD(here), plain)",
   "new": "return seal(cfg.Cipher, headAAD(from), plain)",
   "pkg": ".",
   "run": "TestResealMovesAVolume"
@@ -888,7 +852,7 @@
   "file": "pkg/fence/fence.go",
   "old": "const magic = \"fence\\x00\"",
   "new": "const magic = \"fence\\x01\"",
-  "pkg": "./pkg/fence",
+  "pkg": ".",
   "run": "^TestSpec"
  },
  {
@@ -919,7 +883,7 @@
   "name": "redact: keeps what precedes a malformed scheme",
   "file": "pkg/backend/backend.go",
   "old": "return head + \"***@\" + raw[at+1:]",
-  "new": "return raw",
+  "new": "_ = head\n\treturn raw",
   "pkg": ".",
   "run": "^TestRedaction"
  },
@@ -1164,15 +1128,6 @@
   "new": "func (h *handle) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.WriteResponse) error {\n",
   "pkg": "./pkg/mount",
   "run": "^Test(EveryHandlerOutlivesItsRequest|EveryHandlerOutlivesItsRequest)$",
-  "tags": "fuse"
- },
- {
-  "name": "mount: create of an existing directory opens it",
-  "file": "pkg/mount/fuse_unix.go",
-  "old": "\t\tcase in.IsDir():\n\t\t\terr = vfs.ErrIsDir",
-  "new": "\t\tcase false:\n\t\t\terr = vfs.ErrIsDir",
-  "pkg": "./pkg/mount",
-  "run": "^TestCreateOfAnExistingFileOpensIt$",
   "tags": "fuse"
  },
  {

@@ -324,6 +324,7 @@ func TestFsyncCallersShareTwoCommits(t *testing.T) {
 	g.armed.Store(true)
 	const callers = 3000
 	results := make(chan error, callers)
+	base := runtime.NumGoroutine()
 	go func() { results <- cm.commit() }()
 	select {
 	case <-g.reached:
@@ -334,6 +335,11 @@ func TestFsyncCallersShareTwoCommits(t *testing.T) {
 		go func() { results <- cm.commit() }()
 	}
 	time.Sleep(200 * time.Millisecond) // let them arrive
+	// The callers wait, and nothing else does: a commit started for each of them would
+	// double the goroutines parked behind the stalled store.
+	if extra := runtime.NumGoroutine() - base; extra > callers+50 {
+		t.Fatalf("%d goroutines for %d callers of fsync against a stalled store: commits pile up", extra, callers)
+	}
 	g.free()
 	for range callers {
 		select {
