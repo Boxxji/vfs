@@ -41,7 +41,7 @@ func validName(name string) error {
 // Now is the time every change is stamped with: Config.Clock, or the time of day.
 func (v *Volume) Now() time.Time {
 	if v.cfg.Clock != nil {
-		return v.cfg.Clock()
+		return v.cfg.Clock.Now()
 	}
 	return time.Now()
 }
@@ -68,9 +68,12 @@ func bits(m fs.FileMode) fs.FileMode { return m & (fs.ModePerm | special) }
 
 // Stat returns the attributes of an inode.
 func (v *Volume) Stat(ctx context.Context, ino InodeID) (Inode, error) {
-	v.mu.RLock()
-	defer v.mu.RUnlock()
-	return v.attrs(ctx, ino)
+	var in Inode
+	err := v.view(ctx, func(ctx context.Context) (err error) {
+		in, err = v.attrs(ctx, ino)
+		return err
+	})
+	return in, err
 }
 
 // attrs is stat with a directory's link count. mu is held.
@@ -84,9 +87,12 @@ func (v *Volume) attrs(ctx context.Context, ino InodeID) (Inode, error) {
 }
 
 // stat reads an inode, with the size and time of any writes not yet settled. An
-// inode that was unlinked while a handle holds it is read from the handle's state.
+// inode that was unlinked while a handle holds it is read from the handle's state. mu is held.
 func (v *Volume) stat(ctx context.Context, ino InodeID) (Inode, error) {
 	if f := v.files[ino]; f != nil && f.orphan {
+		if f.refs == 0 {
+			return Inode{}, fmt.Errorf("%w: inode %d", fs.ErrNotExist, ino)
+		}
 		in := f.attr
 		in.Size, in.Mtime, in.Ctime = f.size, f.mtime, f.ctime
 		return in, nil
@@ -102,55 +108,33 @@ func (v *Volume) stat(ctx context.Context, ino InodeID) (Inode, error) {
 	if err != nil {
 		return Inode{}, err
 	}
-	if f := v.files[ino]; f != nil && f.changed {
+	if f := v.files[ino]; f != nil && f.unsettled() {
 		in.Size, in.Mtime, in.Ctime = f.size, f.mtime, f.ctime
 	}
 	return in, nil
 }
 
-// put stages an inode record.
+// put stages an inode record directly into the live overlay (used by tests of Check).
 func (v *Volume) put(in Inode) { v.over.put(keyInode(in.ID), encodeInode(in)) }
-
-// set stages an inode that was read and changed. A handle's own view of the times follows,
-// so a write settled later does not put older times over these; an inode that was unlinked
-// while open is held by its handle alone.
-func (v *Volume) set(in Inode) {
-	if f := v.files[in.ID]; f != nil {
-		f.mtime, f.ctime = in.Mtime, in.Ctime
-		if f.orphan {
-			f.attr = in
-			return
-		}
-	}
-	v.put(in)
-}
-
-// update reads an inode, lets fn change it, and stages it.
-func (v *Volume) update(ctx context.Context, ino InodeID, fn func(*Inode)) (Inode, error) {
-	in, err := v.stat(ctx, ino)
-	if err != nil {
-		return Inode{}, err
-	}
-	fn(&in)
-	v.set(in)
-	return in, nil
-}
 
 // Lookup returns the child of dir called name.
 func (v *Volume) Lookup(ctx context.Context, dir InodeID, name string) (Inode, error) {
 	if err := validName(name); err != nil {
 		return Inode{}, err
 	}
-	v.mu.RLock()
-	defer v.mu.RUnlock()
-	id, _, err := v.entry(ctx, dir, name)
-	if err != nil {
-		return Inode{}, err
-	}
-	return v.attrs(ctx, id)
+	var in Inode
+	err := v.view(ctx, func(ctx context.Context) error {
+		id, _, err := v.entry(ctx, dir, name)
+		if err != nil {
+			return err
+		}
+		in, err = v.attrs(ctx, id)
+		return err
+	})
+	return in, err
 }
 
-// entry reads the directory entry of dir called name.
+// entry reads the directory entry of dir called name. mu is held.
 func (v *Volume) entry(ctx context.Context, dir InodeID, name string) (InodeID, fs.FileMode, error) {
 	b, ok, err := v.get(ctx, keyEntry(dir, name))
 	if err != nil {
@@ -164,46 +148,52 @@ func (v *Volume) entry(ctx context.Context, dir InodeID, name string) (InodeID, 
 
 // ReadDir lists a directory in name order.
 func (v *Volume) ReadDir(ctx context.Context, dir InodeID) ([]DirEntry, error) {
-	v.mu.RLock()
-	defer v.mu.RUnlock()
-	in, err := v.stat(ctx, dir)
-	if err != nil {
-		return nil, err
-	}
-	if !in.IsDir() {
-		return nil, fmt.Errorf("%w: inode %d", ErrNotDir, dir)
-	}
-	recs, err := v.scan(ctx, key(tEntry, uint64(dir)))
-	if err != nil {
-		return nil, err
-	}
-	out := make([]DirEntry, len(recs))
-	for i, r := range recs {
-		id, mode, err := decodeEntry(r.val)
+	var out []DirEntry
+	err := v.view(ctx, func(ctx context.Context) error {
+		in, err := v.stat(ctx, dir)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		out[i] = DirEntry{Name: string(r.key[prefixLen:]), ID: id, Mode: mode}
-	}
-	return out, nil
+		if !in.IsDir() {
+			return fmt.Errorf("%w: inode %d", ErrNotDir, dir)
+		}
+		recs, err := v.scan(ctx, key(tEntry, uint64(dir)))
+		if err != nil {
+			return err
+		}
+		out = make([]DirEntry, len(recs))
+		for i, r := range recs {
+			id, mode, err := decodeEntry(r.val)
+			if err != nil {
+				return err
+			}
+			out[i] = DirEntry{Name: string(r.key[prefixLen:]), ID: id, Mode: mode}
+		}
+		return nil
+	})
+	return out, err
 }
 
 // Parent returns the directory that names the directory dir; the root is its own parent.
 func (v *Volume) Parent(ctx context.Context, dir InodeID) (InodeID, error) {
-	v.mu.RLock()
-	defer v.mu.RUnlock()
-	in, err := v.stat(ctx, dir)
-	switch {
-	case err != nil:
-		return 0, err
-	case !in.IsDir():
-		return 0, fmt.Errorf("%w: inode %d", ErrNotDir, dir)
-	case dir == RootInode:
-		return dir, nil
-	case in.Parent == 0:
-		return 0, fmt.Errorf("%w: directory %d has no parent", ErrCorrupt, dir)
-	}
-	return in.Parent, nil
+	var parent InodeID
+	err := v.view(ctx, func(ctx context.Context) error {
+		in, err := v.stat(ctx, dir)
+		switch {
+		case err != nil:
+			return err
+		case !in.IsDir():
+			return fmt.Errorf("%w: inode %d", ErrNotDir, dir)
+		case dir == RootInode:
+			parent = dir
+			return nil
+		case in.Parent == 0:
+			return fmt.Errorf("%w: directory %d has no parent", ErrCorrupt, dir)
+		}
+		parent = in.Parent
+		return nil
+	})
+	return parent, err
 }
 
 // Mkdir creates a directory in dir.
@@ -243,23 +233,26 @@ func (v *Volume) Symlink(ctx context.Context, dir InodeID, name, target string, 
 
 // Readlink returns the target of a symbolic link.
 func (v *Volume) Readlink(ctx context.Context, ino InodeID) (string, error) {
-	v.mu.RLock()
-	defer v.mu.RUnlock()
-	in, err := v.stat(ctx, ino)
-	if err != nil {
-		return "", err
-	}
-	if in.Mode&fs.ModeSymlink == 0 {
-		return "", fmt.Errorf("%w: inode %d is not a symbolic link", fs.ErrInvalid, ino)
-	}
-	b, ok, err := v.get(ctx, keyInline(ino))
-	if err != nil {
-		return "", err
-	}
-	if !ok {
-		return "", fmt.Errorf("%w: symbolic link %d has no target", ErrCorrupt, ino)
-	}
-	return string(b), nil
+	var target string
+	err := v.view(ctx, func(ctx context.Context) error {
+		in, err := v.stat(ctx, ino)
+		if err != nil {
+			return err
+		}
+		if in.Mode&fs.ModeSymlink == 0 {
+			return fmt.Errorf("%w: inode %d is not a symbolic link", fs.ErrInvalid, ino)
+		}
+		b, ok, err := v.get(ctx, keyInline(ino))
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("%w: symbolic link %d has no target", ErrCorrupt, ino)
+		}
+		target = string(b)
+		return nil
+	})
+	return target, err
 }
 
 // make creates an inode of the given mode (its type and permissions), with a target's
@@ -268,64 +261,72 @@ func (v *Volume) make(ctx context.Context, dir InodeID, name string, mode fs.Fil
 	if err := validName(name); err != nil {
 		return Inode{}, err
 	}
-	var c creation
+	var cr creation
 	for _, o := range opts {
-		o(&c)
+		o(&cr)
 	}
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	if err := v.writable(); err != nil {
-		return Inode{}, err
-	}
-	parent, err := v.stat(ctx, dir)
-	if err != nil {
-		return Inode{}, err
-	}
-	if !parent.IsDir() {
-		return Inode{}, fmt.Errorf("%w: inode %d", ErrNotDir, dir)
-	}
-	if _, ok, err := v.get(ctx, keyEntry(dir, name)); err != nil || ok {
-		if err == nil {
-			err = fmt.Errorf("%w: %q in inode %d", fs.ErrExist, name, dir)
+	var in Inode
+	_, err := v.mutate(ctx, func(ctx context.Context) (*change, error) {
+		parent, err := v.stat(ctx, dir)
+		if err != nil {
+			return nil, err
 		}
-		return Inode{}, err
-	}
-	if v.cfg.Capacity > 0 && v.used()+int64(len(target)) > v.cfg.Capacity {
-		return Inode{}, fmt.Errorf("%w: capacity %d", ErrNoSpace, v.cfg.Capacity)
-	}
-	// A directory with the setgid bit gives its group, and for a directory the bit, to
-	// what is made in it, as BSD and Linux file systems do.
-	if parent.Mode&fs.ModeSetgid != 0 {
-		if mode.IsDir() {
-			mode |= fs.ModeSetgid
+		if !parent.IsDir() {
+			return nil, fmt.Errorf("%w: inode %d", ErrNotDir, dir)
 		}
-		if c.owned && parent.Owned {
-			c.gid = parent.GID
+		if _, ok, err := v.get(ctx, keyEntry(dir, name)); err != nil || ok {
+			if err == nil {
+				err = fmt.Errorf("%w: %q in inode %d", fs.ErrExist, name, dir)
+			}
+			return nil, err
 		}
-	}
-	now := v.Now()
-	in := Inode{ID: v.next, Mode: mode, Mtime: now, Atime: now, Ctime: now, Owned: c.owned, UID: c.uid, GID: c.gid}
-	if in.IsDir() {
-		in.Parent = dir
-	}
-	if target != nil {
-		in.Size = uint64(len(target))
-		v.over.put(keyInline(in.ID), target)
-		v.ns.bytes += in.Size
-	}
-	v.next++
-	v.ns.files++
-	v.put(in)
-	v.over.put(keyEntry(dir, name), encodeEntry(in.ID, mode))
-	parent.Mtime, parent.Ctime = now, now
-	v.put(parent)
-	if in.IsDir() {
-		v.dirn.bump(dir, +1)
-		in.Nlink = 2
-	} else {
-		in.Nlink = 1
-	}
-	return in, v.relieve(ctx)
+		if v.cfg.Capacity > 0 && v.used()+int64(len(target)) > v.cfg.Capacity {
+			return nil, fmt.Errorf("%w: capacity %d", ErrNoSpace, v.cfg.Capacity)
+		}
+		m := mode
+		c := cr
+		// A directory with the setgid bit gives its group, and for a directory the bit, to
+		// what is made in it, as BSD and Linux file systems do.
+		if parent.Mode&fs.ModeSetgid != 0 {
+			if m.IsDir() {
+				m |= fs.ModeSetgid
+			}
+			if c.owned && parent.Owned {
+				c.gid = parent.GID
+			}
+		}
+		now := v.Now()
+		in = Inode{ID: v.next, Mode: m, Mtime: now, Atime: now, Ctime: now, Owned: c.owned, UID: c.uid, GID: c.gid}
+		if in.IsDir() {
+			in.Parent = dir
+		}
+		muts := make([]mut, 0, 4)
+		if target != nil {
+			in.Size = uint64(len(target))
+			muts = append(muts, mut{key: keyInline(in.ID), val: target})
+		}
+		parent.Mtime, parent.Ctime = now, now
+		muts = append(muts,
+			mut{key: keyInode(in.ID), val: encodeInode(in)},
+			mut{key: keyEntry(dir, name), val: encodeEntry(in.ID, m)},
+			mut{key: keyInode(dir), val: encodeInode(parent)},
+		)
+		ch := &change{
+			kind:   changeTree,
+			next:   in.ID + 1,
+			dFiles: 1,
+			dBytes: int64(len(target)),
+			muts:   muts,
+		}
+		if in.IsDir() {
+			ch.dirBumps = []dirBump{{dir: dir, delta: +1}}
+			in.Nlink = 2
+		} else {
+			in.Nlink = 1
+		}
+		return ch, nil
+	})
+	return in, err
 }
 
 // Link names the inode ino a second time, as name in dir. A directory cannot be linked
@@ -335,48 +336,55 @@ func (v *Volume) Link(ctx context.Context, ino, dir InodeID, name string) (Inode
 	if err := validName(name); err != nil {
 		return Inode{}, err
 	}
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	if err := v.writable(); err != nil {
-		return Inode{}, err
-	}
-	in, err := v.stat(ctx, ino)
-	if err != nil {
-		return Inode{}, err
-	}
-	if f := v.files[ino]; f != nil && f.orphan {
-		return Inode{}, fmt.Errorf("%w: inode %d was unlinked", fs.ErrNotExist, ino)
-	}
-	parent, err := v.stat(ctx, dir)
-	if err != nil {
-		return Inode{}, err
-	}
-	switch {
-	case in.IsDir():
-		return Inode{}, fmt.Errorf("%w: a directory has one name", fs.ErrPermission)
-	case !parent.IsDir():
-		return Inode{}, fmt.Errorf("%w: inode %d", ErrNotDir, dir)
-	case in.Nlink >= maxLinks:
-		return Inode{}, fmt.Errorf("%w: inode %d has %d names", ErrTooManyLinks, ino, in.Nlink)
-	}
-	if _, ok, err := v.get(ctx, keyEntry(dir, name)); err != nil || ok {
-		if err == nil {
-			err = fmt.Errorf("%w: %q in inode %d", fs.ErrExist, name, dir)
+	var in Inode
+	_, err := v.mutate(ctx, func(ctx context.Context) (*change, error) {
+		var err error
+		in, err = v.stat(ctx, ino)
+		if err != nil {
+			return nil, err
 		}
-		return Inode{}, err
-	}
-	now := v.Now()
-	if in, err = v.update(ctx, ino, func(in *Inode) { in.Nlink++; in.Ctime = now }); err != nil {
-		return Inode{}, err
-	}
-	v.ns.links = true
-	if in.Nlink == 2 {
-		v.ns.linked++
-	}
-	v.over.put(keyEntry(dir, name), encodeEntry(ino, in.Mode))
-	parent.Mtime, parent.Ctime = now, now
-	v.put(parent)
-	return in, v.relieve(ctx)
+		if f := v.files[ino]; f != nil && f.orphan {
+			return nil, fmt.Errorf("%w: inode %d was unlinked", fs.ErrNotExist, ino)
+		}
+		parent, err := v.stat(ctx, dir)
+		if err != nil {
+			return nil, err
+		}
+		switch {
+		case in.IsDir():
+			return nil, fmt.Errorf("%w: a directory has one name", fs.ErrPermission)
+		case !parent.IsDir():
+			return nil, fmt.Errorf("%w: inode %d", ErrNotDir, dir)
+		case in.Nlink >= maxLinks:
+			return nil, fmt.Errorf("%w: inode %d has %d names", ErrTooManyLinks, ino, in.Nlink)
+		}
+		if _, ok, err := v.get(ctx, keyEntry(dir, name)); err != nil || ok {
+			if err == nil {
+				err = fmt.Errorf("%w: %q in inode %d", fs.ErrExist, name, dir)
+			}
+			return nil, err
+		}
+		now := v.Now()
+		in.Nlink++
+		in.Ctime = now
+		parent.Mtime, parent.Ctime = now, now
+		var dLinked int64
+		if in.Nlink == 2 {
+			dLinked = 1
+		}
+		return &change{
+			kind:     changeTree,
+			next:     v.next,
+			dLinked:  dLinked,
+			setLinks: true,
+			muts: []mut{
+				{key: keyInode(ino), val: encodeInode(in)},
+				{key: keyEntry(dir, name), val: encodeEntry(ino, in.Mode)},
+				{key: keyInode(dir), val: encodeInode(parent)},
+			},
+		}, nil
+	})
+	return in, err
 }
 
 // Remove deletes a file or an empty directory from dir. A file with other names keeps
@@ -386,40 +394,42 @@ func (v *Volume) Remove(ctx context.Context, dir InodeID, name string) error {
 	if err := validName(name); err != nil {
 		return err
 	}
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	if err := v.writable(); err != nil {
-		return err
-	}
-	id, _, err := v.entry(ctx, dir, name)
-	if err != nil {
-		return err
-	}
-	in, err := v.stat(ctx, id)
-	if err != nil {
-		return err
-	}
-	parent, err := v.stat(ctx, dir)
-	if err != nil {
-		return err
-	}
-	now := v.Now()
-	if err := v.drop(ctx, in, now); err != nil {
-		return err
-	}
-	parent.Mtime, parent.Ctime = now, now
-	v.over.del(keyEntry(dir, name))
-	v.put(parent)
-	if in.IsDir() {
-		v.dirn.bump(dir, -1)
-	}
-	return v.relieve(ctx)
+	_, err := v.mutate(ctx, func(ctx context.Context) (*change, error) {
+		id, _, err := v.entry(ctx, dir, name)
+		if err != nil {
+			return nil, err
+		}
+		in, err := v.stat(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		parent, err := v.stat(ctx, dir)
+		if err != nil {
+			return nil, err
+		}
+		now := v.Now()
+		ch := &change{kind: changeTree, next: v.next}
+		if err := v.planDrop(ctx, in, now, ch); err != nil {
+			return nil, err
+		}
+		parent.Mtime, parent.Ctime = now, now
+		ch.muts = append(ch.muts,
+			mut{key: keyEntry(dir, name), del: true},
+			mut{key: keyInode(dir), val: encodeInode(parent)},
+		)
+		if in.IsDir() {
+			ch.dirBumps = append(ch.dirBumps, dirBump{dir: dir, delta: -1})
+		}
+		return ch, nil
+	})
+	return err
 }
 
-// drop takes one name away from in, whose directory entry the caller removes. A
-// directory must be empty. An inode with other names counts one fewer; one with none is
-// deleted, or, if a handle holds it, kept in memory until the handle closes.
-func (v *Volume) drop(ctx context.Context, in Inode, now time.Time) error {
+// planDrop reads everything needed to take one name away from in and records the mutations
+// into ch without mutating v. A directory must be empty. An inode with other names counts
+// one fewer; one with none is deleted, or, if a handle holds it, becomes an orphan on apply.
+// mu is held.
+func (v *Volume) planDrop(ctx context.Context, in Inode, now time.Time, ch *change) error {
 	if in.IsDir() {
 		kids, err := v.has(ctx, key(tEntry, uint64(in.ID)))
 		if err != nil {
@@ -428,16 +438,16 @@ func (v *Volume) drop(ctx context.Context, in Inode, now time.Time) error {
 		if kids {
 			return fmt.Errorf("%w: inode %d", ErrNotEmpty, in.ID)
 		}
-		v.over.del(keyInode(in.ID))
-		v.ns.files--
+		ch.muts = append(ch.muts, mut{key: keyInode(in.ID), del: true})
+		ch.dFiles--
 		return nil
 	}
 	if in.Nlink > 1 {
-		if _, err := v.update(ctx, in.ID, func(i *Inode) { i.Nlink--; i.Ctime = now }); err != nil {
-			return err
-		}
-		if in.Nlink == 2 {
-			v.ns.linked--
+		in.Nlink--
+		in.Ctime = now
+		ch.muts = append(ch.muts, mut{key: keyInode(in.ID), val: encodeInode(in)})
+		if in.Nlink == 1 {
+			ch.dLinked--
 		}
 		return nil
 	}
@@ -458,19 +468,18 @@ func (v *Volume) drop(ctx context.Context, in Inode, now time.Time) error {
 		held += uint64(e.n)
 	}
 	for _, r := range data {
-		v.over.del(r.key)
+		ch.muts = append(ch.muts, mut{key: r.key, del: true})
 	}
-	v.over.del(keyInode(in.ID))
-	v.ns.files--
-	v.ns.bytes -= min(v.ns.bytes, held)
-	if f := v.files[in.ID]; f != nil {
-		if f.refs > 0 {
-			in.Nlink, in.Ctime = 0, now
-			f.orphan, f.attr, f.ctime = true, in, now
-			return nil
+	ch.muts = append(ch.muts, mut{key: keyInode(in.ID), del: true})
+	ch.dFiles--
+	ch.dBytes -= int64(held)
+	ch.gone = append(ch.gone, in.ID)
+	if f := v.files[in.ID]; f != nil && f.refs > 0 {
+		in.Nlink, in.Ctime = 0, now
+		if ch.orphans == nil {
+			ch.orphans = map[InodeID]Inode{}
 		}
-		v.dirty -= f.dirtyN
-		delete(v.files, in.ID)
+		ch.orphans[in.ID] = in
 	}
 	return nil
 }

@@ -14,14 +14,17 @@ import (
 
 	"github.com/hanzoai/vfs"
 	"github.com/hanzoai/vfs/internal/storetest"
+	"github.com/hanzoai/vfs/journal"
 	"github.com/hanzoai/vfs/pkg/backend"
 )
 
 // tick is a clock that moves one millisecond each time it is read, so every change has its
-// own time and a test can order them.
+// own time and a test can order them. It implements journal.Clock.
 type tick struct{ ns atomic.Int64 }
 
-func (c *tick) now() time.Time { return time.Unix(1_700_000_000, c.ns.Add(int64(time.Millisecond))) }
+func (c *tick) now() time.Time                                    { return time.Unix(1_700_000_000, c.ns.Add(int64(time.Millisecond))) }
+func (c *tick) Now() time.Time                                    { return c.now() }
+func (c *tick) AfterFunc(d time.Duration, f func()) journal.Timer { return time.AfterFunc(d, f) }
 
 // newClocked is newMem with a clock the test reads.
 func newClocked(t testing.TB) (*storetest.Mem, vfs.Cipher, *vfs.Volume, *tick) {
@@ -30,7 +33,7 @@ func newClocked(t testing.TB) (*storetest.Mem, vfs.Cipher, *vfs.Volume, *tick) {
 	c := vfs.Hybrid(newKey(t))
 	clk := &tick{}
 	conf := cfg(be, c, 0)
-	conf.Clock = clk.now
+	conf.Clock = clk
 	if err := vfs.Create(ctx, conf); err != nil {
 		t.Fatal(err)
 	}
@@ -39,6 +42,7 @@ func newClocked(t testing.TB) (*storetest.Mem, vfs.Cipher, *vfs.Volume, *tick) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { v.Close() })
 	return be, c, v, clk
 }
 

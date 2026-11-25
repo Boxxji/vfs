@@ -202,7 +202,7 @@ func posixRun(t *testing.T, seed uint64) {
 	clk := &tick{}
 	mk := func(round uint64) *vfs.Volume {
 		cf := cfg(be, c, round)
-		cf.Clock = clk.now
+		cf.Clock = clk
 		switch seed % 3 {
 		case 0:
 			cf.Dirty, cf.Overlay, cf.Cache = 1<<20, 40, 2<<20

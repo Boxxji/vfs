@@ -14,11 +14,14 @@
 // library that speaks the FUSE protocol has neither request). Advisory locks, flock and
 // fcntl, are the kernel's, per mount.
 //
-// A mounted Volume is durable at Flush, which the kernel asks for on every close
-// of a file descriptor, and at Fsync; both return only after the Volume's Head
-// has advanced in the store, so each costs a commit. There is no node-local
-// journal yet to make Fsync cheaper. When the mount ends the Volume is flushed
-// once more.
+// A write on the mount is applied to the Volume and appended to its journal on this
+// node's disk before it is answered. fsync returns when the journal has the change on the
+// disk (group sync: concurrent callers share one), and asks the store for nothing; close
+// asks for nothing either. The store has the change within the Volume's bound, and when
+// the mount ends everything is published first. What the kernel itself holds back (a
+// write that was acknowledged to its caller and has not reached the daemon) is the
+// caller's to fsync, as for any file system; the end of a mount asks the kernel for it
+// (syncfs) before it publishes.
 //
 // Build-tag gated: `go build -tags fuse ./...`.
 package mount
@@ -75,7 +78,7 @@ func Mount(ctx context.Context, vol *vfs.Volume, mountpoint string) error {
 		_ = conn.Close()
 	case <-ctx.Done():
 		var ended bool
-		serveErr, ended = sess.group.stop(mountpoint, fuse.Unmount, detach, served)
+		serveErr, ended = stop(vol, mountpoint, fuse.Unmount, detach, served)
 		// A holder that outlived the grace keeps Serve reading, and closing the connection
 		// waits for that read: it is left to end with the process.
 		if ended {
@@ -98,14 +101,12 @@ func detach(mountpoint string) error {
 	return nil
 }
 
-// session is what every node and handle of one mount shares: the Volume, the mount's
-// own context, and the committer. It is built only by newSession, which refuses a
-// nil context: the work of a read runs on base, and a store client panics on a nil
-// parent the first time it is used.
+// session is what every node and handle of one mount shares: the Volume and the mount's
+// own context. It is built only by newSession, which refuses a nil context: the work of a
+// read runs on base, and a store client panics on a nil parent the first time it is used.
 type session struct {
-	vol   *vfs.Volume
-	base  context.Context
-	group *committer
+	vol  *vfs.Volume
+	base context.Context
 
 	mu    sync.Mutex
 	nodes map[vfs.InodeID]*node // the nodes the kernel holds, by inode
@@ -115,7 +116,7 @@ func newSession(base context.Context, vol *vfs.Volume) *session {
 	if base == nil || vol == nil {
 		panic("mount: a session needs a context and a Volume")
 	}
-	return &session{vol: vol, base: base, group: newCommitter(vol)}
+	return &session{vol: vol, base: base}
 }
 
 // root is the file system.
@@ -465,8 +466,12 @@ func (n *node) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenR
 	return n.s.handle(f), nil
 }
 
+// Fsync makes what the file depends on durable in the journal, and waits for nothing else:
+// not for another file's writes, and not for the store. It is not interrupted: C callers
+// do not restart it (errno.go).
 func (n *node) Fsync(ctx context.Context, _ *fuse.FsyncRequest) error {
-	return errno(n.s.group.commit())
+	ctx = context.WithoutCancel(ctx) // no request is answered EINTR: see errno.go
+	return errno(n.s.vol.SyncInode(ctx, n.ino))
 }
 
 // handle is an open file.
@@ -539,12 +544,9 @@ func (h *handle) FAllocate(ctx context.Context, req *fuse.FAllocateRequest) erro
 	return nil
 }
 
-// Flush is a commit. close(2) is not restarted after EINTR (Linux has already dropped
-// the descriptor), so, like every request of this mount, it waits for the commit and
-// returns its result.
-func (h *handle) Flush(ctx context.Context, _ *fuse.FlushRequest) error {
-	return errno(h.s.group.commit())
-}
+// Flush is the kernel's close(2) of one descriptor. It makes no request and changes
+// nothing: close is not an fsync, and a handle that wrote nothing has nothing to say.
+func (h *handle) Flush(context.Context, *fuse.FlushRequest) error { return nil }
 
 func (h *handle) Release(context.Context, *fuse.ReleaseRequest) error {
 	return errno(h.file.Close())
