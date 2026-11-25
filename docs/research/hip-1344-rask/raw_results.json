@@ -1,0 +1,311 @@
+{
+  "environment": {
+    "goos": "linux",
+    "goarch": "amd64",
+    "go_version": "go1.27.1",
+    "num_cpu": 2,
+    "timestamp_utc": "2026-11-25T13:28:42Z"
+  },
+  "workload_100k_compact32": [
+    {
+      "name": "sorted_slice_baseline",
+      "extents": 100000,
+      "struct_bytes": 2949144,
+      "bytes_per_extent": 29.49144,
+      "heap_alloc_delta_bytes": 2949256,
+      "heap_bytes_per_extent": 29.49256,
+      "pointer_count": 1,
+      "gc_pause_median_us": 80.527,
+      "lookup_hit_p50_ns": 161.84375,
+      "lookup_hit_p95_ns": 189.28125,
+      "lookup_hit_p99_ns": 1634.28125,
+      "lookup_hole_p50_ns": 159.4375,
+      "lookup_hole_p99_ns": 393,
+      "range_scan_mext_per_sec": 292.8355089473245,
+      "random_mutate_kops_per_sec": 3.9818022954767707,
+      "punch_hole_kops_per_sec": 13.905653506129063,
+      "status": "ok"
+    },
+    {
+      "name": "pointer_btree_baseline",
+      "extents": 100000,
+      "struct_bytes": 5238280,
+      "bytes_per_extent": 52.3828,
+      "heap_alloc_delta_bytes": 5838192,
+      "heap_bytes_per_extent": 58.38192,
+      "pointer_count": 26240,
+      "gc_pause_median_us": 56.248,
+      "lookup_hit_p50_ns": 212.25,
+      "lookup_hit_p95_ns": 260.21875,
+      "lookup_hit_p99_ns": 792.25,
+      "lookup_hole_p50_ns": 212.71875,
+      "lookup_hole_p99_ns": 803.28125,
+      "range_scan_mext_per_sec": 211.38494882084078,
+      "random_mutate_kops_per_sec": 2715.8724821825185,
+      "punch_hole_kops_per_sec": 2541.0384055085647,
+      "status": "ok"
+    },
+    {
+      "name": "rask_compact_range_index",
+      "extents": 100000,
+      "struct_bytes": 1253056,
+      "bytes_per_extent": 12.53056,
+      "heap_alloc_delta_bytes": 1259712,
+      "heap_bytes_per_extent": 12.59712,
+      "pointer_count": 832,
+      "gc_pause_median_us": 53.842,
+      "lookup_hit_p50_ns": 154.78125,
+      "lookup_hit_p95_ns": 188.1875,
+      "lookup_hit_p99_ns": 390.03125,
+      "lookup_hole_p50_ns": 151.5625,
+      "lookup_hole_p99_ns": 373.53125,
+      "range_scan_mext_per_sec": 221.9931578267649,
+      "random_mutate_kops_per_sec": 859.3731268351376,
+      "punch_hole_kops_per_sec": 1135.910562945916,
+      "status": "ok"
+    },
+    {
+      "name": "flat_page_bitmap_negative",
+      "extents": 100000,
+      "struct_bytes": 1625000,
+      "bytes_per_extent": 16.25,
+      "heap_alloc_delta_bytes": 0,
+      "heap_bytes_per_extent": 0,
+      "pointer_count": 0,
+      "gc_pause_median_us": 0,
+      "lookup_hit_p50_ns": 0,
+      "lookup_hit_p95_ns": 0,
+      "lookup_hit_p99_ns": 0,
+      "lookup_hole_p50_ns": 0,
+      "lookup_hole_p99_ns": 0,
+      "range_scan_mext_per_sec": 0,
+      "random_mutate_kops_per_sec": 0,
+      "punch_hole_kops_per_sec": 0,
+      "status": "OOM_CAPPED (requires 1.55 MiB dense table for 781 MiB logical span)"
+    }
+  ],
+  "workload_100k_random_val64": [
+    {
+      "name": "sorted_slice_baseline",
+      "extents": 100000,
+      "struct_bytes": 2949144,
+      "bytes_per_extent": 29.49144,
+      "heap_alloc_delta_bytes": 2949144,
+      "heap_bytes_per_extent": 29.49144,
+      "pointer_count": 1,
+      "gc_pause_median_us": 124.522,
+      "lookup_hit_p50_ns": 160.625,
+      "lookup_hit_p95_ns": 190.25,
+      "lookup_hit_p99_ns": 911.25,
+      "lookup_hole_p50_ns": 158.53125,
+      "lookup_hole_p99_ns": 387.84375,
+      "range_scan_mext_per_sec": 297.0179855572809,
+      "random_mutate_kops_per_sec": 3.750633723482942,
+      "punch_hole_kops_per_sec": 13.551870618231325,
+      "status": "ok"
+    },
+    {
+      "name": "pointer_btree_baseline",
+      "extents": 100000,
+      "struct_bytes": 5238280,
+      "bytes_per_extent": 52.3828,
+      "heap_alloc_delta_bytes": 5838192,
+      "heap_bytes_per_extent": 58.38192,
+      "pointer_count": 26240,
+      "gc_pause_median_us": 87.093,
+      "lookup_hit_p50_ns": 223.4375,
+      "lookup_hit_p95_ns": 337.0625,
+      "lookup_hit_p99_ns": 1231.40625,
+      "lookup_hole_p50_ns": 220,
+      "lookup_hole_p99_ns": 1289.53125,
+      "range_scan_mext_per_sec": 180.7083637754236,
+      "random_mutate_kops_per_sec": 2511.65754453577,
+      "punch_hole_kops_per_sec": 2528.610596749572,
+      "status": "ok"
+    },
+    {
+      "name": "rask_compact_range_index",
+      "extents": 100000,
+      "struct_bytes": 1653056,
+      "bytes_per_extent": 16.53056,
+      "heap_alloc_delta_bytes": 1659712,
+      "heap_bytes_per_extent": 16.59712,
+      "pointer_count": 832,
+      "gc_pause_median_us": 70.4,
+      "lookup_hit_p50_ns": 168.5625,
+      "lookup_hit_p95_ns": 228.75,
+      "lookup_hit_p99_ns": 413.90625,
+      "lookup_hole_p50_ns": 170.25,
+      "lookup_hole_p99_ns": 1049.90625,
+      "range_scan_mext_per_sec": 346.7742699813289,
+      "random_mutate_kops_per_sec": 642.2518273910964,
+      "punch_hole_kops_per_sec": 728.3501027447072,
+      "status": "ok"
+    },
+    {
+      "name": "flat_page_bitmap_negative",
+      "extents": 100000,
+      "struct_bytes": 1625000,
+      "bytes_per_extent": 16.25,
+      "heap_alloc_delta_bytes": 0,
+      "heap_bytes_per_extent": 0,
+      "pointer_count": 0,
+      "gc_pause_median_us": 0,
+      "lookup_hit_p50_ns": 0,
+      "lookup_hit_p95_ns": 0,
+      "lookup_hit_p99_ns": 0,
+      "lookup_hole_p50_ns": 0,
+      "lookup_hole_p99_ns": 0,
+      "range_scan_mext_per_sec": 0,
+      "random_mutate_kops_per_sec": 0,
+      "punch_hole_kops_per_sec": 0,
+      "status": "OOM_CAPPED (requires 1.55 MiB dense table for 781 MiB logical span)"
+    }
+  ],
+  "workload_1pib_sparse": [
+    {
+      "name": "sorted_slice_baseline",
+      "extents": 101,
+      "logical_span_bytes": 1125899906842624,
+      "struct_bytes": 3096,
+      "pointer_count": 1,
+      "hit_p50_ns": 47.6875,
+      "hit_p99_ns": 61.28125,
+      "hole_p50_ns": 14.59375,
+      "hole_p99_ns": 18.375,
+      "status": "ok"
+    },
+    {
+      "name": "pointer_btree_baseline",
+      "extents": 101,
+      "logical_span_bytes": 1125899906842624,
+      "struct_bytes": 5416,
+      "pointer_count": 26,
+      "hit_p50_ns": 46.3125,
+      "hit_p99_ns": 63.03125,
+      "hole_p50_ns": 15.3125,
+      "hole_p99_ns": 21.1875,
+      "status": "ok"
+    },
+    {
+      "name": "rask_compact_range_index",
+      "extents": 101,
+      "logical_span_bytes": 1125899906842624,
+      "struct_bytes": 2816,
+      "pointer_count": 9,
+      "hit_p50_ns": 52.71875,
+      "hit_p99_ns": 77.6875,
+      "hole_p50_ns": 13.5625,
+      "hole_p99_ns": 18.71875,
+      "status": "ok"
+    },
+    {
+      "name": "flat_page_bitmap_negative",
+      "extents": 101,
+      "logical_span_bytes": 1125899906842624,
+      "struct_bytes": 2233382993920,
+      "analytical_ram_gib": 2080,
+      "pointer_count": 0,
+      "hit_p50_ns": 0,
+      "hit_p99_ns": 0,
+      "hole_p50_ns": 0,
+      "hole_p99_ns": 0,
+      "status": "OOM_IMPOSSIBLE (2.03 TiB RAM required for 1 PiB @ 4 KiB)"
+    }
+  ],
+  "boundary_dense_fragmented_writes": [
+    {
+      "name": "sorted_slice_baseline",
+      "writes": 25000,
+      "extents": 17462,
+      "insert_kops_per_sec": 514.4897603366755,
+      "bytes_per_extent": 26.741953957164128,
+      "pointer_count": 1,
+      "lookup_hit_p99_ns": 315.875
+    },
+    {
+      "name": "pointer_btree_baseline",
+      "writes": 25000,
+      "extents": 17462,
+      "insert_kops_per_sec": 2831.1945545936414,
+      "bytes_per_extent": 36.27579887756271,
+      "pointer_count": 3170,
+      "lookup_hit_p99_ns": 312.40625
+    },
+    {
+      "name": "rask_compact_range_index",
+      "writes": 25000,
+      "extents": 17462,
+      "insert_kops_per_sec": 1191.4997454956542,
+      "bytes_per_extent": 18.776314282441874,
+      "pointer_count": 201,
+      "lookup_hit_p99_ns": 273.15625
+    }
+  ],
+  "boundary_tiny_file_under_16_extents": [
+    {
+      "name": "sorted_slice_baseline",
+      "extents": 8,
+      "struct_bytes": 216,
+      "lookup_hit_p50_ns": 8.484375,
+      "lookup_hit_p99_ns": 18.9375
+    },
+    {
+      "name": "pointer_btree_baseline",
+      "extents": 8,
+      "struct_bytes": 840,
+      "lookup_hit_p50_ns": 10.828125,
+      "lookup_hit_p99_ns": 11.203125
+    },
+    {
+      "name": "rask_compact_range_index",
+      "extents": 8,
+      "struct_bytes": 544,
+      "lookup_hit_p50_ns": 18.296875,
+      "lookup_hit_p99_ns": 31.5
+    }
+  ],
+  "boundary_flat_page_table_explosion": [
+    {
+      "logical_label": "64 MiB",
+      "logical_bytes": 67108864,
+      "flat_table_bytes": 133120,
+      "flat_table_human": "130.00 KiB",
+      "rask_100_extents_bytes": 2816,
+      "memory_ratio_flat_over_rask": 47.27272727272727
+    },
+    {
+      "logical_label": "1 GiB",
+      "logical_bytes": 1073741824,
+      "flat_table_bytes": 2129920,
+      "flat_table_human": "2.03 MiB",
+      "rask_100_extents_bytes": 2816,
+      "memory_ratio_flat_over_rask": 756.3636363636364
+    },
+    {
+      "logical_label": "1 TiB",
+      "logical_bytes": 1099511627776,
+      "flat_table_bytes": 2181038080,
+      "flat_table_human": "2.03 GiB",
+      "rask_100_extents_bytes": 2816,
+      "memory_ratio_flat_over_rask": 774516.3636363636
+    },
+    {
+      "logical_label": "1 PiB (1\u003c\u003c50 B)",
+      "logical_bytes": 1125899906842624,
+      "flat_table_bytes": 2233382993920,
+      "flat_table_human": "2.03 TiB",
+      "rask_100_extents_bytes": 2816,
+      "memory_ratio_flat_over_rask": 793104756.3636364
+    }
+  ],
+  "rask_100k_compact32_diagnostics": {
+    "Groups": 24,
+    "Leaves": 782,
+    "Compact32": 782,
+    "Compact64": 0,
+    "Full64": 0,
+    "RadixSlots": 16,
+    "RadixEnabled": true
+  }
+}
