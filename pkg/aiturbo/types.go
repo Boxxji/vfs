@@ -142,13 +142,19 @@ func (n Namespace) DirectKey(digest [32]byte) string {
 	return n.KeyPrefix() + "/direct/" + h[:2] + "/" + h
 }
 
+// HeadPrefix returns the key prefix containing all published checkpoint
+// manifests within namespace n.
+func (n Namespace) HeadPrefix() string {
+	return n.KeyPrefix() + "/head/"
+}
+
 // HeadKey returns the atomic checkpoint manifest key for checkpointID within n.
 func (n Namespace) HeadKey(checkpointID string) string {
 	h := blake3.New()
 	_, _ = h.Write([]byte("aiturbo:ckpt:v1\x00"))
 	_, _ = h.Write([]byte(checkpointID))
 	sum := h.Sum(nil)
-	return n.KeyPrefix() + "/head/" + hex.EncodeToString(sum[:16])
+	return n.HeadPrefix() + hex.EncodeToString(sum[:16])
 }
 
 // OwnsKey reports whether key lies strictly inside this namespace's key prefix
@@ -177,7 +183,9 @@ type Config struct {
 
 	// LargeObjectThreshold is the minimum size at which an entry bypasses
 	// group packing and is uploaded directly as a standalone object to avoid
-	// redundant copying. Defaults to TargetGroupBytes when <= 0.
+	// redundant copying. Defaults to TargetGroupBytes when <= 0. Entries
+	// exceeding TargetGroupBytes always take direct bypass so packed groups
+	// never exceed TargetGroupBytes.
 	LargeObjectThreshold int64 `json:"large_object_threshold"`
 
 	// MaxGapBytes is the largest unrequested byte gap between two slices inside
@@ -192,15 +200,19 @@ type Config struct {
 	// Concurrency is the worker pool size for parallel S3 PUT/GET operations.
 	Concurrency int `json:"concurrency"`
 
-	// MaxManifestBytes caps the manifest object size accepted by backend.Get.
+	// MaxManifestBytes caps the manifest object size accepted by backend.Get
+	// and published by UploadCheckpoint.
 	MaxManifestBytes int64 `json:"max_manifest_bytes"`
 
 	// RequireConditionalHead enforces S3 conditional writes (PutIfAbsent for
 	// new checkpoints, PutIfVersion for updates) when publishing the manifest.
 	RequireConditionalHead bool `json:"require_conditional_head"`
 
-	// CleanupOnAbort attempts best-effort deletion of newly uploaded group
-	// objects from an aborted upload if a mid-upload failure occurs.
+	// CleanupOnAbort, when opted into by a single-writer caller, deletes
+	// uploaded objects from an aborted upload ONLY after proving they are not
+	// referenced by any published checkpoint manifest in the namespace.
+	// Defaults to false so shared content-addressed objects are preserved
+	// safely under concurrent writers until GC.
 	CleanupOnAbort bool `json:"cleanup_on_abort"`
 }
 
@@ -215,7 +227,7 @@ func DefaultConfig() Config {
 		Concurrency:            DefaultConcurrency,
 		MaxManifestBytes:       DefaultMaxManifestBytes,
 		RequireConditionalHead: true,
-		CleanupOnAbort:         true,
+		CleanupOnAbort:         false,
 	}
 }
 

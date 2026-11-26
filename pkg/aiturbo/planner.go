@@ -155,7 +155,7 @@ func PlanUpload(entries []Entry, cfg Config) (*UploadPlan, error) {
 				continue
 			}
 
-			if item.Size >= normCfg.LargeObjectThreshold {
+			if item.Size >= normCfg.LargeObjectThreshold || item.Size > normCfg.TargetGroupBytes {
 				large = append(large, item)
 			} else {
 				small = append(small, item)

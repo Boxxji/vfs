@@ -105,29 +105,8 @@ func (e *Engine) uploadWithVersion(ctx context.Context, ns Namespace, checkpoint
 		return nil, err
 	}
 
-	// Upload all grouped packs and direct objects in parallel.
-	uploadedKeys, uploadErr := e.uploadGroups(ctx, plan.Groups, normCfg.Concurrency)
-	if uploadErr != nil {
-		cleaned := 0
-		if normCfg.CleanupOnAbort && len(uploadedKeys) > 0 {
-			cleanCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			for _, k := range uploadedKeys {
-				if err := e.be.Delete(cleanCtx, k); err == nil {
-					cleaned++
-				}
-			}
-			cancel()
-		}
-		return &UploadResult{
-			Plan:             plan,
-			Duration:         time.Since(start),
-			HeadPublished:    false,
-			Aborted:          true,
-			CleanedUpObjects: cleaned,
-		}, uploadErr
-	}
-
-	// All data objects are now durably present in S3. Build deterministic manifest.
+	// Build and size-check the serialized manifest BEFORE uploading data or
+	// publishing a head so oversized unreadable manifests are rejected fail-closed.
 	manifest := buildManifest(ns, checkpointID, StrategyAITurboGrouped, plan)
 	rawManifest, err := manifest.MarshalSigned()
 	if err != nil {
@@ -137,6 +116,33 @@ func (e *Engine) uploadWithVersion(ctx context.Context, ns Namespace, checkpoint
 			HeadPublished: false,
 			Aborted:       true,
 		}, err
+	}
+	if int64(len(rawManifest)) > normCfg.MaxManifestBytes {
+		return &UploadResult{
+				Plan:          plan,
+				Duration:      time.Since(start),
+				HeadPublished: false,
+				Aborted:       true,
+			}, fmt.Errorf("%w: serialized manifest size %d exceeds max_manifest_bytes %d",
+				backend.ErrTooLarge, len(rawManifest), normCfg.MaxManifestBytes)
+	}
+
+	// Upload all grouped packs and direct objects in parallel.
+	uploadedKeys, uploadErr := e.uploadGroups(ctx, plan.Groups, normCfg.Concurrency)
+	if uploadErr != nil {
+		cleaned := 0
+		if normCfg.CleanupOnAbort && len(uploadedKeys) > 0 {
+			cleanCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			cleaned = e.cleanupUnreferencedKeys(cleanCtx, ns, uploadedKeys, normCfg.MaxManifestBytes)
+			cancel()
+		}
+		return &UploadResult{
+			Plan:             plan,
+			Duration:         time.Since(start),
+			HeadPublished:    false,
+			Aborted:          true,
+			CleanedUpObjects: cleaned,
+		}, uploadErr
 	}
 
 	headKey := ns.HeadKey(checkpointID)
@@ -174,6 +180,64 @@ func (e *Engine) uploadWithVersion(ctx context.Context, ns Namespace, checkpoint
 	}, nil
 }
 
+// cleanupUnreferencedKeys deletes candidate keys ONLY after proving they are
+// not referenced by any published checkpoint manifest in ns. If listing or
+// loading any published manifest fails, cleanup aborts fail-closed (0 deletes)
+// to guarantee shared content-addressed objects are never broken.
+func (e *Engine) cleanupUnreferencedKeys(ctx context.Context, ns Namespace, candidateKeys []string, maxManifestBytes int64) int {
+	refKeys, err := e.referencedDataKeys(ctx, ns, maxManifestBytes)
+	if err != nil {
+		return 0
+	}
+	cleaned := 0
+	seen := make(map[string]struct{}, len(candidateKeys))
+	for _, k := range candidateKeys {
+		if _, dup := seen[k]; dup {
+			continue
+		}
+		seen[k] = struct{}{}
+		if _, inUse := refKeys[k]; inUse {
+			continue
+		}
+		if err := e.be.Delete(ctx, k); err == nil {
+			cleaned++
+		}
+	}
+	return cleaned
+}
+
+func (e *Engine) referencedDataKeys(ctx context.Context, ns Namespace, maxManifestBytes int64) (map[string]struct{}, error) {
+	objs, errs := e.be.List(ctx, ns.HeadPrefix())
+	var headKeys []string
+	for obj := range objs {
+		headKeys = append(headKeys, obj.Key)
+	}
+	if listErr := <-errs; listErr != nil {
+		return nil, listErr
+	}
+
+	refs := make(map[string]struct{})
+	for _, hk := range headKeys {
+		raw, _, err := e.be.Get(ctx, hk, maxManifestBytes)
+		if err != nil {
+			return nil, err
+		}
+		m, err := UnmarshalManifest(raw, ns)
+		if err != nil {
+			return nil, err
+		}
+		for _, g := range m.GroupObjects {
+			refs[g.ObjectKey] = struct{}{}
+		}
+		for _, ent := range m.Entries {
+			if ent.ObjectKey != "" {
+				refs[ent.ObjectKey] = struct{}{}
+			}
+		}
+	}
+	return refs, nil
+}
+
 func (e *Engine) uploadGroups(ctx context.Context, groups []UploadGroup, concurrency int) ([]string, error) {
 	if len(groups) == 0 {
 		return nil, nil
@@ -209,7 +273,8 @@ func (e *Engine) uploadGroups(ctx context.Context, groups []UploadGroup, concurr
 		go func() {
 			defer wg.Done()
 			for idx := range jobs {
-				if workCtx.Err() != nil {
+				if err := workCtx.Err(); err != nil {
+					setErr(err)
 					return
 				}
 				g := groups[idx]
@@ -237,6 +302,9 @@ func (e *Engine) uploadGroups(ctx context.Context, groups []UploadGroup, concurr
 	wg.Wait()
 	if firstErr != nil {
 		return uploadedKeys, firstErr
+	}
+	if err := ctx.Err(); err != nil {
+		return uploadedKeys, err
 	}
 	return uploadedKeys, nil
 }
@@ -373,7 +441,8 @@ func (e *Engine) DownloadCheckpoint(ctx context.Context, ns Namespace, checkpoin
 			go func() {
 				defer wg.Done()
 				for idx := range jobs {
-					if workCtx.Err() != nil {
+					if err := workCtx.Err(); err != nil {
+						setErr(err)
 						return
 					}
 					r := plan.Ranges[idx]
@@ -429,6 +498,9 @@ func (e *Engine) DownloadCheckpoint(ctx context.Context, ns Namespace, checkpoin
 		wg.Wait()
 		if firstErr != nil {
 			return nil, firstErr
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
 	}
 

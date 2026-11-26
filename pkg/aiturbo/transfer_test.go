@@ -414,3 +414,189 @@ func TestRealHanzoS3HTTPIntegration(t *testing.T) {
 		t.Fatalf("expected HTTP 412 -> backend.ErrConflict on duplicate checkpoint head, got %v", err)
 	}
 }
+
+func TestCodexP1AbortCleanupPreservesSharedDataObjects(t *testing.T) {
+	ctx := context.Background()
+	ns := Namespace{TenantID: "org-shared", VolumeID: "vol-1"}
+
+	// Shared direct-bypass shard present in both ckpt-v1 and ckpt-v2, plus distinct objects.
+	sharedShard := bytes.Repeat([]byte("S"), 256<<10)
+	v1Only := bytes.Repeat([]byte("A"), 256<<10)
+	v2New1 := bytes.Repeat([]byte("B"), 256<<10)
+	v2New2 := bytes.Repeat([]byte("C"), 256<<10)
+
+	cfg := DefaultConfig()
+	if cfg.CleanupOnAbort {
+		t.Fatalf("expected DefaultConfig().CleanupOnAbort to default to false for shared CAS safety")
+	}
+	cfg.TargetGroupBytes = 128 << 10
+	cfg.LargeObjectThreshold = 128 << 10
+	cfg.Concurrency = 1
+
+	mem := NewMemoryBackend()
+	be := NewInstrumentedBackend(mem, S3ModelConfig{})
+	eng := NewEngine(be)
+
+	// 1. Publish ckpt-v1 successfully (2 direct objects + 1 head).
+	v1Entries := []Entry{
+		{TenantID: ns.TenantID, VolumeID: ns.VolumeID, Path: "a_shared.bin", Data: sharedShard},
+		{TenantID: ns.TenantID, VolumeID: ns.VolumeID, Path: "b_v1.bin", Data: v1Only},
+	}
+	res1, err := eng.UploadCheckpoint(ctx, ns, "ckpt-v1", v1Entries, cfg)
+	if err != nil || !res1.HeadPublished {
+		t.Fatalf("ckpt-v1 upload failed: res=%+v err=%v", res1, err)
+	}
+
+	// 2. Attempt ckpt-v2 reusing a_shared.bin plus two new shards, failing on the 3rd PUT
+	// with CleanupOnAbort explicitly enabled.
+	v2Entries := []Entry{
+		{TenantID: ns.TenantID, VolumeID: ns.VolumeID, Path: "a_shared.bin", Data: sharedShard},
+		{TenantID: ns.TenantID, VolumeID: ns.VolumeID, Path: "c_new1.bin", Data: v2New1},
+		{TenantID: ns.TenantID, VolumeID: ns.VolumeID, Path: "d_new2.bin", Data: v2New2},
+	}
+	cfgCleanup := cfg
+	cfgCleanup.CleanupOnAbort = true
+	be.ResetMetrics()
+	be.SetModelConfig(S3ModelConfig{FailOnPutCall: 3})
+
+	res2, err := eng.UploadCheckpoint(ctx, ns, "ckpt-v2", v2Entries, cfgCleanup)
+	if !errors.Is(err, ErrInjectedFailure) {
+		t.Fatalf("expected ErrInjectedFailure on ckpt-v2, got %v", err)
+	}
+	if res2 == nil || !res2.Aborted || res2.HeadPublished {
+		t.Fatalf("expected aborted ckpt-v2, got %+v", res2)
+	}
+	// Only the newly uploaded unreferenced shard (c_new1.bin) may be cleaned up;
+	// a_shared.bin MUST be preserved!
+	if res2.CleanedUpObjects != 1 {
+		t.Fatalf("expected exactly 1 unreferenced object cleaned up, got %d", res2.CleanedUpObjects)
+	}
+
+	// 3. Previously published ckpt-v1 MUST remain 100% restorable and bit-exact!
+	be.SetModelConfig(S3ModelConfig{})
+	down1, err := eng.DownloadCheckpoint(ctx, ns, "ckpt-v1", nil, cfg)
+	if err != nil {
+		t.Fatalf("ckpt-v1 broken after ckpt-v2 abort cleanup! err=%v", err)
+	}
+	if !bytes.Equal(down1.Files["a_shared.bin"], sharedShard) || !bytes.Equal(down1.Files["b_v1.bin"], v1Only) {
+		t.Fatalf("ckpt-v1 content mismatch after ckpt-v2 abort")
+	}
+}
+
+type cancelAfterFirstDataReadBackend struct {
+	backend.Backend
+	mu        sync.Mutex
+	dataReads int
+	cancel    context.CancelFunc
+}
+
+func (c *cancelAfterFirstDataReadBackend) Get(ctx context.Context, key string, maxBytes int64) ([]byte, backend.Version, error) {
+	data, ver, err := c.Backend.Get(ctx, key, maxBytes)
+	if err == nil && !bytes.Contains([]byte(key), []byte("/head/")) {
+		c.mu.Lock()
+		c.dataReads++
+		if c.dataReads == 1 && c.cancel != nil {
+			c.cancel()
+		}
+		c.mu.Unlock()
+	}
+	return data, ver, err
+}
+
+func (c *cancelAfterFirstDataReadBackend) GetRange(ctx context.Context, key string, off, n int64) ([]byte, error) {
+	data, err := c.Backend.GetRange(ctx, key, off, n)
+	if err == nil {
+		c.mu.Lock()
+		c.dataReads++
+		if c.dataReads == 1 && c.cancel != nil {
+			c.cancel()
+		}
+		c.mu.Unlock()
+	}
+	return data, err
+}
+
+func TestCodexP2DownloadCancellationPropagatesError(t *testing.T) {
+	ns := Namespace{TenantID: "org-cancel", VolumeID: "vol-1"}
+	cfg := DefaultConfig()
+	cfg.TargetGroupBytes = 64 << 10
+	cfg.LargeObjectThreshold = 64 << 10
+	cfg.Concurrency = 1
+
+	mem := NewMemoryBackend()
+	engUpload := NewEngine(mem)
+	entries := []Entry{
+		{TenantID: ns.TenantID, VolumeID: ns.VolumeID, Path: "shard_0.bin", Data: bytes.Repeat([]byte("X"), 80<<10)},
+		{TenantID: ns.TenantID, VolumeID: ns.VolumeID, Path: "shard_1.bin", Data: bytes.Repeat([]byte("Y"), 80<<10)},
+	}
+	if _, err := engUpload.UploadCheckpoint(context.Background(), ns, "ckpt-cancel", entries, cfg); err != nil {
+		t.Fatalf("upload failed: %v", err)
+	}
+
+	dlCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	wrapped := &cancelAfterFirstDataReadBackend{Backend: mem, cancel: cancel}
+	engDownload := NewEngine(wrapped)
+
+	res, err := engDownload.DownloadCheckpoint(dlCtx, ns, "ckpt-cancel", nil, cfg)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled instead of partial restore, got res=%+v err=%v", res, err)
+	}
+}
+
+func TestCodexP2OversizedManifestRejectedBeforePublish(t *testing.T) {
+	ctx := context.Background()
+	ns := Namespace{TenantID: "org-oversized", VolumeID: "vol-1"}
+	entries := make([]Entry, 30)
+	for i := range entries {
+		entries[i] = Entry{
+			TenantID: ns.TenantID,
+			VolumeID: ns.VolumeID,
+			Path:     fmt.Sprintf("dir/file_%02d.bin", i),
+			Data:     []byte{byte(i + 1)},
+		}
+	}
+
+	cfg := DefaultConfig()
+	cfg.MaxManifestBytes = 4096 // 30 entries produce ~9 KiB manifest > 4 KiB cap
+
+	mem := NewMemoryBackend()
+	eng := NewEngine(mem)
+	res, err := eng.UploadCheckpoint(ctx, ns, "ckpt-huge-manifest", entries, cfg)
+	if !errors.Is(err, backend.ErrTooLarge) {
+		t.Fatalf("expected backend.ErrTooLarge for oversized manifest, got res=%+v err=%v", res, err)
+	}
+	if res == nil || res.HeadPublished || !res.Aborted {
+		t.Fatalf("expected HeadPublished=false Aborted=true, got %+v", res)
+	}
+	if got := mem.ObjectCount(); got != 0 {
+		t.Fatalf("expected 0 objects published when manifest exceeds MaxManifestBytes, got %d", got)
+	}
+}
+
+func TestCodexP2PackCeilingRoutesOversizedEntryToDirectBypass(t *testing.T) {
+	ns := Namespace{TenantID: "org-ceiling", VolumeID: "vol-1"}
+	cfg := DefaultConfig()
+	// Lower only TargetGroupBytes while leaving LargeObjectThreshold at 8 MiB.
+	cfg.TargetGroupBytes = 64 << 10
+
+	entries := []Entry{
+		{TenantID: ns.TenantID, VolumeID: ns.VolumeID, Path: "small.bin", Data: bytes.Repeat([]byte("a"), 16<<10)},
+		{TenantID: ns.TenantID, VolumeID: ns.VolumeID, Path: "between.bin", Data: bytes.Repeat([]byte("b"), 128<<10)},
+	}
+	plan, err := PlanUpload(entries, cfg)
+	if err != nil {
+		t.Fatalf("PlanUpload failed: %v", err)
+	}
+	if plan.DirectObjectCount != 1 || plan.PackedGroupCount != 1 {
+		t.Fatalf("expected 1 direct bypass + 1 packed group, got direct=%d packed=%d", plan.DirectObjectCount, plan.PackedGroupCount)
+	}
+	for _, g := range plan.Groups {
+		if !g.DirectBypass && g.TotalBytes > cfg.TargetGroupBytes {
+			t.Fatalf("packed group %s size %d exceeds TargetGroupBytes %d", g.ObjectKey, g.TotalBytes, cfg.TargetGroupBytes)
+		}
+		if g.DirectBypass && g.Items[0].Path != "between.bin" {
+			t.Fatalf("expected between.bin in DirectBypass, got %s", g.Items[0].Path)
+		}
+	}
+}
