@@ -15,6 +15,7 @@ import (
 	"sort"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/hanzoai/vfs"
 	"github.com/hanzoai/vfs/internal/blake3"
@@ -226,13 +227,18 @@ func BuildImage(ctx context.Context, be backend.Backend, c vfs.Cipher, cfg Confi
 			locs[j] = chunkLocs[ref.chunkIdx]
 		}
 		totalLogicalChunks += len(locs)
-		fileManifests[fi] = FileManifest{
-			Path:    f.Path,
+		fm := FileManifest{
 			Size:    int64(len(f.Data)),
 			Digest:  fileDigests[fi],
 			BootHot: f.BootHot,
 			Chunks:  locs,
 		}
+		if utf8.ValidString(f.Path) {
+			fm.Path = f.Path
+		} else {
+			fm.RawPath = []byte(f.Path)
+		}
+		fileManifests[fi] = fm
 	}
 
 	manifest := &Manifest{
@@ -271,12 +277,21 @@ func BuildImage(ctx context.Context, be backend.Backend, c vfs.Cipher, cfg Confi
 	if err != nil {
 		return nil, BuildStats{}, fmt.Errorf("rubikfs: seal manifest: %w", err)
 	}
+	if int64(len(sealedManifest)) > MaxManifestBytes {
+		return nil, BuildStats{}, fmt.Errorf("rubikfs: sealed manifest size %d exceeds max %d: %w",
+			len(sealedManifest), MaxManifestBytes, backend.ErrTooLarge)
+	}
 	mkey := manifestBackendKey(cfg.Scope, cfg.ImageID)
 	if err := be.Put(ctx, mkey, sealedManifest); err != nil {
 		return nil, BuildStats{}, fmt.Errorf("rubikfs: put manifest: %w", err)
 	}
 	sealPutDur += time.Since(sealStart)
 
+	for i := range manifest.Files {
+		if len(manifest.Files[i].RawPath) > 0 {
+			manifest.Files[i].Path = string(manifest.Files[i].RawPath)
+		}
+	}
 	manifest.ManifestBytes = int64(len(sealedManifest))
 	totalStored := totalSealedPackBytes + int64(len(sealedManifest))
 
@@ -356,7 +371,7 @@ func OpenImage(ctx context.Context, be backend.Backend, c vfs.Cipher, scope Scop
 	}
 
 	mkey := manifestBackendKey(scope, imageID)
-	sealed, _, err := be.Get(ctx, mkey, MaxPackPlaintextBytes)
+	sealed, _, err := be.Get(ctx, mkey, MaxManifestBytes)
 	if err != nil {
 		if errors.Is(err, backend.ErrNotFound) {
 			return nil, fmt.Errorf("%w: manifest %q", ErrNotFound, imageID)
@@ -379,7 +394,7 @@ func OpenImage(ctx context.Context, be backend.Backend, c vfs.Cipher, scope Scop
 	if env.Manifest.Scope != scope || env.Manifest.ImageID != imageID {
 		return nil, fmt.Errorf("%w: manifest scope/image mismatch", ErrTenantIsolation)
 	}
-	// Verify BLAKE3 digest of the manifest payload.
+	// Verify BLAKE3 digest of the manifest payload before restoring RawPath into Path.
 	recheck, err := json.Marshal(&env.Manifest)
 	if err != nil {
 		return nil, fmt.Errorf("%w: re-encode manifest: %v", ErrCorruptPack, err)
@@ -392,6 +407,9 @@ func OpenImage(ctx context.Context, be backend.Backend, c vfs.Cipher, scope Scop
 	m.ManifestBytes = int64(len(sealed))
 	byPath := make(map[string]*FileManifest, len(m.Files))
 	for i := range m.Files {
+		if len(m.Files[i].RawPath) > 0 {
+			m.Files[i].Path = string(m.Files[i].RawPath)
+		}
 		byPath[m.Files[i].Path] = &m.Files[i]
 	}
 	return &Reader{
@@ -501,56 +519,71 @@ func (r *Reader) ReadChunk(ctx context.Context, loc ChunkLocation) ([]byte, erro
 }
 
 func (r *Reader) getPack(ctx context.Context, packIdx int) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	r.mu.Lock()
 	if data, ok := r.packCache[packIdx]; ok {
 		r.stats.PackCacheHits++
 		r.mu.Unlock()
 		return data, nil
 	}
-	if call, ok := r.inflight[packIdx]; ok {
-		r.mu.Unlock()
-		select {
-		case <-call.done:
-			return call.data, call.err
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
+	call, ok := r.inflight[packIdx]
+	if !ok {
+		call = &packFetchCall{done: make(chan struct{})}
+		r.inflight[packIdx] = call
+		// Detach shared single-flight fetch from any individual caller's context
+		// so one caller canceling or timing out cannot abort live waiters.
+		go func(c *packFetchCall) {
+			fetchCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			data, fetchDur, unsealDur, sealedBytes, err := r.fetchAndDecodePack(fetchCtx, packIdx)
+
+			r.mu.Lock()
+			delete(r.inflight, packIdx)
+			if err == nil {
+				r.packCache[packIdx] = data
+				r.stats.BackendGets++
+				r.stats.PacksFetched++
+				r.stats.BackendBytesRead += sealedBytes
+				r.stats.DecompressedBytes += int64(len(data))
+				r.stats.BackendFetchTime += fetchDur
+				r.stats.UnsealDecompTime += unsealDur
+			}
+			c.data = data
+			c.err = err
+			close(c.done)
+			r.mu.Unlock()
+		}(call)
 	}
-	call := &packFetchCall{done: make(chan struct{})}
-	r.inflight[packIdx] = call
 	r.mu.Unlock()
 
-	data, fetchDur, unsealDur, sealedBytes, err := r.fetchAndDecodePack(ctx, packIdx)
-
-	r.mu.Lock()
-	delete(r.inflight, packIdx)
-	if err == nil {
-		r.packCache[packIdx] = data
-		r.stats.BackendGets++
-		r.stats.PacksFetched++
-		r.stats.BackendBytesRead += sealedBytes
-		r.stats.DecompressedBytes += int64(len(data))
-		r.stats.BackendFetchTime += fetchDur
-		r.stats.UnsealDecompTime += unsealDur
+	select {
+	case <-call.done:
+		return call.data, call.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
-	call.data = data
-	call.err = err
-	close(call.done)
-	r.mu.Unlock()
-
-	return data, err
 }
 
 func (r *Reader) fetchAndDecodePack(ctx context.Context, packIdx int) ([]byte, time.Duration, time.Duration, int64, error) {
 	meta := r.manifest.Packs[packIdx]
+	if meta.SealedBytes <= 0 || meta.SealedBytes > MaxSealedPackBytes {
+		return nil, 0, 0, 0, fmt.Errorf("%w: pack %d sealed size %d out of bounds [1, %d]",
+			ErrCorruptPack, packIdx, meta.SealedBytes, MaxSealedPackBytes)
+	}
 	fetchStart := time.Now()
-	sealed, _, err := r.be.Get(ctx, meta.BackendKey, MaxPackPlaintextBytes+64<<10)
+	sealed, _, err := r.be.Get(ctx, meta.BackendKey, meta.SealedBytes)
 	fetchDur := time.Since(fetchStart)
 	if err != nil {
 		if errors.Is(err, backend.ErrNotFound) {
 			return nil, fetchDur, 0, 0, fmt.Errorf("%w: pack %d missing", ErrCorruptPack, packIdx)
 		}
 		return nil, fetchDur, 0, 0, fmt.Errorf("rubikfs: get pack %d: %w", packIdx, err)
+	}
+	if int64(len(sealed)) != meta.SealedBytes {
+		return nil, fetchDur, 0, int64(len(sealed)), fmt.Errorf("%w: pack %d sealed length %d != manifest %d",
+			ErrCorruptPack, packIdx, len(sealed), meta.SealedBytes)
 	}
 
 	unsealStart := time.Now()

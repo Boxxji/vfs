@@ -7,13 +7,17 @@ package rubikfs_test
 
 import (
 	"bytes"
+	"compress/flate"
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	mathrand "math/rand"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/luxfi/age"
 
@@ -731,5 +735,322 @@ func TestConfigValidationAndIntraVolumeDedup(t *testing.T) {
 	}
 	if err := rdr.VerifyAll(ctx, map[string][]byte{"/a/one.bin": dupChunk, "/b/two.bin": dupChunk}); err != nil {
 		t.Fatalf("VerifyAll intra-dedup: %v", err)
+	}
+}
+
+func TestCodexP1ScopeNULRejectionAndUnambiguousKeyDerivation(t *testing.T) {
+	master := []byte("shared-master-key-for-scope-test!")
+	s1 := rubikfs.Scope{TenantID: "a", VolumeID: "b\x00c"}
+	s2 := rubikfs.Scope{TenantID: "a\x00b", VolumeID: "c"}
+	if err := s1.Validate(); !errors.Is(err, rubikfs.ErrInvalidConfig) {
+		t.Fatalf("expected ErrInvalidConfig for NUL in VolumeID, got %v", err)
+	}
+	if err := s2.Validate(); !errors.Is(err, rubikfs.ErrInvalidConfig) {
+		t.Fatalf("expected ErrInvalidConfig for NUL in TenantID, got %v", err)
+	}
+	if _, err := rubikfs.NewVolumeCipher(s1, master); !errors.Is(err, rubikfs.ErrInvalidConfig) {
+		t.Fatalf("expected NewVolumeCipher to reject NUL scope, got %v", err)
+	}
+	// Distinct clean scopes with concatenations that would collide without length prefixing.
+	ca, err := rubikfs.NewVolumeCipher(rubikfs.Scope{TenantID: "ab", VolumeID: "c"}, master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cb, err := rubikfs.NewVolumeCipher(rubikfs.Scope{TenantID: "a", VolumeID: "bc"}, master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealed, keyID, err := ca.Seal([]byte("isolated-payload"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cb.Open(sealed, keyID); !errors.Is(err, rubikfs.ErrTenantIsolation) {
+		t.Fatalf("expected ErrTenantIsolation across distinct scopes, got %v", err)
+	}
+}
+
+func TestCodexP2LargePackWithFullChunkTableFetchBound(t *testing.T) {
+	ctx := context.Background()
+	be := openTestBackend(t)
+	scope := rubikfs.Scope{TenantID: "t-32m", VolumeID: "v-32m"}
+	cipher, err := rubikfs.NewVolumeCipher(scope, []byte("pack-bound-regression-key-32byte"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 32 MiB incompressible payload at 16 KiB chunks = 2,048 chunk entries (~80 KiB table) + CodecNone.
+	// Sealed object exceeds 32 MiB + 64 KiB and previously failed with backend.ErrTooLarge.
+	payload := make([]byte, 32<<20)
+	if _, err := rand.Read(payload); err != nil {
+		t.Fatal(err)
+	}
+	cfg := rubikfs.Config{
+		Scope:           scope,
+		ImageID:         "img-32m-full-table",
+		Policy:          rubikfs.PolicyPathOrder,
+		Codec:           rubikfs.CodecNone,
+		ChunkSize:       16 << 10,
+		TargetPackBytes: 32 << 20,
+	}
+	man, _, err := rubikfs.BuildImage(ctx, be, cipher, cfg, []rubikfs.FileInput{
+		{Path: "/weights/full32m.bin", Data: payload},
+	})
+	if err != nil {
+		t.Fatalf("BuildImage 32 MiB pack failed: %v", err)
+	}
+	if len(man.Packs) != 1 || man.Packs[0].SealedBytes <= (32<<20)+(64<<10) {
+		t.Fatalf("expected single sealed pack > 32MiB+64KiB, got packs=%d sealed=%d", len(man.Packs), man.Packs[0].SealedBytes)
+	}
+	rdr, err := rubikfs.OpenImage(ctx, be, cipher, scope, "img-32m-full-table")
+	if err != nil {
+		t.Fatalf("OpenImage 32 MiB pack failed: %v", err)
+	}
+	got, err := rdr.ReadFile(ctx, "/weights/full32m.bin")
+	if err != nil {
+		t.Fatalf("ReadFile 32 MiB pack failed: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("32 MiB pack round-trip payload mismatch")
+	}
+}
+
+func TestCodexP2NonUTF8FilenamePreservedInManifest(t *testing.T) {
+	ctx := context.Background()
+	be := openTestBackend(t)
+	scope := rubikfs.Scope{TenantID: "t-posix", VolumeID: "v-posix"}
+	cipher, err := rubikfs.NewVolumeCipher(scope, []byte("nonutf8-posix-filename-key-32byt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	hostilePath := "/dir/nonutf8-\xff\xfe-file.bin"
+	hostileData := []byte("exact bytes behind non-utf8 posix filename")
+	utf8Path := "/dir/normal.txt"
+	utf8Data := []byte("standard utf8 filename payload")
+
+	cfg := rubikfs.Config{
+		Scope:   scope,
+		ImageID: "img-hostile-names",
+	}
+	man, _, err := rubikfs.BuildImage(ctx, be, cipher, cfg, []rubikfs.FileInput{
+		{Path: hostilePath, Data: hostileData, BootHot: true},
+		{Path: utf8Path, Data: utf8Data},
+	})
+	if err != nil {
+		t.Fatalf("BuildImage with non-UTF-8 path failed: %v", err)
+	}
+	foundInBuilt := false
+	for _, fm := range man.Files {
+		if fm.Path == hostilePath {
+			foundInBuilt = true
+		}
+	}
+	if !foundInBuilt {
+		t.Fatalf("expected built Manifest to retain exact non-UTF-8 path")
+	}
+
+	rdr, err := rubikfs.OpenImage(ctx, be, cipher, scope, "img-hostile-names")
+	if err != nil {
+		t.Fatalf("OpenImage failed on non-UTF-8 filename: %v", err)
+	}
+	gotHostile, err := rdr.ReadFile(ctx, hostilePath)
+	if err != nil {
+		t.Fatalf("ReadFile on non-UTF-8 filename failed: %v", err)
+	}
+	if !bytes.Equal(gotHostile, hostileData) {
+		t.Fatalf("non-UTF-8 file content mismatch: got %q want %q", gotHostile, hostileData)
+	}
+	gotUTF8, err := rdr.ReadFile(ctx, utf8Path)
+	if err != nil || !bytes.Equal(gotUTF8, utf8Data) {
+		t.Fatalf("UTF-8 file read failed: err=%v", err)
+	}
+}
+
+type blockingPackBackend struct {
+	backend.Backend
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (b *blockingPackBackend) Get(ctx context.Context, key string, maxBytes int64) ([]byte, backend.Version, error) {
+	if bytes.Contains([]byte(key), []byte("/pack/")) {
+		b.once.Do(func() { close(b.started) })
+		select {
+		case <-b.release:
+		case <-ctx.Done():
+			return nil, "", ctx.Err()
+		}
+	}
+	return b.Backend.Get(ctx, key, maxBytes)
+}
+
+func TestCodexP2SingleFlightIsolatesCallerCancellation(t *testing.T) {
+	ctx := context.Background()
+	rawBe := openTestBackend(t)
+	scope := rubikfs.Scope{TenantID: "t-sf", VolumeID: "v-sf"}
+	cipher, err := rubikfs.NewVolumeCipher(scope, []byte("singleflight-cancel-key-32bytes!"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := bytes.Repeat([]byte("singleflight-pack-payload-"), 200)
+	cfg := rubikfs.Config{Scope: scope, ImageID: "img-sf"}
+	if _, _, err := rubikfs.BuildImage(ctx, rawBe, cipher, cfg, []rubikfs.FileInput{
+		{Path: "/shared.bin", Data: want},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	blockBe := &blockingPackBackend{
+		Backend: rawBe,
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	rdr, err := rubikfs.OpenImage(ctx, blockBe, cipher, scope, "img-sf")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	err1Ch := make(chan error, 1)
+	go func() {
+		_, err := rdr.ReadFile(ctx1, "/shared.bin")
+		err1Ch <- err
+	}()
+
+	// Wait until caller 1 starts the backend fetch, then start live caller 2 on the same pack.
+	<-blockBe.started
+	res2Ch := make(chan []byte, 1)
+	err2Ch := make(chan error, 1)
+	go func() {
+		got, err := rdr.ReadFile(context.Background(), "/shared.bin")
+		res2Ch <- got
+		err2Ch <- err
+	}()
+
+	// Give caller 2 a moment to join the inflight wait, then cancel caller 1 and release backend.
+	time.Sleep(15 * time.Millisecond)
+	cancel1()
+	if err := <-err1Ch; !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected caller 1 to receive context.Canceled, got %v", err)
+	}
+	close(blockBe.release)
+
+	if err := <-err2Ch; err != nil {
+		t.Fatalf("live caller 2 failed due to caller 1 cancellation: %v", err)
+	}
+	if got := <-res2Ch; !bytes.Equal(got, want) {
+		t.Fatalf("caller 2 payload mismatch")
+	}
+}
+
+func TestCodexP2LongLZMatchLengthOverflowRejectedWithoutPanic(t *testing.T) {
+	// Craft a malformed LongLZFlate stream with litLen=1, dist=1, extraLen=MaxUint64-16.
+	var cmdBuf bytes.Buffer
+	var tmp [binary.MaxVarintLen64]byte
+	n := binary.PutUvarint(tmp[:], 1)
+	cmdBuf.Write(tmp[:n])
+	n = binary.PutUvarint(tmp[:], 1)
+	cmdBuf.Write(tmp[:n])
+	n = binary.PutUvarint(tmp[:], math.MaxUint64-16)
+	cmdBuf.Write(tmp[:n])
+
+	compressStream := func(src []byte) []byte {
+		var out bytes.Buffer
+		w, err := flate.NewWriter(&out, flate.DefaultCompression)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = w.Write(src)
+		_ = w.Close()
+		return out.Bytes()
+	}
+	cmdComp := compressStream(cmdBuf.Bytes())
+	litComp := compressStream([]byte{'A'})
+
+	var wire bytes.Buffer
+	wire.WriteByte(0x02) // codecModeLongLZFlate
+	var hdr [8]byte
+	binary.LittleEndian.PutUint32(hdr[0:4], uint32(len(cmdComp)))
+	binary.LittleEndian.PutUint32(hdr[4:8], uint32(len(litComp)))
+	wire.Write(hdr[:])
+	wire.Write(cmdComp)
+	wire.Write(litComp)
+
+	if _, err := rubikfs.Decompress(rubikfs.CodecLongLZFlate, 1, wire.Bytes()); !errors.Is(err, rubikfs.ErrCorruptPack) {
+		t.Fatalf("expected ErrCorruptPack on uint64 match-length overflow, got %v", err)
+	}
+}
+
+func TestCodexP2OmittedCodecDefaultsToLongLZFlate(t *testing.T) {
+	ctx := context.Background()
+	be := openTestBackend(t)
+	scope := rubikfs.Scope{TenantID: "t-defcodec", VolumeID: "v-defcodec"}
+	cipher, err := rubikfs.NewVolumeCipher(scope, []byte("default-codec-regression-32bytes"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	repetitive := bytes.Repeat([]byte("HANZO_RUBIKFS_DEFAULT_CODEC_REPETITIVE_PAYLOAD_"), 26000) // ~1.2 MB
+	man, stats, err := rubikfs.BuildImage(ctx, be, cipher, rubikfs.Config{
+		Scope:   scope,
+		ImageID: "img-default-codec",
+		// Codec intentionally omitted (zero value -> must normalize to CodecLongLZFlate).
+	}, []rubikfs.FileInput{{Path: "/rep.txt", Data: repetitive}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if man.Codec != rubikfs.CodecLongLZFlate {
+		t.Fatalf("expected omitted Codec to normalize to CodecLongLZFlate, got %v", man.Codec)
+	}
+	if stats.CompressionRatio < 10.0 {
+		t.Fatalf("expected strong compression on repetitive 1.2 MB payload with default codec, got %.2fx", stats.CompressionRatio)
+	}
+
+	// Explicit CodecNone remains uncompressed.
+	manNone, statsNone, err := rubikfs.BuildImage(ctx, be, cipher, rubikfs.Config{
+		Scope:   scope,
+		ImageID: "img-explicit-none",
+		Codec:   rubikfs.CodecNone,
+	}, []rubikfs.FileInput{{Path: "/rep.txt", Data: repetitive}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manNone.Codec != rubikfs.CodecNone || statsNone.CompressedBytes != statsNone.UncompressedBytes {
+		t.Fatalf("expected explicit CodecNone to store uncompressed, got codec=%v comp=%d uncomp=%d",
+			manNone.Codec, statsNone.CompressedBytes, statsNone.UncompressedBytes)
+	}
+}
+
+func TestCodexP2OversizedManifestRejectedBeforeUpload(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping 32 MiB manifest build in -short mode")
+	}
+	ctx := context.Background()
+	be := openTestBackend(t)
+	scope := rubikfs.Scope{TenantID: "t-bigman", VolumeID: "v-bigman"}
+	cipher, err := rubikfs.NewVolumeCipher(scope, []byte("oversized-manifest-key-32bytes!!"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 33,000 empty files with ~1 KiB paths produce > 32 MiB serialized manifest.
+	pad := string(bytes.Repeat([]byte("a"), 1000))
+	files := make([]rubikfs.FileInput, 33000)
+	for i := range files {
+		files[i] = rubikfs.FileInput{
+			Path: fmt.Sprintf("/d/%06d/%s", i, pad),
+		}
+	}
+	_, _, err = rubikfs.BuildImage(ctx, be, cipher, rubikfs.Config{
+		Scope:   scope,
+		ImageID: "img-oversized-manifest",
+	}, files)
+	if !errors.Is(err, backend.ErrTooLarge) {
+		t.Fatalf("expected backend.ErrTooLarge when sealed manifest exceeds MaxManifestBytes, got %v", err)
+	}
+	if _, err := rubikfs.OpenImage(ctx, be, cipher, scope, "img-oversized-manifest"); !errors.Is(err, rubikfs.ErrNotFound) {
+		t.Fatalf("expected oversized manifest not to be uploaded, got OpenImage err=%v", err)
 	}
 }

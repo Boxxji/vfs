@@ -8,6 +8,7 @@ package rubikfs
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -37,6 +38,15 @@ const (
 	// MaxPackPlaintextBytes bounds any single decompressed pack to prevent
 	// memory exhaustion on untrusted/corrupt pack headers (32 MiB).
 	MaxPackPlaintextBytes = 32 << 20
+
+	// MaxSealedPackBytes bounds any sealed pack object including worst-case
+	// chunk index table (up to 32,768 entries at 1 KiB min chunk size),
+	// pack header, and AEAD framing overhead (36 MiB).
+	MaxSealedPackBytes = MaxPackPlaintextBytes + 4<<20
+
+	// MaxManifestBytes bounds sealed image manifests consistently on both
+	// BuildImage write and OpenImage read (32 MiB).
+	MaxManifestBytes = MaxPackPlaintextBytes
 )
 
 // Scope uniquely identifies an isolated tenant and volume boundary.
@@ -47,10 +57,13 @@ type Scope struct {
 	VolumeID string `json:"volume_id"`
 }
 
-// Validate reports whether Scope has non-empty tenant and volume identifiers.
+// Validate reports whether Scope has non-empty, NUL-free tenant and volume identifiers.
 func (s Scope) Validate() error {
 	if s.TenantID == "" || s.VolumeID == "" {
 		return fmt.Errorf("%w: tenant_id and volume_id must be non-empty", ErrInvalidConfig)
+	}
+	if strings.IndexByte(s.TenantID, 0) >= 0 || strings.IndexByte(s.VolumeID, 0) >= 0 {
+		return fmt.Errorf("%w: tenant_id and volume_id must not contain NUL bytes", ErrInvalidConfig)
 	}
 	return nil
 }
@@ -79,8 +92,8 @@ const (
 type CodecKind uint8
 
 const (
-	// CodecNone stores pack chunk payloads uncompressed.
-	CodecNone CodecKind = 0
+	// CodecDefault is the omitted zero value, normalized by Config.Validate to CodecLongLZFlate.
+	CodecDefault CodecKind = 0
 
 	// CodecFlate compresses each pack with standard library DEFLATE (32 KiB window).
 	CodecFlate CodecKind = 1
@@ -88,11 +101,16 @@ const (
 	// CodecLongLZFlate runs a pack-wide multi-MiB window LZ77 match pass followed
 	// by DEFLATE entropy coding, with automatic raw fallback on incompressible packs.
 	CodecLongLZFlate CodecKind = 2
+
+	// CodecNone stores pack chunk payloads explicitly uncompressed.
+	CodecNone CodecKind = 3
 )
 
 // String returns the canonical name of CodecKind.
 func (c CodecKind) String() string {
 	switch c {
+	case CodecDefault:
+		return "default"
 	case CodecNone:
 		return "none"
 	case CodecFlate:
@@ -153,7 +171,7 @@ type Config struct {
 	// Policy selects the packing regime. Defaults to PolicyLocalityHybrid.
 	Policy Policy
 
-	// Codec selects the pack compression codec. Defaults to CodecLongLZFlate.
+	// Codec selects the pack compression codec. Defaults to CodecLongLZFlate when omitted.
 	Codec CodecKind
 
 	// ChunkSize is the fixed base-image chunk size in bytes (e.g., 16 KiB or 64 KiB).
@@ -182,8 +200,8 @@ func (c *Config) Validate() error {
 	if err := c.Scope.Validate(); err != nil {
 		return err
 	}
-	if c.ImageID == "" {
-		return fmt.Errorf("%w: image_id must be non-empty", ErrInvalidConfig)
+	if c.ImageID == "" || strings.IndexByte(c.ImageID, 0) >= 0 {
+		return fmt.Errorf("%w: image_id must be non-empty and NUL-free", ErrInvalidConfig)
 	}
 	if c.Policy == "" {
 		c.Policy = PolicyLocalityHybrid
@@ -210,6 +228,9 @@ func (c *Config) Validate() error {
 	}
 	if c.BootPackBytes < c.ChunkSize || c.BootPackBytes > MaxPackPlaintextBytes {
 		return fmt.Errorf("%w: boot_pack_bytes %d out of [%d, %d]", ErrInvalidConfig, c.BootPackBytes, c.ChunkSize, MaxPackPlaintextBytes)
+	}
+	if c.Codec == CodecDefault {
+		c.Codec = CodecLongLZFlate
 	}
 	if c.Codec != CodecNone && c.Codec != CodecFlate && c.Codec != CodecLongLZFlate {
 		return fmt.Errorf("%w: unknown codec %d", ErrInvalidConfig, c.Codec)
@@ -245,7 +266,8 @@ type ChunkLocation struct {
 
 // FileManifest records the ordered chunks that reconstruct an immutable file.
 type FileManifest struct {
-	Path    string          `json:"path"`
+	Path    string          `json:"path,omitempty"`
+	RawPath []byte          `json:"raw_path,omitempty"`
 	Size    int64           `json:"size"`
 	Digest  [32]byte        `json:"digest"`
 	BootHot bool            `json:"boot_hot"`

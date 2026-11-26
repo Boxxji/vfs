@@ -35,6 +35,13 @@ type VolumeCipher struct {
 	aead  cipher.AEAD
 }
 
+func writeLenPrefixed(h *blake3.Hasher, s string) {
+	var lb [8]byte
+	binary.BigEndian.PutUint64(lb[:], uint64(len(s)))
+	_, _ = h.Write(lb[:])
+	_, _ = h.WriteString(s)
+}
+
 // NewVolumeCipher derives an isolated per-volume AES-256-GCM cipher from masterSecret.
 // Two volumes with different (tenant_id, volume_id) always derive independent keys
 // even if given the same masterSecret.
@@ -48,11 +55,12 @@ func NewVolumeCipher(scope Scope, masterSecret []byte) (*VolumeCipher, error) {
 
 	var key [32]byte
 	h := blake3.New()
-	_, _ = h.WriteString("hanzoai/vfs rubikfs volume key v1\x00")
-	_, _ = h.WriteString(scope.TenantID)
-	_, _ = h.Write([]byte{0})
-	_, _ = h.WriteString(scope.VolumeID)
-	_, _ = h.Write([]byte{0})
+	_, _ = h.WriteString("hanzoai/vfs rubikfs volume key v2\x00")
+	writeLenPrefixed(h, scope.TenantID)
+	writeLenPrefixed(h, scope.VolumeID)
+	var mlen [8]byte
+	binary.BigEndian.PutUint64(mlen[:], uint64(len(masterSecret)))
+	_, _ = h.Write(mlen[:])
 	_, _ = h.Write(masterSecret)
 	h.Expand(key[:])
 
@@ -67,10 +75,9 @@ func NewVolumeCipher(scope Scope, masterSecret []byte) (*VolumeCipher, error) {
 
 	var idSum [16]byte
 	ih := blake3.New()
-	_, _ = ih.WriteString("hanzoai/vfs rubikfs key id v1\x00")
-	_, _ = ih.WriteString(scope.TenantID)
-	_, _ = ih.Write([]byte{0})
-	_, _ = ih.WriteString(scope.VolumeID)
+	_, _ = ih.WriteString("hanzoai/vfs rubikfs key id v2\x00")
+	writeLenPrefixed(ih, scope.TenantID)
+	writeLenPrefixed(ih, scope.VolumeID)
 	_, _ = ih.Write(key[:8])
 	ih.Expand(idSum[:])
 
@@ -115,9 +122,20 @@ var _ vfs.Cipher = (*VolumeCipher)(nil)
 // scopeNamespace derives an opaque, backend.ValidKey-compliant prefix for a
 // (tenant_id, volume_id) scope so no plaintext tenant or volume names appear in S3 keys.
 func scopeNamespace(scope Scope) string {
-	th := blake3.Sum([]byte("hanzoai/vfs rubikfs tenant ns\x00" + scope.TenantID))
-	vh := blake3.Sum([]byte("hanzoai/vfs rubikfs volume ns\x00" + scope.TenantID + "\x00" + scope.VolumeID))
-	return "rubikfs/" + hex.EncodeToString(th[:8]) + "/" + hex.EncodeToString(vh[:8])
+	th := blake3.New()
+	_, _ = th.WriteString("hanzoai/vfs rubikfs tenant ns v2\x00")
+	writeLenPrefixed(th, scope.TenantID)
+	var tsum [8]byte
+	th.Expand(tsum[:])
+
+	vh := blake3.New()
+	_, _ = vh.WriteString("hanzoai/vfs rubikfs volume ns v2\x00")
+	writeLenPrefixed(vh, scope.TenantID)
+	writeLenPrefixed(vh, scope.VolumeID)
+	var vsum [8]byte
+	vh.Expand(vsum[:])
+
+	return "rubikfs/" + hex.EncodeToString(tsum[:]) + "/" + hex.EncodeToString(vsum[:])
 }
 
 // packBackendKey returns the backend object key for a pack within scope.
@@ -128,20 +146,23 @@ func packBackendKey(scope Scope, id PackID) string {
 
 // manifestBackendKey returns the backend object key for an image manifest within scope.
 func manifestBackendKey(scope Scope, imageID string) string {
-	ih := blake3.Sum([]byte("hanzoai/vfs rubikfs manifest\x00" + scope.TenantID + "\x00" + scope.VolumeID + "\x00" + imageID))
-	return scopeNamespace(scope) + "/manifest/" + hex.EncodeToString(ih[:16])
+	ih := blake3.New()
+	_, _ = ih.WriteString("hanzoai/vfs rubikfs manifest v2\x00")
+	writeLenPrefixed(ih, scope.TenantID)
+	writeLenPrefixed(ih, scope.VolumeID)
+	writeLenPrefixed(ih, imageID)
+	var sum [16]byte
+	ih.Expand(sum[:])
+	return scopeNamespace(scope) + "/manifest/" + hex.EncodeToString(sum[:])
 }
 
 // packAAD binds a sealed pack cryptographically to its exact (tenant, volume, image, pack).
 func packAAD(scope Scope, imageID string, id PackID) [aadLen]byte {
 	h := blake3.New()
-	_, _ = h.WriteString("hanzoai/vfs rubikfs pack aad v1\x00")
-	_, _ = h.WriteString(scope.TenantID)
-	_, _ = h.Write([]byte{0})
-	_, _ = h.WriteString(scope.VolumeID)
-	_, _ = h.Write([]byte{0})
-	_, _ = h.WriteString(imageID)
-	_, _ = h.Write([]byte{0})
+	_, _ = h.WriteString("hanzoai/vfs rubikfs pack aad v2\x00")
+	writeLenPrefixed(h, scope.TenantID)
+	writeLenPrefixed(h, scope.VolumeID)
+	writeLenPrefixed(h, imageID)
 	_, _ = h.Write(id[:])
 	var out [aadLen]byte
 	h.Expand(out[:])
@@ -151,12 +172,10 @@ func packAAD(scope Scope, imageID string, id PackID) [aadLen]byte {
 // manifestAAD binds a sealed manifest cryptographically to its exact (tenant, volume, image).
 func manifestAAD(scope Scope, imageID string) [aadLen]byte {
 	h := blake3.New()
-	_, _ = h.WriteString("hanzoai/vfs rubikfs manifest aad v1\x00")
-	_, _ = h.WriteString(scope.TenantID)
-	_, _ = h.Write([]byte{0})
-	_, _ = h.WriteString(scope.VolumeID)
-	_, _ = h.Write([]byte{0})
-	_, _ = h.WriteString(imageID)
+	_, _ = h.WriteString("hanzoai/vfs rubikfs manifest aad v2\x00")
+	writeLenPrefixed(h, scope.TenantID)
+	writeLenPrefixed(h, scope.VolumeID)
+	writeLenPrefixed(h, imageID)
 	var out [aadLen]byte
 	h.Expand(out[:])
 	return out

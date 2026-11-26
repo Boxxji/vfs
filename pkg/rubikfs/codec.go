@@ -382,18 +382,20 @@ func decompressLongLZFlate(data []byte, expectedLen int) ([]byte, error) {
 			if litLen > uint64(len(litStream)-lpos) {
 				return nil, fmt.Errorf("%w: longlz literal overrun", ErrCorruptPack)
 			}
-			if uint64(len(dst))+litLen > uint64(expectedLen) {
+			remOut := uint64(expectedLen - len(dst))
+			if litLen > remOut {
 				return nil, fmt.Errorf("%w: longlz output literal overrun", ErrCorruptPack)
 			}
 			dst = append(dst, litStream[lpos:lpos+int(litLen)]...)
 			lpos += int(litLen)
 
+			remOut = uint64(expectedLen - len(dst))
+			if extraLen > remOut || longLZMinMatch > remOut-extraLen {
+				return nil, fmt.Errorf("%w: longlz match overrun", ErrCorruptPack)
+			}
 			matchLen := extraLen + longLZMinMatch
 			if dist == 0 || dist > uint64(len(dst)) {
 				return nil, fmt.Errorf("%w: longlz invalid match distance %d at offset %d", ErrCorruptPack, dist, len(dst))
-			}
-			if uint64(len(dst))+matchLen > uint64(expectedLen) {
-				return nil, fmt.Errorf("%w: longlz match overrun", ErrCorruptPack)
 			}
 
 			srcOff := len(dst) - int(dist)
