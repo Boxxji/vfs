@@ -535,32 +535,50 @@ func (m *ManifestV1) verifyVersion(policy VerificationPolicy) error {
 	return nil
 }
 
-// SemVer is a parsed semantic version MAJOR.MINOR.PATCH[-prerelease].
+// SemVer is a parsed semantic version MAJOR.MINOR.PATCH[-prerelease][+build].
 type SemVer struct {
 	Major      int
 	Minor      int
 	Patch      int
 	Prerelease string
+	Build      string
 }
 
-// ParseSemVer parses a strict MAJOR.MINOR.PATCH[-prerelease] version string.
+// ParseSemVer parses a strict MAJOR.MINOR.PATCH[-prerelease][+build] version string.
 func ParseSemVer(s string) (SemVer, error) {
 	s = strings.TrimSpace(s)
 	s = strings.TrimPrefix(s, "v")
 	if s == "" {
 		return SemVer{}, errors.New("empty version")
 	}
-	core := s
+	rest := s
+	build := ""
+	if idx := strings.IndexByte(rest, '+'); idx >= 0 {
+		build = rest[idx+1:]
+		rest = rest[:idx]
+		if build == "" {
+			return SemVer{}, errors.New("empty build metadata")
+		}
+		for _, id := range strings.Split(build, ".") {
+			if !isValidSemVerIdent(id) {
+				return SemVer{}, fmt.Errorf("invalid build metadata identifier %q in %q", id, s)
+			}
+		}
+	}
+	core := rest
 	pre := ""
-	if idx := strings.IndexByte(s, '-'); idx >= 0 {
-		core = s[:idx]
-		pre = s[idx+1:]
+	if idx := strings.IndexByte(rest, '-'); idx >= 0 {
+		core = rest[:idx]
+		pre = rest[idx+1:]
 		if pre == "" {
 			return SemVer{}, errors.New("empty prerelease")
 		}
 		for _, id := range strings.Split(pre, ".") {
-			if id == "" {
-				return SemVer{}, fmt.Errorf("empty prerelease identifier in %q", s)
+			if !isValidSemVerIdent(id) {
+				return SemVer{}, fmt.Errorf("invalid prerelease identifier %q in %q", id, s)
+			}
+			if len(id) > 1 && id[0] == '0' && isASCIIOnlyDigits(id) {
+				return SemVer{}, fmt.Errorf("numeric prerelease identifier %q must not have leading zero in %q", id, s)
 			}
 		}
 	}
@@ -568,22 +586,53 @@ func ParseSemVer(s string) (SemVer, error) {
 	if len(parts) != 3 {
 		return SemVer{}, fmt.Errorf("expected MAJOR.MINOR.PATCH, got %q", s)
 	}
-	maj, err := strconv.Atoi(parts[0])
-	if err != nil || maj < 0 {
-		return SemVer{}, fmt.Errorf("invalid major version %q", parts[0])
+	maj, err := parseSemVerCoreNum(parts[0], "major")
+	if err != nil {
+		return SemVer{}, err
 	}
-	min, err := strconv.Atoi(parts[1])
-	if err != nil || min < 0 {
-		return SemVer{}, fmt.Errorf("invalid minor version %q", parts[1])
+	min, err := parseSemVerCoreNum(parts[1], "minor")
+	if err != nil {
+		return SemVer{}, err
 	}
-	pat, err := strconv.Atoi(parts[2])
-	if err != nil || pat < 0 {
-		return SemVer{}, fmt.Errorf("invalid patch version %q", parts[2])
+	pat, err := parseSemVerCoreNum(parts[2], "patch")
+	if err != nil {
+		return SemVer{}, err
 	}
-	return SemVer{Major: maj, Minor: min, Patch: pat, Prerelease: pre}, nil
+	return SemVer{Major: maj, Minor: min, Patch: pat, Prerelease: pre, Build: build}, nil
+}
+
+func parseSemVerCoreNum(raw, label string) (int, error) {
+	if !isASCIIOnlyDigits(raw) {
+		return 0, fmt.Errorf("invalid %s version %q", label, raw)
+	}
+	if len(raw) > 1 && raw[0] == '0' {
+		return 0, fmt.Errorf("invalid %s version %q: leading zero", label, raw)
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("invalid %s version %q", label, raw)
+	}
+	return n, nil
+}
+
+func isValidSemVerIdent(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		isDigit := c >= '0' && c <= '9'
+		isUpper := c >= 'A' && c <= 'Z'
+		isLower := c >= 'a' && c <= 'z'
+		if !isDigit && !isUpper && !isLower && c != '-' {
+			return false
+		}
+	}
+	return true
 }
 
 // Compare returns -1 if v < o, 0 if equal, +1 if v > o.
+// Per SemVer 2.0.0 section 10, build metadata does not affect precedence.
 func (v SemVer) Compare(o SemVer) int {
 	if v.Major != o.Major {
 		return cmpInt(v.Major, o.Major)

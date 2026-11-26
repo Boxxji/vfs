@@ -337,11 +337,13 @@ func (c *Client) PullToDir(ctx context.Context, m *ManifestV1, providers []Chunk
 		latMu.Unlock()
 	}
 
+	seenInfos := make([]os.FileInfo, 0, len(m.Artifacts))
 	for artIdx, art := range m.Artifacts {
-		f, err := openConfinedArtifactFile(outRoot, art.Path)
+		f, fi, err := openConfinedArtifactFile(outRoot, art.Path, seenInfos)
 		if err != nil {
 			return nil, err
 		}
+		seenInfos = append(seenInfos, fi)
 
 		ckptPath := c.checkpointPath(m.ManifestCID, artIdx)
 		ckpt := loadCheckpoint(ckptPath, m.ManifestCID, art.Path, len(art.Chunks))
@@ -645,9 +647,6 @@ func (c *Client) PullArtifactStream(ctx context.Context, m *ManifestV1, artifact
 		if streamErr != nil {
 			continue
 		}
-		if ttftSet.CompareAndSwap(false, true) {
-			ttftNs.Store(time.Since(start).Nanoseconds())
-		}
 		chunkLatencies = append(chunkLatencies, res.dur)
 		downloaded.Add(1)
 		verifiedBytes.Add(int64(len(res.data)))
@@ -666,6 +665,9 @@ func (c *Client) PullArtifactStream(ctx context.Context, m *ManifestV1, artifact
 				cancel()
 				clear(reorder)
 				break
+			}
+			if ttftSet.CompareAndSwap(false, true) {
+				ttftNs.Store(time.Since(start).Nanoseconds())
 			}
 			nextIdx++
 			select {
@@ -693,12 +695,24 @@ func (c *Client) PullArtifactStream(ctx context.Context, m *ManifestV1, artifact
 	return report, nil
 }
 
-// openConfinedArtifactFile opens or creates relSlashPath strictly within root,
-// rejecting any symlink components along parent directories or the target file.
-func openConfinedArtifactFile(root *os.Root, relSlashPath string) (*os.File, error) {
-	if err := validateRelativePath(relSlashPath); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidManifest, err)
+func sameFileAny(fi os.FileInfo, seen []os.FileInfo) bool {
+	for _, prev := range seen {
+		if os.SameFile(fi, prev) {
+			return true
+		}
 	}
+	return false
+}
+
+// openConfinedArtifactFile opens or creates relSlashPath strictly within root,
+// rejecting any symlink components along parent directories or the target file
+// and detaching any hard-linked or previously-opened aliased target so each
+// artifact writes to an independent regular inode.
+func openConfinedArtifactFile(root *os.Root, relSlashPath string, seenInfos []os.FileInfo) (*os.File, os.FileInfo, error) {
+	if err := validateRelativePath(relSlashPath); err != nil {
+		return nil, nil, fmt.Errorf("%w: %v", ErrInvalidManifest, err)
+	}
+	needDetach := false
 	segments := strings.Split(relSlashPath, "/")
 	for i := range segments {
 		prefix := filepath.Join(segments[:i+1]...)
@@ -707,50 +721,86 @@ func openConfinedArtifactFile(root *os.Root, relSlashPath string) (*os.File, err
 			if errors.Is(err, os.ErrNotExist) {
 				break
 			}
-			return nil, fmt.Errorf("modeldist: inspect artifact path %q: %w", relSlashPath, err)
+			return nil, nil, fmt.Errorf("modeldist: inspect artifact path %q: %w", relSlashPath, err)
 		}
 		if fi.Mode()&os.ModeSymlink != 0 {
-			return nil, fmt.Errorf("%w: refusing to traverse symlink %q in output directory", ErrInvalidManifest, prefix)
+			return nil, nil, fmt.Errorf("%w: refusing to traverse symlink %q in output directory", ErrInvalidManifest, prefix)
 		}
 		isLast := i == len(segments)-1
 		if !isLast && !fi.IsDir() {
-			return nil, fmt.Errorf("%w: parent path %q is not a directory", ErrInvalidManifest, prefix)
+			return nil, nil, fmt.Errorf("%w: parent path %q is not a directory", ErrInvalidManifest, prefix)
 		}
 		if isLast && !fi.Mode().IsRegular() {
-			return nil, fmt.Errorf("%w: target path %q is not a regular file", ErrInvalidManifest, prefix)
+			return nil, nil, fmt.Errorf("%w: target path %q is not a regular file", ErrInvalidManifest, prefix)
+		}
+		if isLast && (hasMultipleHardLinks(fi) || sameFileAny(fi, seenInfos)) {
+			needDetach = true
 		}
 	}
 
 	relPath := filepath.FromSlash(relSlashPath)
 	if relDir := filepath.Dir(relPath); relDir != "." {
 		if err := root.MkdirAll(relDir, 0o755); err != nil {
-			return nil, fmt.Errorf("modeldist: create artifact dir %q: %w", relDir, err)
+			return nil, nil, fmt.Errorf("modeldist: create artifact dir %q: %w", relDir, err)
 		}
+	}
+
+	openExclusive := func() (*os.File, os.FileInfo, error) {
+		if err := root.Remove(relPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, nil, fmt.Errorf("modeldist: detach aliased artifact %q: %w", relSlashPath, err)
+		}
+		f, err := root.OpenFile(relPath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o644)
+		if err != nil {
+			return nil, nil, fmt.Errorf("modeldist: create independent artifact %q: %w", relSlashPath, err)
+		}
+		fi, err := verifyOpenedArtifactFile(root, relPath, relSlashPath, f)
+		if err != nil {
+			_ = f.Close()
+			return nil, nil, err
+		}
+		if hasMultipleHardLinks(fi) || sameFileAny(fi, seenInfos) {
+			_ = f.Close()
+			return nil, nil, fmt.Errorf("%w: artifact %q shares an inode with another link", ErrInvalidManifest, relSlashPath)
+		}
+		return f, fi, nil
+	}
+
+	if needDetach {
+		return openExclusive()
 	}
 
 	f, err := root.OpenFile(relPath, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
-		return nil, fmt.Errorf("modeldist: open artifact %q: %w", relSlashPath, err)
+		return nil, nil, fmt.Errorf("modeldist: open artifact %q: %w", relSlashPath, err)
 	}
-	fi, err := f.Stat()
+	fi, err := verifyOpenedArtifactFile(root, relPath, relSlashPath, f)
 	if err != nil {
 		_ = f.Close()
+		return nil, nil, err
+	}
+	if hasMultipleHardLinks(fi) || sameFileAny(fi, seenInfos) {
+		_ = f.Close()
+		return openExclusive()
+	}
+	return f, fi, nil
+}
+
+func verifyOpenedArtifactFile(root *os.Root, relPath, relSlashPath string, f *os.File) (os.FileInfo, error) {
+	fi, err := f.Stat()
+	if err != nil {
 		return nil, err
 	}
 	if !fi.Mode().IsRegular() {
-		_ = f.Close()
 		return nil, fmt.Errorf("%w: opened artifact %q is not a regular file", ErrInvalidManifest, relSlashPath)
 	}
 	lfi, err := root.Lstat(relPath)
 	if err != nil {
-		_ = f.Close()
 		return nil, fmt.Errorf("modeldist: verify artifact %q: %w", relSlashPath, err)
 	}
 	if lfi.Mode()&os.ModeSymlink != 0 || !os.SameFile(fi, lfi) {
-		_ = f.Close()
 		return nil, fmt.Errorf("%w: artifact %q resolved through symlink", ErrInvalidManifest, relSlashPath)
 	}
-	return f, nil
+	return fi, nil
 }
 
 func (c *Client) finalizeReport(

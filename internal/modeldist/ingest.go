@@ -6,8 +6,10 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/hanzoai/vfs/internal/blake3"
@@ -183,7 +185,7 @@ func ExportBundle(ctx context.Context, m *ManifestV1, policy VerificationPolicy,
 	if err := os.MkdirAll(storeDir, 0o755); err != nil {
 		return nil, err
 	}
-	backendURL := "file://" + storeDir
+	backendURL := fileBackendURL(storeDir)
 	b, err := backend.Open(ctx, backendURL)
 	if err != nil {
 		return nil, fmt.Errorf("modeldist: open export backend %s: %w", backendURL, err)
@@ -212,4 +214,12 @@ func ExportBundle(ctx context.Context, m *ManifestV1, policy VerificationPolicy,
 		TotalBytes:     m.TotalBytes(),
 		ExportedAt:     time.Now().UTC().Format(time.RFC3339),
 	}, nil
+}
+
+func fileBackendURL(absDir string) string {
+	p := filepath.ToSlash(absDir)
+	if !strings.HasPrefix(p, "/") {
+		p = "/" + p
+	}
+	return (&url.URL{Scheme: "file", Path: p}).String()
 }

@@ -524,15 +524,15 @@ func (p *HTTPMirrorProvider) GetChunk(ctx context.Context, blake3Hex string, max
 		return nil, fmt.Errorf("modeldist: mirror %s GET chunk status %d", p.id, resp.StatusCode)
 	}
 	var r io.Reader = resp.Body
-	if maxSize > 0 {
-		r = io.LimitReader(resp.Body, maxSize+1)
+	if maxSize > 0 && maxSize < backend.Unbounded {
+		r = io.LimitReader(resp.Body, backend.Past(maxSize))
 	}
 	data, err := io.ReadAll(r)
 	if err != nil {
 		p.errCount.Add(1)
 		return nil, err
 	}
-	if maxSize > 0 && int64(len(data)) > maxSize {
+	if maxSize > 0 && maxSize < backend.Unbounded && int64(len(data)) > maxSize {
 		p.errCount.Add(1)
 		return nil, fmt.Errorf("%w: chunk exceeds max %d", ErrChunkSizeMismatch, maxSize)
 	}

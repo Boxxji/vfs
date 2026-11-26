@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -584,3 +585,389 @@ func TestSemVerPrereleaseNumericPrecedence(t *testing.T) {
 		t.Fatalf("expected rc.10 to pass [1.0.0-rc.2, 1.0.0-rc.10], got %v", err)
 	}
 }
+
+// TestPullToDirDetachesHardLinkedArtifacts verifies that pre-existing hard links
+// between two artifacts in outDir (or linking an artifact to a file outside
+// outDir) are detached onto independent inodes so writing artifact B never
+// overwrites artifact A or any external file.
+func TestPullToDirDetachesHardLinkedArtifacts(t *testing.T) {
+	ctx := context.Background()
+	pub, priv := mustKeyPair(t)
+	store := NewVFSStoreProvider("hardlink-origin", true, storetest.NewMem())
+
+	payloadA := deterministicPayload(101, 48<<10)
+	payloadB := deterministicPayload(202, 48<<10)
+	artA, err := IngestArtifact(ctx, "weights/a.bin", AssetKindGGUF, "Q4_K_M", bytes.NewReader(payloadA), 16<<10, store)
+	if err != nil {
+		t.Fatalf("IngestArtifact A: %v", err)
+	}
+	artB, err := IngestArtifact(ctx, "weights/b.bin", AssetKindGGUF, "Q4_K_M", bytes.NewReader(payloadB), 16<<10, store)
+	if err != nil {
+		t.Fatalf("IngestArtifact B: %v", err)
+	}
+	m := &ManifestV1{
+		SchemaVersion: SchemaVersionV1,
+		ModelID:       "zen-hardlink-test",
+		Version:       "1.0.0",
+		License:       "Apache-2.0",
+		Provenance:    Provenance{CreatedAt: time.Now().UTC().Format(time.RFC3339)},
+		Artifacts:     []Artifact{artA, artB},
+	}
+	if err := m.Sign(priv, "zen-release"); err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	cfg := ClientConfig{}
+	cfg.Policy = VerificationPolicy{TrustedKeys: []ed25519.PublicKey{pub}}
+	cli := NewClient(cfg)
+
+	t.Run("two_artifacts_hardlinked_together", func(t *testing.T) {
+		outDir := t.TempDir()
+		weightsDir := filepath.Join(outDir, "weights")
+		if err := os.MkdirAll(weightsDir, 0o755); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		pathA := filepath.Join(weightsDir, "a.bin")
+		pathB := filepath.Join(weightsDir, "b.bin")
+		if err := os.WriteFile(pathA, []byte("preexisting-shared-inode"), 0o644); err != nil {
+			t.Fatalf("WriteFile A: %v", err)
+		}
+		if err := os.Link(pathA, pathB); err != nil {
+			t.Fatalf("Link A->B: %v", err)
+		}
+
+		if _, err := cli.PullToDir(ctx, m, []ChunkProvider{store}, outDir, PullOptions{}); err != nil {
+			t.Fatalf("PullToDir: %v", err)
+		}
+
+		fiA, err := os.Stat(pathA)
+		if err != nil {
+			t.Fatalf("Stat A: %v", err)
+		}
+		fiB, err := os.Stat(pathB)
+		if err != nil {
+			t.Fatalf("Stat B: %v", err)
+		}
+		if os.SameFile(fiA, fiB) {
+			t.Fatal("expected artifact A and B to occupy independent inodes after PullToDir")
+		}
+		gotA, err := os.ReadFile(pathA)
+		if err != nil {
+			t.Fatalf("ReadFile A: %v", err)
+		}
+		gotB, err := os.ReadFile(pathB)
+		if err != nil {
+			t.Fatalf("ReadFile B: %v", err)
+		}
+		if !bytes.Equal(gotA, payloadA) {
+			t.Fatalf("artifact A bytes corrupted (len=%d, want=%d)", len(gotA), len(payloadA))
+		}
+		if !bytes.Equal(gotB, payloadB) {
+			t.Fatalf("artifact B bytes mismatch (len=%d, want=%d)", len(gotB), len(payloadB))
+		}
+	})
+
+	t.Run("external_hardlink_untouched", func(t *testing.T) {
+		base := t.TempDir()
+		outsideFile := filepath.Join(base, "victim.txt")
+		victimBytes := []byte("do-not-overwrite-outside")
+		if err := os.WriteFile(outsideFile, victimBytes, 0o644); err != nil {
+			t.Fatalf("WriteFile victim: %v", err)
+		}
+		outDir := filepath.Join(base, "out")
+		weightsDir := filepath.Join(outDir, "weights")
+		if err := os.MkdirAll(weightsDir, 0o755); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		if err := os.Link(outsideFile, filepath.Join(weightsDir, "a.bin")); err != nil {
+			t.Fatalf("Link outside->a.bin: %v", err)
+		}
+
+		if _, err := cli.PullToDir(ctx, m, []ChunkProvider{store}, outDir, PullOptions{}); err != nil {
+			t.Fatalf("PullToDir: %v", err)
+		}
+		gotVictim, err := os.ReadFile(outsideFile)
+		if err != nil {
+			t.Fatalf("ReadFile victim: %v", err)
+		}
+		if !bytes.Equal(gotVictim, victimBytes) {
+			t.Fatalf("external hard-linked file was modified: got %q, want %q", gotVictim, victimBytes)
+		}
+		gotA, err := os.ReadFile(filepath.Join(weightsDir, "a.bin"))
+		if err != nil {
+			t.Fatalf("ReadFile a.bin: %v", err)
+		}
+		if !bytes.Equal(gotA, payloadA) {
+			t.Fatalf("artifact A bytes mismatch")
+		}
+	})
+}
+
+// TestSemVerBuildMetadataDoesNotAffectPrecedence verifies SemVer 2.0.0 build
+// metadata separation/validation and confirms +metadata never changes
+// prerelease or policy version precedence.
+func TestSemVerBuildMetadataDoesNotAffectPrecedence(t *testing.T) {
+	vRC2Linux, err := ParseSemVer("1.0.0-rc.2+linux")
+	if err != nil {
+		t.Fatalf("ParseSemVer rc.2+linux: %v", err)
+	}
+	if vRC2Linux.Prerelease != "rc.2" || vRC2Linux.Build != "linux" {
+		t.Fatalf("unexpected parsed fields: %+v", vRC2Linux)
+	}
+	vRC2Darwin, err := ParseSemVer("1.0.0-rc.2+darwin.arm64-2026")
+	if err != nil {
+		t.Fatalf("ParseSemVer rc.2+darwin: %v", err)
+	}
+	if vRC2Linux.Compare(vRC2Darwin) != 0 {
+		t.Fatalf("build metadata must not affect precedence: got %d", vRC2Linux.Compare(vRC2Darwin))
+	}
+	vRC10, err := ParseSemVer("1.0.0-rc.10")
+	if err != nil {
+		t.Fatalf("ParseSemVer rc.10: %v", err)
+	}
+	if c := vRC2Linux.Compare(vRC10); c != -1 {
+		t.Fatalf("expected 1.0.0-rc.2+linux < 1.0.0-rc.10 (-1), got %d", c)
+	}
+
+	// Build metadata containing hyphens on a release version must not be parsed as prerelease.
+	vRelBuild, err := ParseSemVer("1.0.0+build-1")
+	if err != nil {
+		t.Fatalf("ParseSemVer 1.0.0+build-1: %v", err)
+	}
+	if vRelBuild.Prerelease != "" || vRelBuild.Build != "build-1" {
+		t.Fatalf("unexpected release+build parse: %+v", vRelBuild)
+	}
+	vRel, _ := ParseSemVer("1.0.0")
+	if vRelBuild.Compare(vRel) != 0 {
+		t.Fatalf("expected 1.0.0+build-1 == 1.0.0, got %d", vRelBuild.Compare(vRel))
+	}
+
+	for _, bad := range []string{
+		"1.0.0+",
+		"1.0.0+a..b",
+		"1.0.0+a+b",
+		"1.0.0+a/b",
+		"1.0.0-rc.2+",
+		"1.0.0-rc.01",
+		"01.0.0",
+	} {
+		if _, err := ParseSemVer(bad); err == nil {
+			t.Fatalf("expected ParseSemVer(%q) to fail", bad)
+		}
+	}
+
+	// Policy probe: signed 1.0.0-rc.2+linux must be rejected when MinVersion is 1.0.0-rc.10.
+	ctx := context.Background()
+	base, _, pub, priv, _, _ := buildTestBundle(t, ctx, 32<<10)
+	older := *base
+	older.Version = "1.0.0-rc.2+linux"
+	older.ManifestCID = ""
+	older.Signatures = nil
+	if err := older.Sign(priv, "zen-release"); err != nil {
+		t.Fatalf("Sign older: %v", err)
+	}
+	if err := older.Verify(VerificationPolicy{
+		TrustedKeys: []ed25519.PublicKey{pub},
+		MinVersion:  "1.0.0-rc.10",
+	}); !errors.Is(err, ErrVersionRejected) {
+		t.Fatalf("expected 1.0.0-rc.2+linux to be rejected by MinVersion=1.0.0-rc.10, got %v", err)
+	}
+	if err := older.Verify(VerificationPolicy{
+		TrustedKeys: []ed25519.PublicKey{pub},
+		MinVersion:  "1.0.0-rc.2",
+		MaxVersion:  "1.0.0-rc.2",
+	}); err != nil {
+		t.Fatalf("expected 1.0.0-rc.2+linux to satisfy [1.0.0-rc.2, 1.0.0-rc.2], got %v", err)
+	}
+}
+
+// TestHTTPMirrorRelayUnboundedRead verifies that HTTPMirrorProvider.GetChunk
+// does not overflow io.LimitReader when called with backend.Unbounded (such as
+// when one HTTPMirrorServer relays requests from an upstream HTTPMirrorProvider).
+func TestHTTPMirrorRelayUnboundedRead(t *testing.T) {
+	ctx := context.Background()
+	m, _, pub, _, store, _ := buildTestBundle(t, ctx, 64<<10)
+
+	upstream, err := StartHTTPMirror("upstream-http", true, store)
+	if err != nil {
+		t.Fatalf("StartHTTPMirror upstream: %v", err)
+	}
+	defer upstream.Close()
+
+	// Direct unbounded read against HTTPMirrorProvider.
+	firstChunk := m.Artifacts[0].Chunks[0]
+	gotChunk, err := upstream.Client().GetChunk(ctx, firstChunk.BLAKE3, backend.Unbounded)
+	if err != nil {
+		t.Fatalf("GetChunk(Unbounded): %v", err)
+	}
+	if int64(len(gotChunk)) != firstChunk.Size {
+		t.Fatalf("GetChunk(Unbounded) len=%d, want %d", len(gotChunk), firstChunk.Size)
+	}
+
+	// Relay HTTPMirrorServer backed by upstream HTTPMirrorProvider.
+	relay, err := StartHTTPMirror("relay-http", false, upstream.Client())
+	if err != nil {
+		t.Fatalf("StartHTTPMirror relay: %v", err)
+	}
+	defer relay.Close()
+
+	cfg := ClientConfig{}
+	cfg.Policy = VerificationPolicy{TrustedKeys: []ed25519.PublicKey{pub}}
+	cli := NewClient(cfg)
+
+	var out bytes.Buffer
+	rep, err := cli.PullArtifactStream(ctx, m, 0, []ChunkProvider{relay.Client()}, &out)
+	if err != nil {
+		t.Fatalf("PullArtifactStream via relay: %v", err)
+	}
+	if int64(out.Len()) != m.Artifacts[0].Size {
+		t.Fatalf("relayed payload size mismatch: got %d bytes, want %d", out.Len(), m.Artifacts[0].Size)
+	}
+	if rep.ArtifactRootBLAKE3[m.Artifacts[0].Path] != m.Artifacts[0].RootBLAKE3 {
+		t.Fatalf("relayed root BLAKE3 mismatch: got %s, want %s",
+			rep.ArtifactRootBLAKE3[m.Artifacts[0].Path], m.Artifacts[0].RootBLAKE3)
+	}
+}
+
+// TestExportBundleEscapesSpecialCharsInDir verifies that ExportBundle properly
+// percent-encodes filesystem characters like #, ?, %, and spaces when opening
+// its file:// backend so chunks are written inside dstDir/vfs-store rather
+// than a truncated sibling path.
+func TestExportBundleEscapesSpecialCharsInDir(t *testing.T) {
+	ctx := context.Background()
+	m, _, pub, _, store, _ := buildTestBundle(t, ctx, 48<<10)
+	policy := VerificationPolicy{TrustedKeys: []ed25519.PublicKey{pub}}
+
+	base := t.TempDir()
+	dstDir := filepath.Join(base, "bundle#one?two%20three")
+	receipt, err := ExportBundle(ctx, m, policy, store, dstDir)
+	if err != nil {
+		t.Fatalf("ExportBundle: %v", err)
+	}
+	if !strings.HasPrefix(receipt.BackendURL, "file:///") {
+		t.Fatalf("unexpected BackendURL %q", receipt.BackendURL)
+	}
+	// Ensure no truncated sibling directory "/.../bundle" was created.
+	if _, err := os.Stat(filepath.Join(base, "bundle")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected truncated sibling path %q not to exist, stat err=%v", filepath.Join(base, "bundle"), err)
+	}
+	entries, err := os.ReadDir(filepath.Join(dstDir, "vfs-store"))
+	if err != nil {
+		t.Fatalf("ReadDir vfs-store: %v", err)
+	}
+	if len(entries) == 0 {
+		t.Fatal("expected exported vfs-store inside dstDir to be non-empty")
+	}
+
+	// Re-open the exported backend using receipt.BackendURL and pull offline.
+	b, err := backend.Open(ctx, receipt.BackendURL)
+	if err != nil {
+		t.Fatalf("backend.Open(%q): %v", receipt.BackendURL, err)
+	}
+	defer b.Close()
+	offline := NewVFSStoreProvider("offline-special-dir", false, b)
+
+	cfg := ClientConfig{}
+	cfg.Policy = policy
+	var out bytes.Buffer
+	rep, err := NewClient(cfg).PullArtifactStream(ctx, m, 0, []ChunkProvider{offline}, &out)
+	if err != nil {
+		t.Fatalf("PullArtifactStream from escaped export: %v", err)
+	}
+	if int64(out.Len()) != m.Artifacts[0].Size {
+		t.Fatalf("offline exported payload size mismatch: got %d bytes, want %d", out.Len(), m.Artifacts[0].Size)
+	}
+	if rep.ArtifactRootBLAKE3[m.Artifacts[0].Path] != m.Artifacts[0].RootBLAKE3 {
+		t.Fatalf("offline exported root BLAKE3 mismatch")
+	}
+}
+
+type delayedHashProvider struct {
+	ChunkProvider
+	delayHash string
+	delay     time.Duration
+}
+
+func (p *delayedHashProvider) GetChunk(ctx context.Context, blake3Hex string, maxSize int64) ([]byte, error) {
+	if blake3Hex == p.delayHash {
+		select {
+		case <-time.After(p.delay):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return p.ChunkProvider.GetChunk(ctx, blake3Hex, maxSize)
+}
+
+type firstWriteRecordingSink struct {
+	start         time.Time
+	firstWriteSet atomic.Bool
+	firstWriteNs  atomic.Int64
+}
+
+func (s *firstWriteRecordingSink) Write(p []byte) (int, error) {
+	if s.firstWriteSet.CompareAndSwap(false, true) {
+		s.firstWriteNs.Store(time.Since(s.start).Nanoseconds())
+	}
+	return len(p), nil
+}
+
+// TestPullArtifactStreamTTFTWaitsForFirstInOrderWrite verifies that TTFT
+// reflects when the first in-order verified bytes become available at the sink,
+// not when an out-of-order later chunk arrives while chunk 0 is still delayed.
+func TestPullArtifactStreamTTFTWaitsForFirstInOrderWrite(t *testing.T) {
+	ctx := context.Background()
+	pub, priv := mustKeyPair(t)
+	store := NewVFSStoreProvider("ttft-origin", true, storetest.NewMem())
+
+	const chunkSize int64 = 16 << 10
+	art, err := IngestArtifact(
+		ctx,
+		"weights/ttft.gguf",
+		AssetKindGGUF,
+		"Q4_K_M",
+		bytes.NewReader(deterministicPayload(404, int(chunkSize)*8)),
+		chunkSize,
+		store,
+	)
+	if err != nil {
+		t.Fatalf("IngestArtifact: %v", err)
+	}
+	m := &ManifestV1{
+		SchemaVersion: SchemaVersionV1,
+		ModelID:       "zen-ttft-test",
+		Version:       "1.0.0",
+		License:       "Apache-2.0",
+		Provenance:    Provenance{CreatedAt: time.Now().UTC().Format(time.RFC3339)},
+		Artifacts:     []Artifact{art},
+	}
+	if err := m.Sign(priv, "zen-release"); err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+
+	const delay = 120 * time.Millisecond
+	delayed := &delayedHashProvider{
+		ChunkProvider: store,
+		delayHash:     art.Chunks[0].BLAKE3,
+		delay:         delay,
+	}
+
+	cfg := ClientConfig{}
+	cfg.Concurrency = 4
+	cfg.Policy = VerificationPolicy{TrustedKeys: []ed25519.PublicKey{pub}}
+	cli := NewClient(cfg)
+
+	sink := &firstWriteRecordingSink{start: time.Now()}
+	report, err := cli.PullArtifactStream(ctx, m, 0, []ChunkProvider{delayed}, sink)
+	if err != nil {
+		t.Fatalf("PullArtifactStream: %v", err)
+	}
+	firstWriteMs := float64(sink.firstWriteNs.Load()) / float64(time.Millisecond)
+	if report.TTFTMs < 100 {
+		t.Fatalf("TTFT=%.2fms is far below chunk-0 delay (%.0fms); out-of-order arrival leaked into TTFT",
+			report.TTFTMs, float64(delay/time.Millisecond))
+	}
+	if report.TTFTMs+5 < firstWriteMs {
+		t.Fatalf("TTFT=%.2fms preceded first sink write at %.2fms", report.TTFTMs, firstWriteMs)
+	}
+}
+
