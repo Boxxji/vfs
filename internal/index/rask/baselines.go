@@ -1137,3 +1137,253 @@ func (f *FlatPageTable) PointerCount() int {
 	}
 	return ptrs
 }
+
+// ============================================================================
+// Baseline 4 (Engine Payload-Free Run Slice): SortedRunSlice (16 B/element)
+// ============================================================================
+
+// Run mirrors hanzoai/vfs file.go's payload-free `type run struct{ a, b uint64 }`
+// (16 bytes, file.go:590), used by layer.void to track sorted, disjoint,
+// non-touching half-open byte intervals [A, B) with no value field.
+type Run struct {
+	A uint64
+	B uint64
+}
+
+// SortedRunSlice is a payload-free sorted slice of 16-byte Run intervals
+// matching hanzoai/vfs's in-memory `[]run` representation. It serves both as
+// the apples-to-apples 16-byte/element baseline and as the independent
+// payload-free differential oracle for RASKIndex.
+type SortedRunSlice struct {
+	runs []Run
+}
+
+// NewSortedRunSlice constructs an empty payload-free SortedRunSlice.
+func NewSortedRunSlice() *SortedRunSlice {
+	return &SortedRunSlice{}
+}
+
+func (s *SortedRunSlice) Len() int { return len(s.runs) }
+
+// Contains reports whether offset falls inside any covered run [A, B).
+func (s *SortedRunSlice) Contains(offset uint64) bool {
+	n := len(s.runs)
+	if n == 0 {
+		return false
+	}
+	lo, hi := 0, n
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		if s.runs[mid].A <= offset {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	idx := lo - 1
+	return idx >= 0 && offset < s.runs[idx].B
+}
+
+func (s *SortedRunSlice) Lookup(offset uint64) (uint64, bool) {
+	if s.Contains(offset) {
+		return 0, true
+	}
+	return 0, false
+}
+
+// RangeScanRuns visits all runs intersecting [start, end) in ascending order.
+func (s *SortedRunSlice) RangeScanRuns(start, end uint64, fn func(Run) bool) {
+	if start >= end || len(s.runs) == 0 {
+		return
+	}
+	i := sort.Search(len(s.runs), func(i int) bool {
+		return s.runs[i].B > start
+	})
+	for ; i < len(s.runs); i++ {
+		r := s.runs[i]
+		if r.A >= end {
+			break
+		}
+		if !fn(r) {
+			break
+		}
+	}
+}
+
+func (s *SortedRunSlice) RangeScan(start, end uint64, fn func(Extent) bool) {
+	s.RangeScanRuns(start, end, func(r Run) bool {
+		return fn(Extent{Start: r.A, End: r.B, Val: 0})
+	})
+}
+
+// InsertRun adds the half-open interval [a, b), merging any overlapping or
+// adjacent touching runs so invariants (sorted, disjoint, never touching) hold.
+func (s *SortedRunSlice) InsertRun(a, b uint64) {
+	if a >= b {
+		return
+	}
+	n := len(s.runs)
+	if n == 0 {
+		s.runs = append(s.runs, Run{A: a, B: b})
+		return
+	}
+	last := &s.runs[n-1]
+	if a > last.B {
+		s.runs = append(s.runs, Run{A: a, B: b})
+		return
+	}
+	if a == last.B {
+		last.B = b
+		return
+	}
+
+	// First run that could touch or overlap [a, b) has B >= a.
+	lo := sort.Search(n, func(i int) bool {
+		return s.runs[i].B >= a
+	})
+	// First run strictly past [a, b) has A > b.
+	hi := sort.Search(n, func(i int) bool {
+		return s.runs[i].A > b
+	})
+
+	if lo == hi {
+		s.runs = append(s.runs, Run{})
+		copy(s.runs[lo+1:], s.runs[lo:n])
+		s.runs[lo] = Run{A: a, B: b}
+		return
+	}
+
+	if s.runs[lo].A < a {
+		a = s.runs[lo].A
+	}
+	if s.runs[hi-1].B > b {
+		b = s.runs[hi-1].B
+	}
+	s.runs[lo] = Run{A: a, B: b}
+	if hi-lo > 1 {
+		copy(s.runs[lo+1:], s.runs[hi:n])
+		s.runs = s.runs[:n-(hi-lo-1)]
+	}
+}
+
+// Insert implements RangeIndex by ignoring val and storing payload-free [start, end).
+func (s *SortedRunSlice) Insert(start, end, _ uint64) {
+	s.InsertRun(start, end)
+}
+
+func (s *SortedRunSlice) DeleteRange(start, end uint64) {
+	if start >= end || len(s.runs) == 0 {
+		return
+	}
+	n := len(s.runs)
+	lo := sort.Search(n, func(i int) bool {
+		return s.runs[i].B > start
+	})
+	if lo >= n || s.runs[lo].A >= end {
+		return
+	}
+	hi := sort.Search(n, func(i int) bool {
+		return s.runs[i].A >= end
+	})
+
+	var rep [2]Run
+	repN := 0
+	if s.runs[lo].A < start {
+		rep[repN] = Run{A: s.runs[lo].A, B: start}
+		repN++
+	}
+	if s.runs[hi-1].B > end {
+		rep[repN] = Run{A: end, B: s.runs[hi-1].B}
+		repN++
+	}
+
+	oldSpan := hi - lo
+	diff := repN - oldSpan
+	if diff > 0 {
+		s.runs = append(s.runs, Run{})
+		copy(s.runs[hi+1:], s.runs[hi:n])
+	} else if diff < 0 {
+		copy(s.runs[lo+repN:], s.runs[hi:n])
+		s.runs = s.runs[:n+diff]
+	}
+	copy(s.runs[lo:lo+repN], rep[:repN])
+}
+
+func (s *SortedRunSlice) MemoryBytes() int64 {
+	return int64(unsafe.Sizeof(*s)) + int64(cap(s.runs))*int64(unsafe.Sizeof(Run{}))
+}
+
+func (s *SortedRunSlice) PointerCount() int {
+	if cap(s.runs) > 0 {
+		return 1
+	}
+	return 0
+}
+
+// ============================================================================
+// Baseline 5 (Engine Settled Record Slice): SortedRecordSlice (48 B/element)
+// ============================================================================
+
+// RecordExtent mirrors hanzoai/vfs record.go's settled `type extent struct`
+// (`off uint64; n uint32; id chunkID`, record.go:235, where `chunkID` is
+// `[32]byte` at chunk.go:87). Go aligns this struct to 8 bytes: 44 payload
+// bytes + 4 bytes tail padding = 48 bytes/element.
+type RecordExtent struct {
+	Off uint64
+	N   uint32
+	ID  [32]byte
+}
+
+// SortedRecordSlice is a sorted slice of RecordExtent matching fileState.ext
+// (`[]extent`) in hanzoai/vfs, for apples-to-apples settled-record memory
+// comparison.
+type SortedRecordSlice struct {
+	recs []RecordExtent
+}
+
+// NewSortedRecordSlice constructs an empty SortedRecordSlice.
+func NewSortedRecordSlice() *SortedRecordSlice {
+	return &SortedRecordSlice{}
+}
+
+func (s *SortedRecordSlice) Len() int { return len(s.recs) }
+
+func (s *SortedRecordSlice) Append(off uint64, length uint32, id [32]byte) {
+	s.recs = append(s.recs, RecordExtent{Off: off, N: length, ID: id})
+}
+
+func (s *SortedRecordSlice) Lookup(offset uint64) (uint64, bool) {
+	n := len(s.recs)
+	if n == 0 {
+		return 0, false
+	}
+	lo, hi := 0, n
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		if s.recs[mid].Off <= offset {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	idx := lo - 1
+	if idx >= 0 && offset < s.recs[idx].Off+uint64(s.recs[idx].N) {
+		// Decode first 8 bytes of chunk ID as a handle tag.
+		id := s.recs[idx].ID
+		v := uint64(id[0]) | uint64(id[1])<<8 | uint64(id[2])<<16 | uint64(id[3])<<24 |
+			uint64(id[4])<<32 | uint64(id[5])<<40 | uint64(id[6])<<48 | uint64(id[7])<<56
+		return v, true
+	}
+	return 0, false
+}
+
+func (s *SortedRecordSlice) MemoryBytes() int64 {
+	return int64(unsafe.Sizeof(*s)) + int64(cap(s.recs))*int64(unsafe.Sizeof(RecordExtent{}))
+}
+
+func (s *SortedRecordSlice) PointerCount() int {
+	if cap(s.recs) > 0 {
+		return 1
+	}
+	return 0
+}

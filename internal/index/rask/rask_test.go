@@ -491,3 +491,191 @@ func TestMultiTenantConcurrentIsolation(t *testing.T) {
 		}
 	}
 }
+
+// TestDifferentialOraclePayloadFreeRuns12k validates RASKIndex against an
+// independent payload-free interval-set model (SortedRunSlice holding 16-byte
+// Run{A, B} matching hanzoai/vfs file.go:590) across 12,000 randomized insert,
+// touch-coalesce, multi-leaf merge, hole-punch, truncate, 4 GiB boundary, and
+// 1 PiB sparse operations. It also verifies that RASK automatically selects
+// modeConstVal32 (8 B/extent) for payload-free leaves.
+func TestDifferentialOraclePayloadFreeRuns12k(t *testing.T) {
+	rng := rand.New(rand.NewPCG(0x72756E73, 0x1344))
+
+	oracle := NewSortedRunSlice()
+	raskIdx := NewRASKIndex()
+
+	const totalOps = 12_000
+	var probes [48]uint64
+	sawConstVal32 := false
+
+	for op := 0; op < totalOps; op++ {
+		var start, end uint64
+		switch rng.IntN(10) {
+		case 0, 1, 2, 3, 4:
+			// Dense local region -> heavy adjacent-run coalescing and splits.
+			start = rng.Uint64N(256 << 10)
+			end = start + 1 + rng.Uint64N(8192)
+		case 5, 6:
+			// Medium multi-leaf spans within 4 GiB.
+			start = rng.Uint64N(64 << 20)
+			end = start + 1 + rng.Uint64N(1<<20)
+		case 7:
+			// 4 GiB segment boundary crossings.
+			base := uint64(rng.IntN(4)+1) << 32
+			start = base - rng.Uint64N(8192)
+			end = base + 1 + rng.Uint64N(8192)
+		case 8:
+			// Sparse 1 PiB clusters.
+			cluster := uint64(rng.IntN(8)) * (PiB / 8)
+			if cluster >= PiB {
+				cluster = PiB - (1 << 20)
+			}
+			start = cluster + rng.Uint64N(64<<10)
+			end = start + 1 + rng.Uint64N(16<<10)
+		case 9:
+			// Wide >4 GiB run (exercises modeFull64 fallback alongside modeConstVal32).
+			start = uint64(rng.IntN(4)) << 32
+			end = start + (5 << 30) + rng.Uint64N(1<<20)
+		}
+
+		switch rng.IntN(5) {
+		case 0:
+			// Hole punch
+			oracle.DeleteRange(start, end)
+			raskIdx.DeleteRange(start, end)
+		case 1:
+			// Occasional truncate tail
+			if op%50 == 1 {
+				cut := rng.Uint64N(64 << 20)
+				oracle.DeleteRange(cut, MaxOffset)
+				raskIdx.DeleteRange(cut, MaxOffset)
+			} else {
+				oracle.InsertRun(start, end)
+				raskIdx.Insert(start, end, 0)
+			}
+		default:
+			oracle.InsertRun(start, end)
+			raskIdx.Insert(start, end, 0)
+		}
+
+		if op%100 == 0 || op == totalOps-1 {
+			if raskIdx.Stats().ConstVal32 > 0 {
+				sawConstVal32 = true
+			}
+			if raskIdx.Len() != oracle.Len() {
+				t.Fatalf("op %d: RASK Len=%d != payload-free oracle Len=%d", op, raskIdx.Len(), oracle.Len())
+			}
+
+			var wantRuns []Run
+			oracle.RangeScanRuns(0, math.MaxUint64, func(r Run) bool {
+				wantRuns = append(wantRuns, r)
+				return true
+			})
+			gotExts := collectAll(raskIdx, 0, math.MaxUint64)
+			if len(gotExts) != len(wantRuns) {
+				t.Fatalf("op %d: scan len=%d != want %d", op, len(gotExts), len(wantRuns))
+			}
+			for i, w := range wantRuns {
+				if w.A >= w.B {
+					t.Fatalf("op %d: invalid oracle run %+v", op, w)
+				}
+				if i > 0 && wantRuns[i-1].B >= w.A {
+					t.Fatalf("op %d: touching/overlapping oracle runs %+v and %+v", op, wantRuns[i-1], w)
+				}
+				g := gotExts[i]
+				if g.Start != w.A || g.End != w.B || g.Val != 0 {
+					t.Fatalf("op %d: scan[%d]=%+v != want Run%+v", op, i, g, w)
+				}
+			}
+
+			p := probes[:0]
+			p = append(p, 0, start, end)
+			if start > 0 {
+				p = append(p, start-1)
+			}
+			if end > 0 {
+				p = append(p, end-1)
+			}
+			if end < math.MaxUint64 {
+				p = append(p, end+1)
+			}
+			for k := 0; k < 16; k++ {
+				p = append(p, rng.Uint64N(256<<10))
+			}
+			for _, off := range p {
+				wantHit := oracle.Contains(off)
+				gotVal, gotHit := raskIdx.Lookup(off)
+				if gotHit != wantHit || (gotHit && gotVal != 0) {
+					t.Fatalf("op %d: Lookup(%d)=(%d,%v) != payload-free Contains=%v",
+						op, off, gotVal, gotHit, wantHit)
+				}
+			}
+
+			// Windowed RangeScan equivalence.
+			wStart, wEnd := start, end+4096
+			var wantWin []Run
+			oracle.RangeScanRuns(wStart, wEnd, func(r Run) bool {
+				wantWin = append(wantWin, r)
+				return true
+			})
+			gotWin := collectAll(raskIdx, wStart, wEnd)
+			if len(gotWin) != len(wantWin) {
+				t.Fatalf("op %d: windowed scan len=%d != want %d", op, len(gotWin), len(wantWin))
+			}
+			for i, w := range wantWin {
+				if gotWin[i].Start != w.A || gotWin[i].End != w.B || gotWin[i].Val != 0 {
+					t.Fatalf("op %d: windowed scan[%d]=%+v != want %+v", op, i, gotWin[i], w)
+				}
+			}
+		}
+	}
+
+	if !sawConstVal32 {
+		t.Fatalf("expected modeConstVal32 to be exercised on payload-free run workload")
+	}
+
+	// Full drain equivalence.
+	oracle.DeleteRange(0, MaxOffset)
+	raskIdx.DeleteRange(0, MaxOffset)
+	if raskIdx.Len() != 0 || oracle.Len() != 0 {
+		t.Fatalf("after drain: rask=%d oracle=%d", raskIdx.Len(), oracle.Len())
+	}
+}
+
+// TestPayloadFreeRunMemoryComparison verifies that RASKIndex in modeConstVal32
+// (8 B/extent leaf payload) uses strictly less memory than a matched 16-byte
+// SortedRunSlice (file.go:590 run{a, b}) and a matched 48-byte SortedRecordSlice
+// (record.go:235 extent{off, n, id}).
+func TestPayloadFreeRunMemoryComparison(t *testing.T) {
+	const numRuns = 50_000
+	runSlice := NewSortedRunSlice()
+	raskRuns := NewRASKIndex()
+	recSlice := NewSortedRecordSlice()
+
+	for i := uint64(0); i < numRuns; i++ {
+		off := i * 8192
+		runSlice.InsertRun(off, off+4096)
+		raskRuns.Insert(off, off+4096, 0)
+		var id [32]byte
+		id[0] = byte(i)
+		recSlice.Append(off, 4096, id)
+	}
+
+	runBPE := float64(runSlice.MemoryBytes()) / float64(runSlice.Len())
+	raskBPE := float64(raskRuns.MemoryBytes()) / float64(raskRuns.Len())
+	recBPE := float64(recSlice.MemoryBytes()) / float64(recSlice.Len())
+	st := raskRuns.Stats()
+
+	t.Logf("Payload-free %d runs: RASK(modeConstVal32)=%.2f B/ext (leaves=%d constVal32=%d) vs SortedRunSlice(16B)=%.2f B/ext (ratio=%.2fx) vs SortedRecordSlice(48B)=%.2f B/ext",
+		numRuns, raskBPE, st.Leaves, st.ConstVal32, runBPE, raskBPE/runBPE, recBPE)
+
+	if st.ConstVal32 == 0 || st.ConstVal32 != st.Leaves {
+		t.Fatalf("expected all %d payload-free leaves in modeConstVal32, got %+v", st.Leaves, st)
+	}
+	if raskBPE >= runBPE {
+		t.Fatalf("expected RASK modeConstVal32 (%.2f B/ext) < SortedRunSlice 16B (%.2f B/ext)", raskBPE, runBPE)
+	}
+	if raskBPE >= recBPE {
+		t.Fatalf("expected RASK modeConstVal32 (%.2f B/ext) < SortedRecordSlice 48B (%.2f B/ext)", raskBPE, recBPE)
+	}
+}

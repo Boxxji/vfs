@@ -33,11 +33,18 @@ const (
 type leafMode uint8
 
 const (
+	// modeConstVal32 packs each extent as 2 uint32 words (8 bytes/extent):
+	//   [relStart, length]
+	// Valid when maxEnd - baseOff <= math.MaxUint32 and every extent in the
+	// leaf shares the same Val (stored once in baseVal). This covers payload-free
+	// run{a, b} indexes (Val == 0) as well as uniform-tag spans.
+	modeConstVal32 leafMode = iota
+
 	// modeCompact32 packs each extent as 3 uint32 words (12 bytes/extent):
 	//   [relStart, length, relVal]
 	// Valid when maxEnd - baseOff <= math.MaxUint32 and every extent value
 	// satisfies baseVal <= val <= baseVal + math.MaxUint32.
-	modeCompact32 leafMode = iota
+	modeCompact32
 
 	// modeCompact64 packs each extent as 4 uint32 words (16 bytes/extent):
 	//   [relStart, length, valLo, valHi]
@@ -52,6 +59,8 @@ const (
 
 func modeStride(m leafMode) int {
 	switch m {
+	case modeConstVal32:
+		return 2
 	case modeCompact32:
 		return 3
 	case modeCompact64:
@@ -99,6 +108,14 @@ type raskLeaf struct {
 func (l *raskLeaf) get(i int) Extent {
 	w := l.words
 	switch l.mode {
+	case modeConstVal32:
+		idx := i * 2
+		s := l.baseOff + uint64(w[idx])
+		return Extent{
+			Start: s,
+			End:   s + uint64(w[idx+1]),
+			Val:   l.baseVal,
+		}
 	case modeCompact32:
 		idx := i * 3
 		s := l.baseOff + uint64(w[idx])
@@ -129,6 +146,8 @@ func (l *raskLeaf) lastVal() uint64 {
 	i := int(l.count) - 1
 	w := l.words
 	switch l.mode {
+	case modeConstVal32:
+		return l.baseVal
 	case modeCompact32:
 		return l.baseVal + uint64(w[i*3+2])
 	case modeCompact64:
@@ -145,6 +164,17 @@ func (l *raskLeaf) decodeAll(dst []Extent) []Extent {
 	dst = dst[:0]
 	w := l.words
 	switch l.mode {
+	case modeConstVal32:
+		baseOff, baseVal := l.baseOff, l.baseVal
+		for i := 0; i < n; i++ {
+			idx := i * 2
+			s := baseOff + uint64(w[idx])
+			dst = append(dst, Extent{
+				Start: s,
+				End:   s + uint64(w[idx+1]),
+				Val:   baseVal,
+			})
+		}
 	case modeCompact32:
 		baseOff, baseVal := l.baseOff, l.baseVal
 		for i := 0; i < n; i++ {
@@ -201,7 +231,10 @@ func packLeafInto(l *raskLeaf, exts []Extent) {
 				maxV = v
 			}
 		}
-		if maxV-minV <= math.MaxUint32 {
+		if minV == maxV {
+			mode = modeConstVal32
+			baseVal = minV
+		} else if maxV-minV <= math.MaxUint32 {
 			mode = modeCompact32
 			baseVal = minV
 		} else {
@@ -222,6 +255,12 @@ func packLeafInto(l *raskLeaf, exts []Extent) {
 	}
 
 	switch mode {
+	case modeConstVal32:
+		for i, e := range exts {
+			idx := i * 2
+			words[idx] = uint32(e.Start - baseOff)
+			words[idx+1] = uint32(e.End - e.Start)
+		}
 	case modeCompact32:
 		for i, e := range exts {
 			idx := i * 3
@@ -308,6 +347,29 @@ func (l *raskLeaf) lookup(offset uint64) (uint64, bool) {
 	n := int(l.count)
 	w := l.words
 	switch l.mode {
+	case modeConstVal32:
+		target := uint32(offset - l.baseOff)
+		lo, hi := 0, n
+		for lo < hi {
+			mid := int(uint(lo+hi) >> 1)
+			if w[mid*2] <= target {
+				lo = mid + 1
+			} else {
+				hi = mid
+			}
+		}
+		idx := lo - 1
+		if idx < 0 {
+			return 0, false
+		}
+		base := idx * 2
+		relStart := w[base]
+		length := w[base+1]
+		if target-relStart < length {
+			return l.baseVal, true
+		}
+		return 0, false
+
 	case modeCompact32:
 		target := uint32(offset - l.baseOff)
 		lo, hi := 0, n
@@ -403,6 +465,9 @@ func (l *raskLeaf) tryFastInsert(start, end, val uint64) (delta int, ok bool) {
 	if start < l.baseOff || end-l.baseOff > math.MaxUint32 {
 		return 0, false
 	}
+	if l.mode == modeConstVal32 && val != l.baseVal {
+		return 0, false
+	}
 	if l.mode == modeCompact32 && (val < l.baseVal || val-l.baseVal > math.MaxUint32) {
 		return 0, false
 	}
@@ -426,9 +491,12 @@ func (l *raskLeaf) tryFastInsert(start, end, val uint64) (delta int, ok bool) {
 		base := n * stride
 		l.words[base] = uint32(start - l.baseOff)
 		l.words[base+1] = uint32(end - start)
-		if l.mode == modeCompact32 {
+		switch l.mode {
+		case modeConstVal32:
+			// Value is implicit in l.baseVal.
+		case modeCompact32:
 			l.words[base+2] = uint32(val - l.baseVal)
-		} else {
+		default:
 			l.words[base+2] = uint32(val)
 			l.words[base+3] = uint32(val >> 32)
 		}
@@ -475,9 +543,12 @@ func (l *raskLeaf) tryFastInsert(start, end, val uint64) (delta int, ok bool) {
 	base := lo * stride
 	l.words[base] = relStart
 	l.words[base+1] = uint32(end - start)
-	if l.mode == modeCompact32 {
+	switch l.mode {
+	case modeConstVal32:
+		// Value is implicit in l.baseVal.
+	case modeCompact32:
 		l.words[base+2] = uint32(val - l.baseVal)
-	} else {
+	default:
 		l.words[base+2] = uint32(val)
 		l.words[base+3] = uint32(val >> 32)
 	}
@@ -497,6 +568,34 @@ func (l *raskLeaf) scan(start, end uint64, fn func(Extent) bool) bool {
 	baseOff := l.baseOff
 
 	switch l.mode {
+	case modeConstVal32:
+		baseVal := l.baseVal
+		lo := 0
+		if start > baseOff {
+			relTarget := uint32(start - baseOff)
+			hi := n
+			for lo < hi {
+				mid := int(uint(lo+hi) >> 1)
+				idx := mid * 2
+				if w[idx]+w[idx+1] <= relTarget {
+					lo = mid + 1
+				} else {
+					hi = mid
+				}
+			}
+		}
+		for i := lo; i < n; i++ {
+			idx := i * 2
+			s := baseOff + uint64(w[idx])
+			if s >= end {
+				break
+			}
+			if !fn(Extent{Start: s, End: s + uint64(w[idx+1]), Val: baseVal}) {
+				return false
+			}
+		}
+		return true
+
 	case modeCompact32:
 		baseVal := l.baseVal
 		lo := 0
@@ -629,7 +728,8 @@ type radixSlot struct {
 // Design highlights:
 //   - Two-level flat group directory storing leaf headers by value (no per-extent
 //     or per-node pointer chains).
-//   - Zero-pointer packed-delta leaf blocks (12 B/extent in modeCompact32,
+//   - Zero-pointer packed-delta leaf blocks (8 B/extent in modeConstVal32 for
+//     payload-free run{a,b} / uniform-value leaves, 12 B/extent in modeCompact32,
 //     16 B/extent in modeCompact64, 24 B/extent fallback in modeFull64).
 //   - Open-addressed 4 GiB segment radix table giving O(1) hole rejection on
 //     petabyte-scale sparse files with O(extents) memory.
@@ -1451,6 +1551,7 @@ func (r *RASKIndex) PointerCount() int {
 type ModeStats struct {
 	Groups       int
 	Leaves       int
+	ConstVal32   int
 	Compact32    int
 	Compact64    int
 	Full64       int
@@ -1469,6 +1570,8 @@ func (r *RASKIndex) Stats() ModeStats {
 		for j := range r.groups[i].leaves {
 			st.Leaves++
 			switch r.groups[i].leaves[j].mode {
+			case modeConstVal32:
+				st.ConstVal32++
 			case modeCompact32:
 				st.Compact32++
 			case modeCompact64:

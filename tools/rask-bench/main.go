@@ -28,6 +28,7 @@ import (
 	"runtime"
 	"slices"
 	"time"
+	"unsafe"
 
 	"github.com/hanzoai/vfs/internal/index/rask"
 )
@@ -93,6 +94,17 @@ type FlatExplosionRow struct {
 	MemoryRatio     float64 `json:"memory_ratio_flat_over_rask"`
 }
 
+type ElementAlignmentRow struct {
+	EngineType       string  `json:"engine_type"`
+	SourceRef        string  `json:"source_ref"`
+	ElementBytes     int     `json:"element_bytes"`
+	SliceStructBytes int64   `json:"slice_struct_bytes"`
+	SliceBytesPerExt float64 `json:"slice_bytes_per_extent"`
+	MatchedRASKMode  string  `json:"matched_rask_mode"`
+	RASKBytesPerExt  float64 `json:"rask_bytes_per_extent"`
+	RatioRASKOverRef float64 `json:"ratio_rask_over_slice"`
+}
+
 type Report struct {
 	Environment struct {
 		GOOS      string `json:"goos"`
@@ -101,6 +113,8 @@ type Report struct {
 		NumCPU    int    `json:"num_cpu"`
 		Timestamp string `json:"timestamp_utc"`
 	} `json:"environment"`
+	WorkloadPayloadFree []IndexMetrics              `json:"workload_100k_payload_free_runs"`
+	ElementAlignment    []ElementAlignmentRow       `json:"engine_element_size_alignment_100k"`
 	WorkloadCompact32   []IndexMetrics              `json:"workload_100k_compact32"`
 	WorkloadRandomVal64 []IndexMetrics              `json:"workload_100k_random_val64"`
 	WorkloadSparse1PiB  []Sparse1PiBMetrics         `json:"workload_1pib_sparse"`
@@ -108,6 +122,7 @@ type Report struct {
 	BoundaryTiny16      []BoundaryTinyMetrics       `json:"boundary_tiny_file_under_16_extents"`
 	BoundaryFlatExplode []FlatExplosionRow          `json:"boundary_flat_page_table_explosion"`
 	RASKDiagnostics     rask.ModeStats              `json:"rask_100k_compact32_diagnostics"`
+	RASKPayloadFreeDiag rask.ModeStats              `json:"rask_100k_payload_free_diagnostics"`
 }
 
 func percentile(sorted []float64, p float64) float64 {
@@ -525,13 +540,203 @@ func runFlatExplosionTable(rask1PiBBytes int64) []FlatExplosionRow {
 	return rows
 }
 
+// runPayloadFreeWorkload benchmarks hanzoai/vfs's payload-free `run{a, b}`
+// (16 B, file.go:590) against RASKIndex in modeConstVal32 (8 B/ext leaf payload).
+func runPayloadFreeWorkload(numExtents int) ([]IndexMetrics, rask.ModeStats) {
+	type factory struct {
+		name   string
+		mk     func() rask.RangeIndex
+		mutOps int
+	}
+	factories := []factory{
+		{name: "sorted_run_slice_16b", mk: func() rask.RangeIndex { return rask.NewSortedRunSlice() }, mutOps: 2000},
+		{name: "rask_payload_free_constval32", mk: func() rask.RangeIndex { return rask.NewRASKIndex() }, mutOps: 20000},
+	}
+
+	maxOff := uint64(numExtents) * 8192
+	const probeCount = 65536
+	hitOffsets := make([]uint64, probeCount)
+	holeOffsets := make([]uint64, probeCount)
+	pRng := rand.New(rand.NewPCG(303, 404))
+	for i := 0; i < probeCount; i++ {
+		idx := uint64(pRng.IntN(numExtents))
+		hitOffsets[i] = idx*8192 + uint64(pRng.IntN(4096))
+		holeOffsets[i] = idx*8192 + 4096 + uint64(pRng.IntN(4096))
+	}
+
+	results := make([]IndexMetrics, 0, len(factories))
+	var raskDiag rask.ModeStats
+
+	for _, f := range factories {
+		runtime.GC()
+		runtime.GC()
+		var m0, m1 runtime.MemStats
+		runtime.ReadMemStats(&m0)
+
+		idx := f.mk()
+		for i := 0; i < numExtents; i++ {
+			off := uint64(i) * 8192
+			idx.Insert(off, off+4096, 0)
+		}
+
+		runtime.GC()
+		runtime.ReadMemStats(&m1)
+		heapDelta := int64(m1.HeapAlloc) - int64(m0.HeapAlloc)
+		if heapDelta < 0 {
+			heapDelta = 0
+		}
+
+		if rIdx, ok := idx.(*rask.RASKIndex); ok {
+			raskDiag = rIdx.Stats()
+		}
+
+		extCount := idx.Len()
+		structBytes := idx.MemoryBytes()
+		ptrs := idx.PointerCount()
+		gcUs := measureGCPauseUs(idx)
+
+		hitP50, hitP95, hitP99 := measureLookups(idx, hitOffsets, 4000, 32)
+		holeP50, _, holeP99 := measureLookups(idx, holeOffsets, 4000, 32)
+		scanMExt := measureRangeScan(idx, maxOff, 500)
+
+		mutRng := rand.New(rand.NewPCG(505, 606))
+		t0 := time.Now()
+		for i := 0; i < f.mutOps; i++ {
+			off := mutRng.Uint64N(maxOff)
+			length := uint64(512 + mutRng.IntN(4096))
+			idx.Insert(off, off+length, 0)
+		}
+		mutDur := time.Since(t0).Seconds()
+		mutKOps := float64(f.mutOps) / 1e3 / mutDur
+
+		punchOps := f.mutOps / 2
+		t1 := time.Now()
+		for i := 0; i < punchOps; i++ {
+			off := mutRng.Uint64N(maxOff)
+			length := uint64(512 + mutRng.IntN(8192))
+			idx.DeleteRange(off, off+length)
+		}
+		punchDur := time.Since(t1).Seconds()
+		punchKOps := float64(punchOps) / 1e3 / punchDur
+
+		results = append(results, IndexMetrics{
+			Name:             f.name,
+			Extents:          extCount,
+			StructBytes:      structBytes,
+			BytesPerExtent:   float64(structBytes) / float64(extCount),
+			HeapAllocDelta:   heapDelta,
+			HeapBytesPerExt:  float64(heapDelta) / float64(extCount),
+			PointerCount:     ptrs,
+			GCPauseUs:        gcUs,
+			LookupHitP50Ns:   hitP50,
+			LookupHitP95Ns:   hitP95,
+			LookupHitP99Ns:   hitP99,
+			LookupHoleP50Ns:  holeP50,
+			LookupHoleP99Ns:  holeP99,
+			RangeScanMExtSec: scanMExt,
+			RandomMutKOpsSec: mutKOps,
+			PunchHoleKOpsSec: punchKOps,
+			Status:           "ok",
+		})
+	}
+	return results, raskDiag
+}
+
+func buildElementAlignment(numExtents int, payloadFree, compact32 []IndexMetrics) []ElementAlignmentRow {
+	var runSliceBytes int64
+	var runSliceBPE, raskConstBPE float64
+	for _, m := range payloadFree {
+		switch m.Name {
+		case "sorted_run_slice_16b":
+			runSliceBytes = m.StructBytes
+			runSliceBPE = m.BytesPerExtent
+		case "rask_payload_free_constval32":
+			raskConstBPE = m.BytesPerExtent
+		}
+	}
+
+	var extSliceBytes int64
+	var extSliceBPE, raskCompact32BPE float64
+	for _, m := range compact32 {
+		switch m.Name {
+		case "sorted_slice_baseline":
+			extSliceBytes = m.StructBytes
+			extSliceBPE = m.BytesPerExtent
+		case "rask_compact_range_index":
+			raskCompact32BPE = m.BytesPerExtent
+		}
+	}
+
+	recSlice := rask.NewSortedRecordSlice()
+	for i := 0; i < numExtents; i++ {
+		var id [32]byte
+		id[0] = byte(i)
+		id[1] = byte(i >> 8)
+		recSlice.Append(uint64(i)*8192, 4096, id)
+	}
+	recBytes := recSlice.MemoryBytes()
+	recBPE := float64(recBytes) / float64(recSlice.Len())
+
+	return []ElementAlignmentRow{
+		{
+			EngineType:       "run{a, b uint64} (payload-free)",
+			SourceRef:        "file.go:590 (layer.void []run)",
+			ElementBytes:     int(unsafe.Sizeof(rask.Run{})),
+			SliceStructBytes: runSliceBytes,
+			SliceBytesPerExt: runSliceBPE,
+			MatchedRASKMode:  "modeConstVal32 (8 B leaf payload)",
+			RASKBytesPerExt:  raskConstBPE,
+			RatioRASKOverRef: raskConstBPE / runSliceBPE,
+		},
+		{
+			EngineType:       "Extent{Start, End, Val uint64} (value-carrying)",
+			SourceRef:        "internal/index/rask/index.go:39",
+			ElementBytes:     int(unsafe.Sizeof(rask.Extent{})),
+			SliceStructBytes: extSliceBytes,
+			SliceBytesPerExt: extSliceBPE,
+			MatchedRASKMode:  "modeCompact32 (12 B leaf payload)",
+			RASKBytesPerExt:  raskCompact32BPE,
+			RatioRASKOverRef: raskCompact32BPE / extSliceBPE,
+		},
+		{
+			EngineType:       "extent{off uint64, n uint32, id [32]byte} (settled record)",
+			SourceRef:        "record.go:235 + chunk.go:87 (fileState.ext)",
+			ElementBytes:     int(unsafe.Sizeof(rask.RecordExtent{})),
+			SliceStructBytes: recBytes,
+			SliceBytesPerExt: recBPE,
+			MatchedRASKMode:  "modeCompact32 (12 B index handle)",
+			RASKBytesPerExt:  raskCompact32BPE,
+			RatioRASKOverRef: raskCompact32BPE / recBPE,
+		},
+	}
+}
+
 func buildScoreTableMarkdown(rep *Report) string {
 	var out string
 	out += "# HIP-1344 RASK Compact Sparse-Range Index — Measured Score Table\n\n"
 	out += fmt.Sprintf("Environment: `%s/%s`, `%s`, `%d` CPUs (`%s`).\n\n",
 		rep.Environment.GOOS, rep.Environment.GOARCH, rep.Environment.GoVersion, rep.Environment.NumCPU, rep.Environment.Timestamp)
 
-	out += "## 1. Primary Workload: 100,000 Sparse-Run Extents (4 KiB Data / 4 KiB Hole, Compact Values)\n\n"
+	out += "## 1. Engine Element-Size Alignment (100,000 Append-Grown Extents)\n\n"
+	out += "| Engine / Baseline Element | Source | Bytes/Slot | Sorted Slice B/Ext | Matched RASK Mode | RASK B/Ext | Ratio (RASK / Slice) |\n"
+	out += "|---|---|---:|---:|---|---:|---:|\n"
+	for _, row := range rep.ElementAlignment {
+		out += fmt.Sprintf("| `%s` | `%s` | %d | %.2f | `%s` | **%.2f** | **%.2fx** |\n",
+			row.EngineType, row.SourceRef, row.ElementBytes, row.SliceBytesPerExt,
+			row.MatchedRASKMode, row.RASKBytesPerExt, row.RatioRASKOverRef)
+	}
+
+	out += "\n## 2. Payload-Free Run Workload: 100,000 `run{a, b}` Intervals (`file.go:590`, 16 B vs `modeConstVal32`)\n\n"
+	out += "| Baseline | Struct Bytes | B/Extent | HeapAlloc Delta | Heap B/Ext | GC Pointers | Hit p50 / p99 (ns) | Hole p50 / p99 (ns) | RangeScan (M ext/s) | Random Insert (K ops/s) | PunchHole (K ops/s) |\n"
+	out += "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n"
+	for _, m := range rep.WorkloadPayloadFree {
+		out += fmt.Sprintf("| `%s` | %d | **%.2f** | %d | %.2f | %d | %.1f / %.1f | %.1f / %.1f | %.2f | %.1f | %.1f |\n",
+			m.Name, m.StructBytes, m.BytesPerExtent, m.HeapAllocDelta, m.HeapBytesPerExt,
+			m.PointerCount, m.LookupHitP50Ns, m.LookupHitP99Ns,
+			m.LookupHoleP50Ns, m.LookupHoleP99Ns, m.RangeScanMExtSec, m.RandomMutKOpsSec, m.PunchHoleKOpsSec)
+	}
+
+	out += "\n## 3. Value-Carrying Workload: 100,000 Sparse-Run Extents (4 KiB Data / 4 KiB Hole, Compact 32-Bit Values)\n\n"
 	out += "| Baseline | Struct Bytes | B/Extent | HeapAlloc Delta | Heap B/Ext | GC Pointers | GC Pause (us) | Hit p50 / p95 / p99 (ns) | Hole p50 / p99 (ns) | RangeScan (M ext/s) | Random Insert (K ops/s) | PunchHole (K ops/s) |\n"
 	out += "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n"
 	for _, m := range rep.WorkloadCompact32 {
@@ -546,7 +751,7 @@ func buildScoreTableMarkdown(rep *Report) string {
 			m.LookupHoleP50Ns, m.LookupHoleP99Ns, m.RangeScanMExtSec, m.RandomMutKOpsSec, m.PunchHoleKOpsSec)
 	}
 
-	out += "\n## 2. Arbitrary 64-Bit Random Values Workload (100,000 Extents, `modeCompact64`)\n\n"
+	out += "\n## 4. Arbitrary 64-Bit Random Values Workload (100,000 Extents, `modeCompact64`)\n\n"
 	out += "| Baseline | Struct Bytes | B/Extent | Heap B/Ext | GC Pointers | Hit p50 / p99 (ns) | Random Insert (K ops/s) | PunchHole (K ops/s) |\n"
 	out += "|---|---:|---:|---:|---:|---:|---:|---:|\n"
 	for _, m := range rep.WorkloadRandomVal64 {
@@ -558,7 +763,7 @@ func buildScoreTableMarkdown(rep *Report) string {
 			m.LookupHitP50Ns, m.LookupHitP99Ns, m.RandomMutKOpsSec, m.PunchHoleKOpsSec)
 	}
 
-	out += "\n## 3. 1 PiB (`1 << 50` B) Sparse-File Stress Workload (101 Extents Across `0`, `1 TiB`, `256 TiB`, `512 TiB`, `1 PiB - 4 KiB`)\n\n"
+	out += "\n## 5. 1 PiB (`1 << 50` B) Sparse-File Stress Workload (101 Extents Across `0`, `1 TiB`, `256 TiB`, `512 TiB`, `1 PiB - 4 KiB`)\n\n"
 	out += "| Baseline | Extents | Struct Memory | GC Pointers | Hit p50 / p99 (ns) | 1 PiB Hole p50 / p99 (ns) | Status |\n"
 	out += "|---|---:|---:|---:|---:|---:|---|\n"
 	for _, m := range rep.WorkloadSparse1PiB {
@@ -572,7 +777,7 @@ func buildScoreTableMarkdown(rep *Report) string {
 			m.HitP50Ns, m.HitP99Ns, m.HoleP50Ns, m.HoleP99Ns, m.Status)
 	}
 
-	out += "\n## 4. Documented Honest Negative & Boundary Regimes\n\n"
+	out += "\n## 6. Documented Honest Negative & Boundary Regimes\n\n"
 	out += "### A. `dense_tiny_random_100pct_fragmented_writes` (25,000 Random 4 KiB Writes, Uncoalescable 64-bit Values)\n\n"
 	out += "| Baseline | Extents | Insert Throughput (K ops/s) | B/Extent | GC Pointers | Hit p99 (ns) |\n"
 	out += "|---|---:|---:|---:|---:|---:|\n"
@@ -612,7 +817,9 @@ func main() {
 	rep.Environment.NumCPU = runtime.NumCPU()
 	rep.Environment.Timestamp = time.Now().UTC().Format(time.RFC3339)
 
+	rep.WorkloadPayloadFree, rep.RASKPayloadFreeDiag = runPayloadFreeWorkload(*numExtents)
 	rep.WorkloadCompact32, rep.RASKDiagnostics = runLargeWorkload(*numExtents, false)
+	rep.ElementAlignment = buildElementAlignment(*numExtents, rep.WorkloadPayloadFree, rep.WorkloadCompact32)
 	rep.WorkloadRandomVal64, _ = runLargeWorkload(*numExtents, true)
 	rep.WorkloadSparse1PiB = run1PiBSparseWorkload()
 	rep.BoundaryFragmented = runBoundaryFragmented()
