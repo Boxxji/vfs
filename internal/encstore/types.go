@@ -643,6 +643,15 @@ type BundleArtifactEntry struct {
 	ManifestCID string       `json:"manifest_cid"`
 }
 
+// BundleRevocationRef pins an owner-signed revocation list exported into an
+// offline bundle so deletion or rollback of enc/revoke/<owner_key_id> is
+// rejected fail-closed during RestoreAndVerify.
+type BundleRevocationRef struct {
+	Owner        PublicIdentity `json:"owner"`
+	Seq          uint64         `json:"seq"`
+	CurrentEpoch uint64         `json:"current_epoch"`
+}
+
 // AuthorizedBundleIndex is the Ed25519-signed index written into a portable
 // `file://` VFS directory during ExportAuthorizedBundle.
 type AuthorizedBundleIndex struct {
@@ -651,6 +660,7 @@ type AuthorizedBundleIndex struct {
 	ExportedAt       time.Time             `json:"exported_at"`
 	Artifacts        []BundleArtifactEntry `json:"artifacts"`
 	HasRevocationLog bool                  `json:"has_revocation_log"`
+	RevocationLogs   []BundleRevocationRef `json:"revocation_logs,omitempty"`
 	SignatureHex     string                `json:"signature_hex"`
 }
 
@@ -695,6 +705,14 @@ func (b *AuthorizedBundleIndex) Verify(trustedOwnerEdPubs []ed25519.PublicKey) e
 		}
 		if !trusted {
 			return fmt.Errorf("%w: bundle owner %s not trusted", ErrUntrustedOwner, b.Owner.KeyID)
+		}
+	}
+	for _, ref := range b.RevocationLogs {
+		if _, _, err := ref.Owner.Validate(); err != nil {
+			return fmt.Errorf("%w: bundle revocation ref owner invalid: %v", ErrInvalidManifest, err)
+		}
+		if ref.Seq == 0 || ref.CurrentEpoch == 0 {
+			return fmt.Errorf("%w: bundle revocation ref for %s requires seq>=1 and epoch>=1", ErrInvalidManifest, ref.Owner.KeyID)
 		}
 	}
 	sig, err := hex.DecodeString(b.SignatureHex)

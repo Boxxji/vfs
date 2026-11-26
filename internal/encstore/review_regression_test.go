@@ -1054,3 +1054,469 @@ func TestRestoreAndVerifyFailsOverPastCorruptedBundleIndex(t *testing.T) {
 		t.Fatalf("expected ErrAllReplicasFailed when all bundle indexes corrupted, got %v", err)
 	}
 }
+
+// gatingRevocationBackend pauses the first PutIfAbsent for a targeted
+// revocation payload (matching seq & epoch) so a second Vault can concurrently
+// publish a conflicting equal-sequence record at a different epoch.
+type gatingRevocationBackend struct {
+	backend.Backend
+	targetSeq   uint64
+	targetEpoch uint64
+	paused      chan struct{}
+	release     chan struct{}
+	once        sync.Once
+}
+
+func (g *gatingRevocationBackend) PutIfAbsent(ctx context.Context, key string, data []byte) (backend.Version, error) {
+	if strings.HasPrefix(key, "enc/revoke/") {
+		var r SignedRevocationList
+		if json.Unmarshal(data, &r) == nil && r.Seq == g.targetSeq && r.CurrentEpoch == g.targetEpoch {
+			g.once.Do(func() {
+				close(g.paused)
+				<-g.release
+			})
+		}
+	}
+	return g.Backend.PutIfAbsent(ctx, key, data)
+}
+
+// TestRevocationCASRejectsEqualSeqConflictAcrossEpochs verifies that a paused
+// RevokePeer publication at (Seq=1, epoch=2) cannot overwrite an accepted
+// RevokeConsent publication at (Seq=1, epoch=1); CAS rejects the equal-sequence
+// conflict regardless of epoch, forcing reload, merge, and sequence advancement
+// so both revocations survive.
+func TestRevocationCASRejectsEqualSeqConflictAcrossEpochs(t *testing.T) {
+	ctx := context.Background()
+	owner, err := GenerateIdentity("owner-cas-cross-epoch")
+	if err != nil {
+		t.Fatalf("GenerateIdentity owner: %v", err)
+	}
+	peer, err := GenerateIdentity("peer-cas-cross-epoch")
+	if err != nil {
+		t.Fatalf("GenerateIdentity peer: %v", err)
+	}
+
+	rawMem := newMemBackend()
+	gated := &gatingRevocationBackend{
+		Backend:     rawMem,
+		targetSeq:   1,
+		targetEpoch: 2,
+		paused:      make(chan struct{}),
+		release:     make(chan struct{}),
+	}
+	store, err := NewReplicatedStore([]NodeEndpoint{
+		{Name: "node-gated", Backend: gated},
+	}, 1)
+	if err != nil {
+		t.Fatalf("NewReplicatedStore: %v", err)
+	}
+
+	vaultPeer, err := NewVault(owner)
+	if err != nil {
+		t.Fatalf("NewVault peer: %v", err)
+	}
+	_ = vaultPeer.AuthorizePeer(peer.Public("peer"))
+	vaultConsent, err := NewVault(owner)
+	if err != nil {
+		t.Fatalf("NewVault consent: %v", err)
+	}
+	_ = vaultConsent.AuthorizePeer(peer.Public("peer"))
+
+	// Write an artifact bound to consent-target before the race.
+	putRes, err := vaultPeer.PutArtifact(ctx, store, PutRequest{
+		ArtifactID: "art-cas-consent",
+		Kind:       KindAgentMemory,
+		Data:       []byte("confidential-consent-bound-payload"),
+		License:    LicensePolicy{SPDX: "Apache-2.0", CommercialAllowed: true, RedistributionAllowed: true},
+		Consent:    sampleConsent(owner, "consent-target", "memory:read", time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("PutArtifact: %v", err)
+	}
+
+	// Start Vault 1's RevokePeer (Seq=1, epoch=2); it pauses before PutIfAbsent.
+	type revResult struct {
+		list *SignedRevocationList
+		err  error
+	}
+	peerDone := make(chan revResult, 1)
+	go func() {
+		rl, rerr := vaultPeer.RevokePeer(ctx, store, peer.KeyID, "compromised-peer")
+		peerDone <- revResult{list: rl, err: rerr}
+	}()
+
+	select {
+	case <-gated.paused:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for RevokePeer (Seq=1, epoch=2) to pause")
+	}
+
+	// While Vault 1 is paused, Vault 2 publishes RevokeConsent at (Seq=1, epoch=1).
+	consentList, err := vaultConsent.RevokeConsent(ctx, store, "consent-target")
+	if err != nil {
+		close(gated.release)
+		t.Fatalf("RevokeConsent: %v", err)
+	}
+	if consentList.Seq != 1 || consentList.CurrentEpoch != 1 {
+		close(gated.release)
+		t.Fatalf("expected consent revocation at (Seq=1, epoch=1), got (Seq=%d, epoch=%d)", consentList.Seq, consentList.CurrentEpoch)
+	}
+
+	// Also confirm direct PutRevocationQuorum rejects a conflicting (Seq=1, epoch=2) record.
+	directConflict := &SignedRevocationList{
+		Version:      FormatVersion,
+		Owner:        owner.Public("owner"),
+		CurrentEpoch: 2,
+		Seq:          1,
+		RevokedPeers: []RevocationEntry{{PeerKeyID: peer.KeyID, RevokedAtEpoch: 2, RevokedAt: time.Now().UTC(), Reason: "direct-conflict"}},
+		UpdatedAt:    time.Now().UTC(),
+	}
+	if err := directConflict.Sign(owner); err != nil {
+		close(gated.release)
+		t.Fatalf("Sign directConflict: %v", err)
+	}
+	if _, err := store.PutRevocationQuorum(ctx, owner.KeyID, owner.Ed25519Pub, directConflict); !errors.Is(err, ErrStaleRevocation) {
+		close(gated.release)
+		t.Fatalf("expected ErrStaleRevocation for conflicting equal-seq cross-epoch write, got %v", err)
+	}
+
+	// Resume Vault 1's paused RevokePeer: it must reject the stale Seq=1 write,
+	// reload (Seq=1, epoch=1), merge consent-target, advance to Seq=2, and publish.
+	close(gated.release)
+	res := <-peerDone
+	if res.err != nil {
+		t.Fatalf("RevokePeer after CAS retry: %v", res.err)
+	}
+	if res.list.Seq < 2 {
+		t.Fatalf("expected merged revocation list at Seq>=2, got Seq=%d", res.list.Seq)
+	}
+
+	latest, err := store.GetLatestRevocationList(ctx, owner.KeyID, owner.Ed25519Pub)
+	if err != nil || latest == nil {
+		t.Fatalf("GetLatestRevocationList: latest=%v err=%v", latest, err)
+	}
+	if !latest.IsConsentRevoked("consent-target") {
+		t.Fatalf("consent revocation was overwritten! latest=%+v", latest)
+	}
+	if !latest.IsPeerRevoked(peer.KeyID, 2) {
+		t.Fatalf("peer revocation missing from merged list! latest=%+v", latest)
+	}
+
+	// Artifact bound to consent-target must STILL fail with ErrConsentRevoked.
+	policy := ReadPolicy{TrustedOwnerEdPubs: []ed25519.PublicKey{owner.Ed25519Pub}}
+	if _, err := ReadArtifact(ctx, store, putRes.ManifestCID, owner, policy); !errors.Is(err, ErrConsentRevoked) {
+		t.Fatalf("expected ErrConsentRevoked after concurrent peer+consent revocation, got %v", err)
+	}
+}
+
+// TestRestoreAndVerifyEnforcesRequiredBundleRevocationLog verifies that
+// RestoreAndVerify enforces the signed AuthorizedBundleIndex's revocation-log
+// requirements before restoring any artifacts, rejecting bundles whose
+// enc/revoke/<owner> record was deleted or rolled back to an older sequence.
+func TestRestoreAndVerifyEnforcesRequiredBundleRevocationLog(t *testing.T) {
+	ctx := context.Background()
+	owner, err := GenerateIdentity("owner-bundle-rev-req")
+	if err != nil {
+		t.Fatalf("GenerateIdentity owner: %v", err)
+	}
+	peer, err := GenerateIdentity("peer-bundle-rev-req")
+	if err != nil {
+		t.Fatalf("GenerateIdentity peer: %v", err)
+	}
+
+	srcCluster := startTestCluster(t, 2, 2)
+	vault, err := NewVault(owner)
+	if err != nil {
+		t.Fatalf("NewVault: %v", err)
+	}
+	_ = vault.AuthorizePeer(peer.Public("peer"))
+
+	putRes, err := vault.PutArtifact(ctx, srcCluster.store, PutRequest{
+		ArtifactID: "art-revoked-consent",
+		Kind:       KindAgentMemory,
+		Data:       []byte("secret-under-revoked-consent"),
+		License:    LicensePolicy{SPDX: "Apache-2.0", CommercialAllowed: true, RedistributionAllowed: true},
+		Consent:    sampleConsent(owner, "consent-rev-bundle", "memory:read", time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("PutArtifact: %v", err)
+	}
+
+	// Publish Seq=1 (unrelated consent) so we can later simulate a rollback attack.
+	olderRev, err := vault.RevokeConsent(ctx, srcCluster.store, "consent-unrelated")
+	if err != nil {
+		t.Fatalf("RevokeConsent unrelated: %v", err)
+	}
+	olderRevBytes, err := json.Marshal(olderRev)
+	if err != nil {
+		t.Fatalf("Marshal olderRev: %v", err)
+	}
+
+	// Publish Seq=2 revoking the artifact's actual consent.
+	if _, err := vault.RevokeConsent(ctx, srcCluster.store, "consent-rev-bundle"); err != nil {
+		t.Fatalf("RevokeConsent target: %v", err)
+	}
+
+	exportDir := filepath.Join(t.TempDir(), "bundle-with-rev")
+	expRes, err := vault.ExportAuthorizedBundle(ctx, srcCluster.store, exportDir, []string{putRes.ManifestCID})
+	if err != nil {
+		t.Fatalf("ExportAuthorizedBundle: %v", err)
+	}
+	if !expRes.Index.HasRevocationLog || len(expRes.Index.RevocationLogs) == 0 {
+		t.Fatalf("expected ExportAuthorizedBundle to sign HasRevocationLog=true and RevocationLogs, got %+v", expRes.Index)
+	}
+
+	loadBundleMem := func(t *testing.T) *memBackend {
+		t.Helper()
+		fb, err := backend.Open(ctx, "file://"+exportDir)
+		if err != nil {
+			t.Fatalf("backend.Open: %v", err)
+		}
+		defer fb.Close()
+		mb := newMemBackend()
+		objCh, errCh := fb.List(ctx, "")
+		for obj := range objCh {
+			raw, _, err := fb.Get(ctx, obj.Key, backend.Unbounded)
+			if err != nil {
+				t.Fatalf("Get %s: %v", obj.Key, err)
+			}
+			_ = mb.Put(ctx, obj.Key, raw)
+		}
+		if err := <-errCh; err != nil {
+			t.Fatalf("List: %v", err)
+		}
+		return mb
+	}
+
+	policy := ReadPolicy{TrustedOwnerEdPubs: []ed25519.PublicKey{owner.Ed25519Pub}}
+	revKey, err := RevocationKey(owner.KeyID)
+	if err != nil {
+		t.Fatalf("RevocationKey: %v", err)
+	}
+
+	// Baseline: intact bundle enforces ErrConsentRevoked.
+	intactStore, _ := NewReplicatedStore([]NodeEndpoint{{Name: "intact", Backend: loadBundleMem(t)}}, 1)
+	if _, err := RestoreAndVerify(ctx, intactStore, owner, policy); !errors.Is(err, ErrConsentRevoked) {
+		t.Fatalf("expected ErrConsentRevoked on intact bundle, got %v", err)
+	}
+
+	// Subcase A: deleting enc/revoke/<owner_key_id> must fail closed, never return plaintext.
+	strippedMem := loadBundleMem(t)
+	if err := strippedMem.Delete(ctx, revKey); err != nil {
+		t.Fatalf("Delete revKey: %v", err)
+	}
+	strippedStore, _ := NewReplicatedStore([]NodeEndpoint{{Name: "stripped", Backend: strippedMem}}, 1)
+	if res, err := RestoreAndVerify(ctx, strippedStore, owner, policy); !errors.Is(err, ErrInvalidManifest) {
+		t.Fatalf("expected ErrInvalidManifest when required revocation log is deleted, got res=%v err=%v", res, err)
+	}
+
+	// Subcase B: rolling back enc/revoke/<owner_key_id> to older valid Seq=1 must fail closed.
+	rollbackMem := loadBundleMem(t)
+	if err := rollbackMem.Put(ctx, revKey, olderRevBytes); err != nil {
+		t.Fatalf("Put olderRev: %v", err)
+	}
+	rollbackStore, _ := NewReplicatedStore([]NodeEndpoint{{Name: "rollback", Backend: rollbackMem}}, 1)
+	if res, err := RestoreAndVerify(ctx, rollbackStore, owner, policy); !errors.Is(err, ErrInvalidManifest) {
+		t.Fatalf("expected ErrInvalidManifest when bundle revocation log is rolled back, got res=%v err=%v", res, err)
+	}
+
+	// Subcase C: legacy index with only HasRevocationLog=true (no RevocationLogs slice)
+	// must also fail closed when enc/revoke/<owner_key_id> is deleted.
+	legacyMem := loadBundleMem(t)
+	legacyIdx := *expRes.Index
+	legacyIdx.RevocationLogs = nil
+	legacyIdx.HasRevocationLog = true
+	if err := legacyIdx.Sign(owner); err != nil {
+		t.Fatalf("Sign legacyIdx: %v", err)
+	}
+	legacyIdxBytes, _ := json.Marshal(&legacyIdx)
+	_ = legacyMem.Put(ctx, BundleIndexKey(), legacyIdxBytes)
+	_ = legacyMem.Delete(ctx, revKey)
+	legacyStore, _ := NewReplicatedStore([]NodeEndpoint{{Name: "legacy-stripped", Backend: legacyMem}}, 1)
+	if res, err := RestoreAndVerify(ctx, legacyStore, owner, policy); !errors.Is(err, ErrInvalidManifest) {
+		t.Fatalf("expected ErrInvalidManifest on legacy HasRevocationLog=true bundle missing log, got res=%v err=%v", res, err)
+	}
+}
+
+// TestCryptoShredRecoversPersistedManifestsAfterRestart verifies that a freshly
+// recreated Vault (with empty in-memory artifactHistory) recovers all persisted
+// manifests and chunks for artifactID from store before deleting the head,
+// erasing wrapped DEKs and ciphertext chunks across all reachable replicas.
+func TestCryptoShredRecoversPersistedManifestsAfterRestart(t *testing.T) {
+	ctx := context.Background()
+	owner, err := GenerateIdentity("owner-shred-restart")
+	if err != nil {
+		t.Fatalf("GenerateIdentity owner: %v", err)
+	}
+	peer, err := GenerateIdentity("peer-shred-restart")
+	if err != nil {
+		t.Fatalf("GenerateIdentity peer: %v", err)
+	}
+
+	cluster := startTestCluster(t, 3, 2)
+	vaultBeforeRestart, err := NewVault(owner)
+	if err != nil {
+		t.Fatalf("NewVault before restart: %v", err)
+	}
+	_ = vaultBeforeRestart.AuthorizePeer(peer.Public("peer"))
+
+	// Write v1 and v2 (without ParentManifestCID link to also test manifest scan)
+	// plus an unrelated artifact that must survive untouched.
+	v1Res, err := vaultBeforeRestart.PutArtifact(ctx, cluster.store, PutRequest{
+		ArtifactID: "shred-after-restart",
+		Kind:       KindAgentMemory,
+		Data:       bytes.Repeat([]byte("version-1-secret-"), 256),
+		ChunkSize:  1024,
+		License:    LicensePolicy{SPDX: "Apache-2.0", CommercialAllowed: true, RedistributionAllowed: true},
+		Consent:    sampleConsent(owner, "consent-shred", "memory:read", time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("PutArtifact v1: %v", err)
+	}
+	v2Res, err := vaultBeforeRestart.PutArtifact(ctx, cluster.store, PutRequest{
+		ArtifactID: "shred-after-restart",
+		Kind:       KindAgentMemory,
+		Data:       bytes.Repeat([]byte("version-2-secret-"), 256),
+		ChunkSize:  1024,
+		License:    LicensePolicy{SPDX: "Apache-2.0", CommercialAllowed: true, RedistributionAllowed: true},
+		Consent:    sampleConsent(owner, "consent-shred", "memory:read", time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("PutArtifact v2: %v", err)
+	}
+	keepRes, err := vaultBeforeRestart.PutArtifact(ctx, cluster.store, PutRequest{
+		ArtifactID: "unrelated-keep-me",
+		Kind:       KindAgentMemory,
+		Data:       []byte("unrelated-artifact-must-survive"),
+		License:    LicensePolicy{SPDX: "Apache-2.0", CommercialAllowed: true, RedistributionAllowed: true},
+		Consent:    sampleConsent(owner, "consent-keep", "memory:read", time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("PutArtifact keep: %v", err)
+	}
+
+	// Simulate process restart: brand-new Vault instance with empty artifactHistory.
+	restartedVault, err := NewVault(owner)
+	if err != nil {
+		t.Fatalf("NewVault restarted: %v", err)
+	}
+	receipt, err := restartedVault.CryptoShred(ctx, cluster.store, "shred-after-restart", "gdpr-restart-erasure")
+	if err != nil {
+		t.Fatalf("CryptoShred after restart: %v", err)
+	}
+	if receipt.ManifestsDeleted != 2 {
+		t.Fatalf("ManifestsDeleted=%d, want 2 (v1 and v2 recovered from store)", receipt.ManifestsDeleted)
+	}
+	if receipt.ChunksDeleteOps == 0 {
+		t.Fatal("expected ChunksDeleteOps > 0 after recovering persisted manifests")
+	}
+
+	// Verify every manifest and every ciphertext chunk of v1 and v2 is gone on ALL replicas.
+	for _, m := range []*SignedManifest{v1Res.Manifest, v2Res.Manifest} {
+		mk, _ := ManifestKey(m.ManifestCID)
+		for _, ep := range cluster.store.Nodes() {
+			if _, _, err := ep.Backend.Get(ctx, mk, MaxManifestSize); !errors.Is(err, backend.ErrNotFound) {
+				t.Fatalf("node %s still retains shredded manifest %s: err=%v", ep.Name, m.ManifestCID[:12], err)
+			}
+			for _, ref := range m.CipherChunks {
+				ck, _ := ChunkKey(ref.CiphertextCID)
+				if _, _, err := ep.Backend.Get(ctx, ck, ref.CiphertextSize+1024); !errors.Is(err, backend.ErrNotFound) {
+					t.Fatalf("node %s still retains shredded chunk %s: err=%v", ep.Name, ref.CiphertextCID[:12], err)
+				}
+			}
+		}
+	}
+
+	// Verify unrelated artifact was NOT touched and remains readable by the peer.
+	policy := ReadPolicy{TrustedOwnerEdPubs: []ed25519.PublicKey{owner.Ed25519Pub}}
+	keepRead, err := ReadArtifact(ctx, cluster.store, keepRes.ManifestCID, peer, policy)
+	if err != nil {
+		t.Fatalf("ReadArtifact unrelated keep-me: %v", err)
+	}
+	if string(keepRead.Data) != "unrelated-artifact-must-survive" {
+		t.Fatalf("unrelated artifact payload mismatch: %q", string(keepRead.Data))
+	}
+}
+
+// TestGetVerifiedManifestFailsOverOnCorruptedSelfCID verifies that when the
+// first replica alters only the unsigned JSON manifest_cid field (leaving
+// ComputeCID equal to the requested CID), GetVerifiedManifest treats it as
+// replica corruption, quarantines that replica, and fails over cleanly to a
+// healthy replica for reads and exports.
+func TestGetVerifiedManifestFailsOverOnCorruptedSelfCID(t *testing.T) {
+	ctx := context.Background()
+	owner, err := GenerateIdentity("owner-selfcid-failover")
+	if err != nil {
+		t.Fatalf("GenerateIdentity owner: %v", err)
+	}
+
+	node0 := newMemBackend()
+	node1 := newMemBackend()
+	store, err := NewReplicatedStore([]NodeEndpoint{
+		{Name: "replica-0-bad-selfcid", Backend: node0},
+		{Name: "replica-1-healthy", Backend: node1},
+	}, 2)
+	if err != nil {
+		t.Fatalf("NewReplicatedStore: %v", err)
+	}
+
+	vault, err := NewVault(owner)
+	if err != nil {
+		t.Fatalf("NewVault: %v", err)
+	}
+	payload := []byte("manifest-self-cid-failover-payload")
+	putRes, err := vault.PutArtifact(ctx, store, PutRequest{
+		ArtifactID: "art-selfcid-failover",
+		Kind:       KindAgentMemory,
+		Data:       payload,
+		License:    LicensePolicy{SPDX: "Apache-2.0", CommercialAllowed: true, RedistributionAllowed: true},
+		Consent:    sampleConsent(owner, "consent-selfcid", "memory:read", time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("PutArtifact: %v", err)
+	}
+
+	// Corrupt ONLY the unsigned manifest_cid JSON field on replica-0.
+	mk, _ := ManifestKey(putRes.ManifestCID)
+	raw0, _, err := node0.Get(ctx, mk, MaxManifestSize)
+	if err != nil {
+		t.Fatalf("node0 Get manifest: %v", err)
+	}
+	var poisoned SignedManifest
+	if err := json.Unmarshal(raw0, &poisoned); err != nil {
+		t.Fatalf("Unmarshal raw0: %v", err)
+	}
+	poisoned.ManifestCID = strings.Repeat("ff", 32)
+	poisonedRaw, err := json.Marshal(&poisoned)
+	if err != nil {
+		t.Fatalf("Marshal poisoned: %v", err)
+	}
+	if err := node0.Put(ctx, mk, poisonedRaw); err != nil {
+		t.Fatalf("node0 Put poisoned: %v", err)
+	}
+
+	// 1. ReadArtifact must fail over past replica-0 to replica-1 and succeed.
+	policy := ReadPolicy{TrustedOwnerEdPubs: []ed25519.PublicKey{owner.Ed25519Pub}}
+	readRes, err := ReadArtifact(ctx, store, putRes.ManifestCID, owner, policy)
+	if err != nil {
+		t.Fatalf("ReadArtifact failed instead of failing over past corrupted self-CID: %v", err)
+	}
+	if !bytes.Equal(readRes.Data, payload) {
+		t.Fatalf("ReadArtifact payload mismatch: got %q, want %q", readRes.Data, payload)
+	}
+
+	// 2. ExportAuthorizedBundle must also succeed via failover to replica-1.
+	exportDir := filepath.Join(t.TempDir(), "export-selfcid")
+	if _, err := vault.ExportAuthorizedBundle(ctx, store, exportDir, []string{putRes.ManifestCID}); err != nil {
+		t.Fatalf("ExportAuthorizedBundle failed instead of failing over past corrupted self-CID: %v", err)
+	}
+
+	// 3. When ALL replicas have corrupted self-CID, fail closed with ErrAllReplicasFailed + ErrInvalidManifest.
+	if err := node1.Put(ctx, mk, poisonedRaw); err != nil {
+		t.Fatalf("node1 Put poisoned: %v", err)
+	}
+	if _, _, err := store.GetVerifiedManifest(ctx, putRes.ManifestCID, []ed25519.PublicKey{owner.Ed25519Pub}); !errors.Is(err, ErrAllReplicasFailed) || !errors.Is(err, ErrInvalidManifest) {
+		t.Fatalf("expected ErrAllReplicasFailed wrapping ErrInvalidManifest when all replicas alter manifest_cid, got %v", err)
+	}
+}
+

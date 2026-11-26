@@ -50,6 +50,10 @@ const (
 	// publication and retrieval.
 	MaxTombstoneSize int64 = 1 << 20
 
+	// MaxHeadPointerSize bounds serialized HeadPointer size when recovering
+	// persisted artifact heads across storage nodes.
+	MaxHeadPointerSize int64 = 1 << 20
+
 	// MaxBundleIndexSize bounds serialized AuthorizedBundleIndex size across
 	// both export and restore.
 	MaxBundleIndexSize int64 = 4 << 20
@@ -863,10 +867,18 @@ func (s *ReplicatedStore) GetVerifiedManifest(ctx context.Context, manifestCID s
 			lastErr = fmt.Errorf("%w: manifest CID mismatch from %s", ErrInvalidManifest, ep.Name)
 			continue
 		}
+		if m.ManifestCID != "" && m.ManifestCID != manifestCID {
+			s.quarantine(ep.Name, "manifest self-CID mismatch")
+			lastErr = fmt.Errorf("%w: manifest self-CID mismatch from %s", ErrInvalidManifest, ep.Name)
+			continue
+		}
 		if err := m.Verify(trustedOwnerEdPubs); err != nil {
 			// A manifest whose CID matched the requested CID has a cryptographically
 			// bound bad signature or untrusted owner — fail closed immediately.
 			return nil, nil, err
+		}
+		if m.ManifestCID == "" {
+			m.ManifestCID = manifestCID
 		}
 		return &m, raw, nil
 	}
@@ -882,7 +894,8 @@ func revocationNewer(a, b *SignedRevocationList) bool {
 
 // PutRevocationQuorum publishes revList monotonically across all replicas using
 // conditional compare-and-swap (PutIfAbsent / PutIfVersion) so a delayed or
-// stale publication can never overwrite a higher-sequence valid revocation list.
+// stale publication can never overwrite a higher-sequence or conflicting
+// equal-sequence valid revocation list.
 func (s *ReplicatedStore) PutRevocationQuorum(ctx context.Context, ownerKeyID string, ownerEdPub ed25519.PublicKey, revList *SignedRevocationList) (int, error) {
 	key, err := RevocationKey(ownerKeyID)
 	if err != nil {
@@ -957,16 +970,16 @@ func (s *ReplicatedStore) putRevocationOnNode(ctx context.Context, ep NodeEndpoi
 		}
 		var cur SignedRevocationList
 		if json.Unmarshal(curRaw, &cur) == nil && cur.Verify(ownerEdPub) == nil && cur.Owner.KeyID == ownerKeyID {
-			if revocationNewer(&cur, revList) {
+			if cur.Seq > revList.Seq || cur.CurrentEpoch > revList.CurrentEpoch {
 				return fmt.Errorf("%w: %s holds seq=%d epoch=%d, refusing seq=%d epoch=%d",
 					ErrStaleRevocation, ep.Name, cur.Seq, cur.CurrentEpoch, revList.Seq, revList.CurrentEpoch)
 			}
-			if cur.Seq == revList.Seq && cur.CurrentEpoch == revList.CurrentEpoch {
+			if cur.Seq == revList.Seq {
 				if bytes.Equal(curRaw, raw) {
 					return nil
 				}
-				return fmt.Errorf("%w: %s holds conflicting revocation list at seq=%d epoch=%d",
-					ErrStaleRevocation, ep.Name, cur.Seq, cur.CurrentEpoch)
+				return fmt.Errorf("%w: %s holds conflicting revocation list at seq=%d (cur epoch=%d, candidate epoch=%d)",
+					ErrStaleRevocation, ep.Name, cur.Seq, cur.CurrentEpoch, revList.CurrentEpoch)
 			}
 		}
 		_, putErr := ep.Backend.PutIfVersion(ctx, key, raw, curVer)
@@ -981,18 +994,17 @@ func (s *ReplicatedStore) putRevocationOnNode(ctx context.Context, ep NodeEndpoi
 	return fmt.Errorf("%w: %s exceeded CAS retry limit", ErrStaleRevocation, ep.Name)
 }
 
-// GetLatestRevocationList fetches the highest-Seq valid SignedRevocationList
-// signed by ownerEdPub across all reachable nodes. Returns (nil, nil) only when
-// every replica reports genuine absence (backend.ErrNotFound); fails closed
-// with an error if no valid record could be obtained after retrieval or
-// verification failures.
-func (s *ReplicatedStore) GetLatestRevocationList(ctx context.Context, ownerKeyID string, ownerEdPub ed25519.PublicKey) (*SignedRevocationList, error) {
+// GetAllValidRevocationLists fetches every valid owner-signed revocation list
+// observed across reachable replicas. Returns (nil, nil) only when every
+// replica reports genuine absence (backend.ErrNotFound); fails closed if no
+// valid record could be obtained after retrieval or verification failures.
+func (s *ReplicatedStore) GetAllValidRevocationLists(ctx context.Context, ownerKeyID string, ownerEdPub ed25519.PublicKey) ([]*SignedRevocationList, error) {
 	key, err := RevocationKey(ownerKeyID)
 	if err != nil {
 		return nil, err
 	}
 	var (
-		best       *SignedRevocationList
+		valid      []*SignedRevocationList
 		hadFailure bool
 		lastErr    error
 	)
@@ -1022,13 +1034,30 @@ func (s *ReplicatedStore) GetLatestRevocationList(ctx context.Context, ownerKeyI
 			lastErr = fmt.Errorf("%w: %s revocation list owner %q != %q", ErrUntrustedOwner, ep.Name, r.Owner.KeyID, ownerKeyID)
 			continue
 		}
-		if best == nil || revocationNewer(&r, best) {
-			copyR := r
-			best = &copyR
-		}
+		copyR := r
+		valid = append(valid, &copyR)
 	}
-	if best == nil && hadFailure {
+	if len(valid) == 0 && hadFailure {
 		return nil, fmt.Errorf("%w: revocation list for %s: %w", ErrAllReplicasFailed, ownerKeyID, lastErr)
+	}
+	return valid, nil
+}
+
+// GetLatestRevocationList fetches the highest-Seq valid SignedRevocationList
+// signed by ownerEdPub across all reachable nodes. Returns (nil, nil) only when
+// every replica reports genuine absence (backend.ErrNotFound); fails closed
+// with an error if no valid record could be obtained after retrieval or
+// verification failures.
+func (s *ReplicatedStore) GetLatestRevocationList(ctx context.Context, ownerKeyID string, ownerEdPub ed25519.PublicKey) (*SignedRevocationList, error) {
+	valid, err := s.GetAllValidRevocationLists(ctx, ownerKeyID, ownerEdPub)
+	if err != nil || len(valid) == 0 {
+		return nil, err
+	}
+	best := valid[0]
+	for _, r := range valid[1:] {
+		if revocationNewer(r, best) {
+			best = r
+		}
 	}
 	return best, nil
 }

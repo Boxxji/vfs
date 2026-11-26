@@ -832,13 +832,21 @@ func (v *Vault) mutateAndPublishRevocation(
 
 	const maxPublishAttempts = 8
 	for attempt := 0; attempt < maxPublishAttempts; attempt++ {
-		persisted, err := store.GetLatestRevocationList(ctx, v.owner.KeyID, v.owner.Ed25519Pub)
+		allPersisted, err := store.GetAllValidRevocationLists(ctx, v.owner.KeyID, v.owner.Ed25519Pub)
 		if err != nil {
 			return nil, err
 		}
+		var persisted *SignedRevocationList
+		for _, r := range allPersisted {
+			if persisted == nil || revocationNewer(r, persisted) {
+				persisted = r
+			}
+		}
 
 		v.mu.Lock()
-		v.mergeRevocationListLocked(persisted)
+		for _, r := range allPersisted {
+			v.mergeRevocationListLocked(r)
+		}
 		cand := v.snapshotRevStateLocked()
 		v.mu.Unlock()
 
@@ -899,10 +907,158 @@ type ShredReceipt struct {
 	TombstoneReplicas int                `json:"tombstone_replicas"`
 }
 
+// recoverPersistedArtifactManifests discovers all persisted owner-signed
+// manifests for artifactID in store (via in-memory history, per-node head
+// pointers, enc/manifest/ prefix scans, and same-artifact ParentManifestCID
+// chains) so CryptoShred works completely even after a fresh Vault restart.
+func (v *Vault) recoverPersistedArtifactManifests(
+	ctx context.Context,
+	store *ReplicatedStore,
+	artifactID string,
+	seedCIDs []string,
+) (map[string]*SignedManifest, []string, uint64) {
+	ownerTrusted := []ed25519.PublicKey{v.owner.Ed25519Pub}
+	manifests := make(map[string]*SignedManifest)
+	knownCIDs := make(map[string]struct{})
+	queue := make([]string, 0, len(seedCIDs)+4)
+	var maxEpoch uint64
+
+	enqueue := func(cid string) {
+		if cid == "" || ValidateHexDigest(cid) != nil {
+			return
+		}
+		if _, seen := knownCIDs[cid]; seen {
+			return
+		}
+		knownCIDs[cid] = struct{}{}
+		queue = append(queue, cid)
+	}
+
+	for _, cid := range seedCIDs {
+		enqueue(cid)
+	}
+
+	// 1. Recover head pointers from every reachable replica BEFORE deleting head.
+	if hk, err := HeadKey(artifactID); err == nil {
+		for _, ep := range store.Nodes() {
+			raw, _, err := ep.Backend.Get(ctx, hk, MaxHeadPointerSize)
+			if err != nil {
+				continue
+			}
+			var hp HeadPointer
+			if json.Unmarshal(raw, &hp) == nil && hp.ArtifactID == artifactID {
+				enqueue(hp.ManifestCID)
+				if hp.Epoch > maxEpoch {
+					maxEpoch = hp.Epoch
+				}
+			}
+		}
+	}
+
+	// 2. Scan persisted manifests under enc/manifest/ across reachable replicas
+	// to catch earlier versions that were not linked by ParentManifestCID.
+	checkedKeys := make(map[string]struct{})
+	for _, ep := range store.Nodes() {
+		objCh, errCh := ep.Backend.List(ctx, "enc/manifest/")
+		var nodeCIDs []string
+		for obj := range objCh {
+			parts := strings.Split(obj.Key, "/")
+			if len(parts) != 4 || parts[0] != "enc" || parts[1] != "manifest" {
+				continue
+			}
+			cid := parts[3]
+			if ValidateHexDigest(cid) != nil {
+				continue
+			}
+			nodeCIDs = append(nodeCIDs, cid)
+		}
+		_ = <-errCh
+
+		for _, cid := range nodeCIDs {
+			if _, ok := manifests[cid]; ok {
+				continue
+			}
+			nodeKey := ep.Name + ":" + cid
+			if _, seen := checkedKeys[nodeKey]; seen {
+				continue
+			}
+			checkedKeys[nodeKey] = struct{}{}
+			mk, err := ManifestKey(cid)
+			if err != nil {
+				continue
+			}
+			raw, _, err := ep.Backend.Get(ctx, mk, MaxManifestSize)
+			if err != nil {
+				continue
+			}
+			var m SignedManifest
+			if json.Unmarshal(raw, &m) != nil {
+				continue
+			}
+			if m.ArtifactID != artifactID || m.Owner.KeyID != v.owner.KeyID {
+				continue
+			}
+			computedCID, err := m.ComputeCID()
+			if err != nil || computedCID != cid {
+				continue
+			}
+			if m.ManifestCID != "" && m.ManifestCID != cid {
+				continue
+			}
+			if m.Verify(ownerTrusted) != nil {
+				continue
+			}
+			if m.ManifestCID == "" {
+				m.ManifestCID = cid
+			}
+			copyM := m
+			manifests[cid] = &copyM
+			knownCIDs[cid] = struct{}{}
+			if copyM.Epoch > maxEpoch {
+				maxEpoch = copyM.Epoch
+			}
+			if copyM.ParentManifestCID != "" {
+				enqueue(copyM.ParentManifestCID)
+			}
+		}
+	}
+
+	// 3. Resolve queued CIDs and walk same-artifact ParentManifestCID chains.
+	for len(queue) > 0 {
+		cid := queue[0]
+		queue = queue[1:]
+		if _, ok := manifests[cid]; ok {
+			continue
+		}
+		m, _, err := store.GetVerifiedManifest(ctx, cid, ownerTrusted)
+		if err != nil {
+			continue
+		}
+		if m.ArtifactID != artifactID || m.Owner.KeyID != v.owner.KeyID {
+			continue
+		}
+		manifests[cid] = m
+		if m.Epoch > maxEpoch {
+			maxEpoch = m.Epoch
+		}
+		if m.ParentManifestCID != "" {
+			enqueue(m.ParentManifestCID)
+		}
+	}
+
+	allCIDs := make([]string, 0, len(knownCIDs))
+	for cid := range knownCIDs {
+		allCIDs = append(allCIDs, cid)
+	}
+	sort.Strings(allCIDs)
+	return manifests, allCIDs, maxEpoch
+}
+
 // CryptoShred performs cryptographic erasure for artifactID:
 //  1. Zeroes and deletes all locally cached DEKs for artifactID.
-//  2. Publishes an owner-signed DeletionTombstone across independent storage nodes.
-//  3. Best-effort deletes ciphertext chunks, manifests, and head pointer from reachable nodes.
+//  2. Recovers the persisted manifest set (head pointers, manifest index, and
+//     parent chains) before deleting head pointers, manifests, and ciphertext chunks.
+//  3. Publishes an owner-signed DeletionTombstone across independent storage nodes.
 func (v *Vault) CryptoShred(ctx context.Context, store *ReplicatedStore, artifactID, reason string) (*ShredReceipt, error) {
 	if err := ValidateSegment(artifactID); err != nil {
 		return nil, err
@@ -918,6 +1074,20 @@ func (v *Vault) CryptoShred(ctx context.Context, store *ReplicatedStore, artifac
 	manifestCIDs := append([]string(nil), v.artifactHistory[artifactID]...)
 	delete(v.artifactHistory, artifactID)
 	v.mu.Unlock()
+
+	var recoveredManifests map[string]*SignedManifest
+	if store != nil {
+		var maxEpoch uint64
+		recoveredManifests, manifestCIDs, maxEpoch = v.recoverPersistedArtifactManifests(ctx, store, artifactID, manifestCIDs)
+		if maxEpoch > epoch {
+			epoch = maxEpoch
+		}
+		if persistedRev, err := store.GetLatestRevocationList(ctx, v.owner.KeyID, v.owner.Ed25519Pub); err == nil && persistedRev != nil {
+			if persistedRev.CurrentEpoch > epoch {
+				epoch = persistedRev.CurrentEpoch
+			}
+		}
+	}
 
 	tombstone := &DeletionTombstone{
 		Version:        FormatVersion,
@@ -939,10 +1109,16 @@ func (v *Vault) CryptoShred(ctx context.Context, store *ReplicatedStore, artifac
 		return receipt, nil
 	}
 
-	// Best-effort delete known manifests and their ciphertext chunks.
+	// Best-effort delete all recovered manifests and their ciphertext chunks.
+	deletedChunks := make(map[string]struct{})
 	for _, mCID := range manifestCIDs {
-		if m, _, err := store.GetVerifiedManifest(ctx, mCID, nil); err == nil {
+		m := recoveredManifests[mCID]
+		if m != nil {
 			for _, ref := range m.CipherChunks {
+				if _, already := deletedChunks[ref.CiphertextCID]; already {
+					continue
+				}
+				deletedChunks[ref.CiphertextCID] = struct{}{}
 				if ck, err := ChunkKey(ref.CiphertextCID); err == nil {
 					receipt.ChunksDeleteOps += store.DeleteBestEffort(ctx, ck)
 				}
@@ -1268,6 +1444,7 @@ func (v *Vault) ExportAuthorizedBundle(ctx context.Context, src *ReplicatedStore
 	type revRecord struct {
 		key string
 		raw []byte
+		ref BundleRevocationRef
 	}
 	var revRecords []revRecord
 	for _, ownerID := range ownerIDs {
@@ -1289,7 +1466,15 @@ func (v *Vault) ExportAuthorizedBundle(ctx context.Context, src *ReplicatedStore
 		if int64(len(rawR)) > MaxRevocationListSize {
 			return nil, fmt.Errorf("%w: %w: serialized revocation list size %d exceeds limit %d", ErrInvalidManifest, backend.ErrTooLarge, len(rawR), MaxRevocationListSize)
 		}
-		revRecords = append(revRecords, revRecord{key: rKey, raw: rawR})
+		revRecords = append(revRecords, revRecord{
+			key: rKey,
+			raw: rawR,
+			ref: BundleRevocationRef{
+				Owner:        revList.Owner,
+				Seq:          revList.Seq,
+				CurrentEpoch: revList.CurrentEpoch,
+			},
+		})
 	}
 
 	dstBackend, err := backend.Open(ctx, "file://"+exportDir)
@@ -1339,11 +1524,13 @@ func (v *Vault) ExportAuthorizedBundle(ctx context.Context, src *ReplicatedStore
 		})
 	}
 
+	revRefs := make([]BundleRevocationRef, 0, len(revRecords))
 	for _, rr := range revRecords {
 		if err := dstBackend.Put(ctx, rr.key, rr.raw); err != nil {
 			return nil, err
 		}
 		bytesWritten += int64(len(rr.raw))
+		revRefs = append(revRefs, rr.ref)
 	}
 
 	index := &AuthorizedBundleIndex{
@@ -1352,6 +1539,7 @@ func (v *Vault) ExportAuthorizedBundle(ctx context.Context, src *ReplicatedStore
 		ExportedAt:       time.Now().UTC(),
 		Artifacts:        entries,
 		HasRevocationLog: len(revRecords) > 0,
+		RevocationLogs:   revRefs,
 	}
 	if err := index.Sign(v.owner); err != nil {
 		return nil, err
@@ -1440,6 +1628,45 @@ func RestoreAndVerify(ctx context.Context, independentStore *ReplicatedStore, re
 			lastErr = backend.ErrNotFound
 		}
 		return nil, fmt.Errorf("%w: bundle index: %w", ErrAllReplicasFailed, lastErr)
+	}
+
+	// Enforce the signed index's revocation-log requirement fail-closed BEFORE
+	// restoring any artifact so deleting or rolling back enc/revoke/<owner> in
+	// an offline bundle can never silently disable consent or peer revocations.
+	if !policy.IgnoreRevocationList {
+		if len(idx.RevocationLogs) > 0 {
+			for _, ref := range idx.RevocationLogs {
+				ownerEdPub, _, err := ref.Owner.Validate()
+				if err != nil {
+					return nil, fmt.Errorf("encstore: validate bundle revocation ref %s: %w", ref.Owner.KeyID, err)
+				}
+				revList, err := independentStore.GetLatestRevocationList(ctx, ref.Owner.KeyID, ownerEdPub)
+				if err != nil {
+					return nil, fmt.Errorf("encstore: verify required bundle revocation log for %s: %w", ref.Owner.KeyID, err)
+				}
+				if revList == nil {
+					return nil, fmt.Errorf("%w: signed bundle requires revocation log for owner %s (seq>=%d), but none was found",
+						ErrInvalidManifest, ref.Owner.KeyID, ref.Seq)
+				}
+				if revList.Seq < ref.Seq || revList.CurrentEpoch < ref.CurrentEpoch {
+					return nil, fmt.Errorf("%w: signed bundle requires revocation log for owner %s at seq>=%d epoch>=%d, got seq=%d epoch=%d",
+						ErrInvalidManifest, ref.Owner.KeyID, ref.Seq, ref.CurrentEpoch, revList.Seq, revList.CurrentEpoch)
+				}
+			}
+		} else if idx.HasRevocationLog {
+			ownerEdPub, _, err := idx.Owner.Validate()
+			if err != nil {
+				return nil, fmt.Errorf("encstore: validate bundle owner %s: %w", idx.Owner.KeyID, err)
+			}
+			revList, err := independentStore.GetLatestRevocationList(ctx, idx.Owner.KeyID, ownerEdPub)
+			if err != nil {
+				return nil, fmt.Errorf("encstore: verify required bundle revocation log for %s: %w", idx.Owner.KeyID, err)
+			}
+			if revList == nil {
+				return nil, fmt.Errorf("%w: signed bundle requires revocation log for owner %s, but none was found",
+					ErrInvalidManifest, idx.Owner.KeyID)
+			}
+		}
 	}
 
 	restored := make([]RestoredArtifact, 0, len(idx.Artifacts))
