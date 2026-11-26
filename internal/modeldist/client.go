@@ -175,7 +175,10 @@ func (c *Client) FetchVerifiedManifest(ctx context.Context, cidHex string, provi
 	if len(providers) == 0 {
 		return nil, nil, fmt.Errorf("%w: no providers configured", ErrAllProvidersFailed)
 	}
-	var lastErr error
+	var (
+		lastErr      error
+		integrityErr error
+	)
 	for _, p := range providers {
 		if err := ctx.Err(); err != nil {
 			return nil, nil, err
@@ -187,18 +190,43 @@ func (c *Client) FetchVerifiedManifest(ctx context.Context, cidHex string, provi
 		}
 		m, err := ParseManifest(raw)
 		if err != nil {
+			integrityErr = err
 			lastErr = err
 			continue
 		}
 		if strings.ToLower(m.ManifestCID) != cidHex {
-			lastErr = fmt.Errorf("%w: provider %s returned CID %s, want %s", ErrManifestCIDMismatch, p.ID(), m.ManifestCID, cidHex)
+			integrityErr = fmt.Errorf("%w: provider %s returned CID %s, want %s", ErrManifestCIDMismatch, p.ID(), m.ManifestCID, cidHex)
+			lastErr = integrityErr
+			continue
+		}
+		computedCID, err := m.ComputeCID()
+		if err != nil {
+			integrityErr = err
+			lastErr = err
+			continue
+		}
+		if computedCID != cidHex {
+			integrityErr = fmt.Errorf("%w: provider %s payload computed CID %s, want %s", ErrManifestCIDMismatch, p.ID(), computedCID, cidHex)
+			lastErr = integrityErr
 			continue
 		}
 		if err := m.Verify(c.cfg.Policy); err != nil {
-			// Policy/signature failures on the exact requested CID are fatal.
-			return nil, nil, err
+			// License and version checks depend strictly on the unsigned body,
+			// which is now cryptographically bound to cidHex, so they are fatal.
+			// Signature, structural, or provenance failures can be mirror-specific
+			// (e.g. stripped/tampered signatures outside the unsigned CID body),
+			// so record them and continue failing over to remaining mirrors.
+			if errors.Is(err, ErrLicenseRejected) || errors.Is(err, ErrVersionRejected) {
+				return nil, nil, err
+			}
+			integrityErr = err
+			lastErr = err
+			continue
 		}
 		return m, p, nil
+	}
+	if integrityErr != nil {
+		return nil, nil, fmt.Errorf("%w: fetch manifest %s: %w", ErrAllProvidersFailed, cidHex, integrityErr)
 	}
 	if lastErr == nil {
 		lastErr = ErrManifestNotFound
@@ -267,6 +295,11 @@ func (c *Client) PullToDir(ctx context.Context, m *ManifestV1, providers []Chunk
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		return nil, err
 	}
+	outRoot, err := os.OpenRoot(outDir)
+	if err != nil {
+		return nil, err
+	}
+	defer outRoot.Close()
 	if c.cfg.CheckpointDir != "" {
 		if err := os.MkdirAll(c.cfg.CheckpointDir, 0o755); err != nil {
 			return nil, err
@@ -305,11 +338,7 @@ func (c *Client) PullToDir(ctx context.Context, m *ManifestV1, providers []Chunk
 	}
 
 	for artIdx, art := range m.Artifacts {
-		targetPath := filepath.Join(outDir, filepath.FromSlash(art.Path))
-		if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
-			return nil, err
-		}
-		f, err := os.OpenFile(targetPath, os.O_CREATE|os.O_RDWR, 0o644)
+		f, err := openConfinedArtifactFile(outRoot, art.Path)
 		if err != nil {
 			return nil, err
 		}
@@ -533,8 +562,14 @@ func (c *Client) PullArtifactStream(ctx context.Context, m *ManifestV1, artifact
 	workCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// Bounded dispatch window keeps peak RAM at O(workers * chunkSize).
+	// Credit-bounded dispatch window ties new chunk fetches strictly to in-order
+	// consumption so peak RAM stays O(workers * chunkSize) even if an early
+	// chunk stalls.
 	window := workers * 2
+	credits := make(chan struct{}, window)
+	for i := 0; i < window; i++ {
+		credits <- struct{}{}
+	}
 	jobs := make(chan ChunkRef, window)
 	results := make(chan fetchedChunk, window)
 
@@ -561,10 +596,16 @@ func (c *Client) PullArtifactStream(ctx context.Context, m *ManifestV1, artifact
 		}()
 	}
 
-	// Feeder goroutine respects bounded window via channel capacity.
+	// Feeder goroutine acquires one credit per dispatched chunk; credits are
+	// replenished exclusively when the coordinator consumes chunks in order.
 	go func() {
 		defer close(jobs)
 		for _, ref := range art.Chunks {
+			select {
+			case <-credits:
+			case <-workCtx.Done():
+				return
+			}
 			select {
 			case jobs <- ref:
 			case <-workCtx.Done():
@@ -601,6 +642,9 @@ func (c *Client) PullArtifactStream(ctx context.Context, m *ManifestV1, artifact
 			}
 			continue
 		}
+		if streamErr != nil {
+			continue
+		}
 		if ttftSet.CompareAndSwap(false, true) {
 			ttftNs.Store(time.Since(start).Nanoseconds())
 		}
@@ -620,8 +664,14 @@ func (c *Client) PullArtifactStream(ctx context.Context, m *ManifestV1, artifact
 			if _, err := sink.Write(buf); err != nil && streamErr == nil {
 				streamErr = err
 				cancel()
+				clear(reorder)
+				break
 			}
 			nextIdx++
+			select {
+			case credits <- struct{}{}:
+			case <-workCtx.Done():
+			}
 		}
 	}
 
@@ -641,6 +691,66 @@ func (c *Client) PullArtifactStream(ctx context.Context, m *ManifestV1, artifact
 	report.ArtifactRootBLAKE3[art.Path] = gotB3
 	report.ArtifactRootSHA256[art.Path] = gotS2
 	return report, nil
+}
+
+// openConfinedArtifactFile opens or creates relSlashPath strictly within root,
+// rejecting any symlink components along parent directories or the target file.
+func openConfinedArtifactFile(root *os.Root, relSlashPath string) (*os.File, error) {
+	if err := validateRelativePath(relSlashPath); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidManifest, err)
+	}
+	segments := strings.Split(relSlashPath, "/")
+	for i := range segments {
+		prefix := filepath.Join(segments[:i+1]...)
+		fi, err := root.Lstat(prefix)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				break
+			}
+			return nil, fmt.Errorf("modeldist: inspect artifact path %q: %w", relSlashPath, err)
+		}
+		if fi.Mode()&os.ModeSymlink != 0 {
+			return nil, fmt.Errorf("%w: refusing to traverse symlink %q in output directory", ErrInvalidManifest, prefix)
+		}
+		isLast := i == len(segments)-1
+		if !isLast && !fi.IsDir() {
+			return nil, fmt.Errorf("%w: parent path %q is not a directory", ErrInvalidManifest, prefix)
+		}
+		if isLast && !fi.Mode().IsRegular() {
+			return nil, fmt.Errorf("%w: target path %q is not a regular file", ErrInvalidManifest, prefix)
+		}
+	}
+
+	relPath := filepath.FromSlash(relSlashPath)
+	if relDir := filepath.Dir(relPath); relDir != "." {
+		if err := root.MkdirAll(relDir, 0o755); err != nil {
+			return nil, fmt.Errorf("modeldist: create artifact dir %q: %w", relDir, err)
+		}
+	}
+
+	f, err := root.OpenFile(relPath, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("modeldist: open artifact %q: %w", relSlashPath, err)
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	if !fi.Mode().IsRegular() {
+		_ = f.Close()
+		return nil, fmt.Errorf("%w: opened artifact %q is not a regular file", ErrInvalidManifest, relSlashPath)
+	}
+	lfi, err := root.Lstat(relPath)
+	if err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("modeldist: verify artifact %q: %w", relSlashPath, err)
+	}
+	if lfi.Mode()&os.ModeSymlink != 0 || !os.SameFile(fi, lfi) {
+		_ = f.Close()
+		return nil, fmt.Errorf("%w: artifact %q resolved through symlink", ErrInvalidManifest, relSlashPath)
+	}
+	return f, nil
 }
 
 func (c *Client) finalizeReport(

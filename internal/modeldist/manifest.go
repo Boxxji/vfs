@@ -43,8 +43,9 @@ const (
 	// MaxManifestBytes bounds untrusted manifest payloads read from mirrors.
 	MaxManifestBytes int64 = 16 << 20
 
-	cidDomainPrefix = "hanzo-vfs-modeldist-cid-v1\x00"
-	sigDomainPrefix = "hanzo-vfs-modeldist-manifest-v1\x00"
+	cidDomainPrefix        = "hanzo-vfs-modeldist-cid-v1\x00"
+	sigDomainPrefix        = "hanzo-vfs-modeldist-manifest-v1\x00"
+	refSegmentDomainPrefix = "hanzo-vfs-modeldist-ref-seg-v1\x00"
 )
 
 // AssetKind classifies artifacts inside a model distribution manifest.
@@ -285,6 +286,10 @@ type VerificationPolicy struct {
 // Verify checks structural integrity, content-addressed CID, Ed25519 signatures,
 // license compliance, semantic version constraints, and optional parent provenance.
 func (m *ManifestV1) Verify(policy VerificationPolicy) error {
+	return m.verifyWithVisited(policy, make(map[string]struct{}))
+}
+
+func (m *ManifestV1) verifyWithVisited(policy VerificationPolicy, visited map[string]struct{}) error {
 	if err := m.validateStructure(); err != nil {
 		return err
 	}
@@ -295,6 +300,11 @@ func (m *ManifestV1) Verify(policy VerificationPolicy) error {
 	if m.ManifestCID != cid {
 		return fmt.Errorf("%w: manifest_cid %s != computed %s", ErrManifestCIDMismatch, m.ManifestCID, cid)
 	}
+	if _, seen := visited[cid]; seen {
+		return fmt.Errorf("%w: cyclic provenance at %s", ErrProvenanceInvalid, cid)
+	}
+	visited[cid] = struct{}{}
+
 	if err := m.verifySignatures(policy); err != nil {
 		return err
 	}
@@ -305,27 +315,44 @@ func (m *ManifestV1) Verify(policy VerificationPolicy) error {
 		return err
 	}
 	if m.Provenance.ParentManifestCID != "" {
-		if !isHexDigest64(m.Provenance.ParentManifestCID) {
-			return fmt.Errorf("%w: invalid parent_manifest_cid %q", ErrProvenanceInvalid, m.Provenance.ParentManifestCID)
+		parentCID := m.Provenance.ParentManifestCID
+		if !isHexDigest64(parentCID) {
+			return fmt.Errorf("%w: invalid parent_manifest_cid %q", ErrProvenanceInvalid, parentCID)
 		}
-		if m.Provenance.ParentManifestCID == m.ManifestCID {
+		if parentCID == m.ManifestCID {
 			return fmt.Errorf("%w: self-referential parent_manifest_cid", ErrProvenanceInvalid)
 		}
+		if _, seen := visited[parentCID]; seen {
+			return fmt.Errorf("%w: cyclic provenance referencing %s", ErrProvenanceInvalid, parentCID)
+		}
 		if policy.ParentResolver != nil {
-			parent, err := policy.ParentResolver(m.Provenance.ParentManifestCID)
+			parent, err := policy.ParentResolver(parentCID)
 			if err != nil {
-				return fmt.Errorf("%w: resolve parent %s: %v", ErrProvenanceInvalid, m.Provenance.ParentManifestCID, err)
+				return fmt.Errorf("%w: resolve parent %s: %v", ErrProvenanceInvalid, parentCID, err)
+			}
+			if parent == nil {
+				return fmt.Errorf("%w: resolved nil parent %s", ErrProvenanceInvalid, parentCID)
+			}
+			// Verify the returned parent matches the requested CID before
+			// recursing so an untrusted resolver returning the child (or any
+			// wrong manifest) cannot trigger unbounded recursion.
+			if parent.ManifestCID != parentCID {
+				return fmt.Errorf("%w: parent CID mismatch (got %s, want %s)", ErrProvenanceInvalid, parent.ManifestCID, parentCID)
+			}
+			computedParentCID, err := parent.ComputeCID()
+			if err != nil {
+				return fmt.Errorf("%w: parent %s compute CID: %v", ErrProvenanceInvalid, parentCID, err)
+			}
+			if computedParentCID != parentCID {
+				return fmt.Errorf("%w: parent %s computed CID mismatch (got %s)", ErrProvenanceInvalid, parentCID, computedParentCID)
 			}
 			parentPolicy := policy
 			// Parent models may be older versions than derived fine-tunes/adapters.
 			parentPolicy.MinVersion = ""
 			parentPolicy.MaxVersion = ""
 			parentPolicy.ExactVersion = ""
-			if err := parent.Verify(parentPolicy); err != nil {
-				return fmt.Errorf("%w: parent %s failed verification: %v", ErrProvenanceInvalid, m.Provenance.ParentManifestCID, err)
-			}
-			if parent.ManifestCID != m.Provenance.ParentManifestCID {
-				return fmt.Errorf("%w: parent CID mismatch", ErrProvenanceInvalid)
+			if err := parent.verifyWithVisited(parentPolicy, visited); err != nil {
+				return fmt.Errorf("%w: parent %s failed verification: %v", ErrProvenanceInvalid, parentCID, err)
 			}
 		}
 	}
@@ -531,6 +558,11 @@ func ParseSemVer(s string) (SemVer, error) {
 		if pre == "" {
 			return SemVer{}, errors.New("empty prerelease")
 		}
+		for _, id := range strings.Split(pre, ".") {
+			if id == "" {
+				return SemVer{}, fmt.Errorf("empty prerelease identifier in %q", s)
+			}
+		}
 	}
 	parts := strings.Split(core, ".")
 	if len(parts) != 3 {
@@ -571,7 +603,61 @@ func (v SemVer) Compare(o SemVer) int {
 	if o.Prerelease == "" {
 		return -1
 	}
-	return strings.Compare(v.Prerelease, o.Prerelease)
+	return comparePrerelease(v.Prerelease, o.Prerelease)
+}
+
+// comparePrerelease implements SemVer 2.0.0 section 11.4 prerelease precedence:
+// dot-separated identifiers are compared left-to-right, purely numeric
+// identifiers are compared numerically, numeric identifiers sort below
+// non-numeric identifiers, and a shorter prefix sorts below a longer one.
+func comparePrerelease(a, b string) int {
+	ap := strings.Split(a, ".")
+	bp := strings.Split(b, ".")
+	n := len(ap)
+	if len(bp) < n {
+		n = len(bp)
+	}
+	for i := 0; i < n; i++ {
+		if ap[i] == bp[i] {
+			continue
+		}
+		aNum := isASCIIOnlyDigits(ap[i])
+		bNum := isASCIIOnlyDigits(bp[i])
+		switch {
+		case aNum && bNum:
+			if c := cmpNumericIdent(ap[i], bp[i]); c != 0 {
+				return c
+			}
+		case aNum && !bNum:
+			return -1
+		case !aNum && bNum:
+			return 1
+		default:
+			return strings.Compare(ap[i], bp[i])
+		}
+	}
+	return cmpInt(len(ap), len(bp))
+}
+
+func isASCIIOnlyDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func cmpNumericIdent(a, b string) int {
+	a = strings.TrimLeft(a, "0")
+	b = strings.TrimLeft(b, "0")
+	if len(a) != len(b) {
+		return cmpInt(len(a), len(b))
+	}
+	return strings.Compare(a, b)
 }
 
 func cmpInt(a, b int) int {
@@ -612,18 +698,34 @@ func ManifestKey(cidHex string) (string, error) {
 	return key, nil
 }
 
-// RefKey maps a logical (modelID, version) pair to a valid pkg/backend.Backend key.
+// RefKey maps a logical (modelID, version) pair to a valid pkg/backend.Backend
+// key while preserving distinct releases (e.g. "1.0.0-rc.1" vs "1.0.0-rc-1")
+// via a domain-separated BLAKE3 digest of each raw identifier.
 func RefKey(modelID, version string) (string, error) {
-	m := sanitizeKeySegment(modelID)
-	v := sanitizeKeySegment(version)
-	if m == "" || v == "" {
+	if strings.TrimSpace(modelID) == "" || strings.TrimSpace(version) == "" {
 		return "", fmt.Errorf("%w: invalid ref (%q, %q)", ErrInvalidManifest, modelID, version)
 	}
-	key := "model/ref/" + m + "/" + v
+	key := "model/ref/" + encodeRefSegment(modelID) + "/" + encodeRefSegment(version)
 	if err := backend.ValidKey(key); err != nil {
 		return "", err
 	}
 	return key, nil
+}
+
+func encodeRefSegment(raw string) string {
+	h := blake3.New()
+	_, _ = h.WriteString(refSegmentDomainPrefix)
+	_, _ = h.WriteString(raw)
+	digest := hex.EncodeToString(h.Sum(nil))
+
+	slug := sanitizeKeySegment(raw)
+	if len(slug) > 64 {
+		slug = strings.TrimRight(slug[:64], "-")
+	}
+	if slug == "" {
+		return digest
+	}
+	return slug + "-" + digest
 }
 
 // DigestChunk computes both BLAKE3 (internal/blake3) and SHA-256 hex digests for data.

@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/hanzoai/vfs/internal/modeldist"
@@ -277,12 +278,12 @@ func runMultiGiBThreeMirrors(ctx context.Context, modelGiB float64, chunkMiB, co
 	}
 
 	runtime.GC()
+	sampler := startHeapPeakSampler(10 * time.Millisecond)
 	rep, err := cli.PullArtifactStream(ctx, fetched, 0, providers, io.Discard)
+	peakHeapBytes, _ := sampler.Stop()
 	if err != nil {
 		return ScenarioResult{}, err
 	}
-	var ms runtime.MemStats
-	runtime.ReadMemStats(&ms)
 
 	decentPct := 0.0
 	if rep.DownloadedChunks > 0 {
@@ -305,10 +306,68 @@ func runMultiGiBThreeMirrors(ctx context.Context, modelGiB float64, chunkMiB, co
 		ThroughputMBps:     rep.ThroughputMBps,
 		ChunkP50Ms:         rep.ChunkLatencyP50Ms,
 		ChunkP99Ms:         rep.ChunkLatencyP99Ms,
-		PeakHeapMiB:        float64(ms.HeapInuse) / (1024 * 1024),
+		PeakHeapMiB:        float64(peakHeapBytes) / (1024 * 1024),
 		ProviderBreakdown:  rep.ProviderChunkCounts,
-		Notes:              "Every chunk verified with BLAKE3 + SHA-256 over real TCP loopback HTTP; bounded reorder window.",
+		Notes:              "Every chunk verified with BLAKE3 + SHA-256 over real TCP loopback HTTP; credit-bounded reorder window with continuous peak heap sampling.",
 	}, nil
+}
+
+// heapPeakSampler periodically samples runtime.MemStats during a transfer to
+// record the true high-water HeapInuse rather than a post-GC snapshot.
+type heapPeakSampler struct {
+	interval time.Duration
+	stopCh   chan struct{}
+	doneCh   chan struct{}
+	peak     atomic.Uint64
+	samples  atomic.Int64
+}
+
+func startHeapPeakSampler(interval time.Duration) *heapPeakSampler {
+	if interval <= 0 {
+		interval = 10 * time.Millisecond
+	}
+	s := &heapPeakSampler{
+		interval: interval,
+		stopCh:   make(chan struct{}),
+		doneCh:   make(chan struct{}),
+	}
+	s.sample()
+	go func() {
+		defer close(s.doneCh)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				s.sample()
+			case <-s.stopCh:
+				s.sample()
+				return
+			}
+		}
+	}()
+	return s
+}
+
+func (s *heapPeakSampler) sample() {
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+	s.samples.Add(1)
+	for {
+		cur := s.peak.Load()
+		if ms.HeapInuse <= cur {
+			return
+		}
+		if s.peak.CompareAndSwap(cur, ms.HeapInuse) {
+			return
+		}
+	}
+}
+
+func (s *heapPeakSampler) Stop() (peakBytes uint64, sampleCount int64) {
+	close(s.stopCh)
+	<-s.doneCh
+	return s.peak.Load(), s.samples.Load()
 }
 
 func makeSmallBundle(ctx context.Context, chunkSize int64) (*modeldist.ManifestV1, ed25519.PublicKey, ed25519.PrivateKey, *modeldist.VFSStoreProvider, string, error) {
