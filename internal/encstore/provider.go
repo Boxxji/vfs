@@ -37,6 +37,27 @@ import (
 	_ "github.com/hanzoai/vfs/pkg/backend/file"
 )
 
+const (
+	// MaxManifestSize bounds serialized SignedManifest size consistently across
+	// both PutArtifact (write) and GetVerifiedManifest (read).
+	MaxManifestSize int64 = 64 << 20
+
+	// MaxRevocationListSize bounds serialized SignedRevocationList size across
+	// both publication and retrieval.
+	MaxRevocationListSize int64 = 4 << 20
+
+	// MaxTombstoneSize bounds serialized DeletionTombstone size across both
+	// publication and retrieval.
+	MaxTombstoneSize int64 = 1 << 20
+
+	// MaxBundleIndexSize bounds serialized AuthorizedBundleIndex size across
+	// both export and restore.
+	MaxBundleIndexSize int64 = 4 << 20
+
+	// maxHTTPBodySize caps a single HTTPNodeServer PUT request body.
+	maxHTTPBodySize int64 = 128 << 20
+)
+
 // FaultMode injects deterministic storage-provider faults for adversarial
 // integrity and resilience testing.
 type FaultMode int
@@ -232,9 +253,13 @@ func (n *HTTPNodeServer) handleObj(w http.ResponseWriter, r *http.Request) {
 
 	case http.MethodPut:
 		n.puts.Add(1)
-		body, err := io.ReadAll(io.LimitReader(r.Body, 128<<20))
+		body, err := io.ReadAll(io.LimitReader(r.Body, maxHTTPBodySize+1))
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if int64(len(body)) > maxHTTPBodySize {
+			http.Error(w, "object too large", http.StatusRequestEntityTooLarge)
 			return
 		}
 		n.bytesRecv.Add(int64(len(body)))
@@ -245,11 +270,37 @@ func (n *HTTPNodeServer) handleObj(w http.ResponseWriter, r *http.Request) {
 					http.Error(w, "conflict", http.StatusPreconditionFailed)
 					return
 				}
+				if errors.Is(err, backend.ErrTooLarge) {
+					http.Error(w, "too large", http.StatusRequestEntityTooLarge)
+					return
+				}
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
 			w.Header().Set("ETag", string(ver))
 			w.WriteHeader(http.StatusCreated)
+			return
+		}
+		if vals, hasIfMatch := r.Header["If-Match"]; hasIfMatch {
+			expected := ""
+			if len(vals) > 0 {
+				expected = vals[0]
+			}
+			ver, err := n.store.PutIfVersion(ctx, key, body, backend.Version(expected))
+			if err != nil {
+				if errors.Is(err, backend.ErrConflict) {
+					http.Error(w, "conflict", http.StatusPreconditionFailed)
+					return
+				}
+				if errors.Is(err, backend.ErrTooLarge) {
+					http.Error(w, "too large", http.StatusRequestEntityTooLarge)
+					return
+				}
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("ETag", string(ver))
+			w.WriteHeader(http.StatusOK)
 			return
 		}
 		if err := n.store.Put(ctx, key, body); err != nil {
@@ -411,18 +462,46 @@ func (b *HTTPBackend) PutIfAbsent(ctx context.Context, key string, data []byte) 
 	if resp.StatusCode == http.StatusPreconditionFailed {
 		return "", backend.ErrConflict
 	}
+	if resp.StatusCode == http.StatusRequestEntityTooLarge {
+		return "", backend.ErrTooLarge
+	}
 	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("http backend put-if-absent %s: status %d", key, resp.StatusCode)
 	}
 	return backend.Version(resp.Header.Get("ETag")), nil
 }
 
-func (b *HTTPBackend) PutIfVersion(ctx context.Context, key string, data []byte, _ backend.Version) (backend.Version, error) {
-	if err := b.Put(ctx, key, data); err != nil {
+func (b *HTTPBackend) PutIfVersion(ctx context.Context, key string, data []byte, expected backend.Version) (backend.Version, error) {
+	if err := backend.ValidKey(key); err != nil {
 		return "", err
 	}
-	sum := blake3.Sum(data)
-	return backend.Version(hex.EncodeToString(sum[:])), nil
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, b.objURL(key), bytes.NewReader(data))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("If-Match", string(expected))
+	req.ContentLength = int64(len(data))
+	resp, err := b.client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode == http.StatusPreconditionFailed {
+		return "", backend.ErrConflict
+	}
+	if resp.StatusCode == http.StatusRequestEntityTooLarge {
+		return "", backend.ErrTooLarge
+	}
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		return "", fmt.Errorf("http backend put-if-version %s: status %d", key, resp.StatusCode)
+	}
+	ver := backend.Version(resp.Header.Get("ETag"))
+	if ver == "" {
+		sum := blake3.Sum(data)
+		ver = backend.Version(hex.EncodeToString(sum[:]))
+	}
+	return ver, nil
 }
 
 func (b *HTTPBackend) Delete(ctx context.Context, key string) error {
@@ -767,7 +846,7 @@ func (s *ReplicatedStore) GetVerifiedManifest(ctx context.Context, manifestCID s
 	}
 	var lastErr error
 	for _, ep := range s.nodes {
-		raw, _, err := ep.Backend.Get(ctx, key, 16<<20)
+		raw, _, err := ep.Backend.Get(ctx, key, MaxManifestSize)
 		if err != nil {
 			lastErr = err
 			continue
@@ -794,59 +873,210 @@ func (s *ReplicatedStore) GetVerifiedManifest(ctx context.Context, manifestCID s
 	if lastErr == nil {
 		lastErr = backend.ErrNotFound
 	}
-	return nil, nil, fmt.Errorf("%w: manifest %s: %v", ErrAllReplicasFailed, manifestCID[:12], lastErr)
+	return nil, nil, fmt.Errorf("%w: manifest %s: %w", ErrAllReplicasFailed, manifestCID[:12], lastErr)
+}
+
+func revocationNewer(a, b *SignedRevocationList) bool {
+	return a.Seq > b.Seq || (a.Seq == b.Seq && a.CurrentEpoch > b.CurrentEpoch)
+}
+
+// PutRevocationQuorum publishes revList monotonically across all replicas using
+// conditional compare-and-swap (PutIfAbsent / PutIfVersion) so a delayed or
+// stale publication can never overwrite a higher-sequence valid revocation list.
+func (s *ReplicatedStore) PutRevocationQuorum(ctx context.Context, ownerKeyID string, ownerEdPub ed25519.PublicKey, revList *SignedRevocationList) (int, error) {
+	key, err := RevocationKey(ownerKeyID)
+	if err != nil {
+		return 0, err
+	}
+	if err := revList.Verify(ownerEdPub); err != nil {
+		return 0, err
+	}
+	if revList.Owner.KeyID != ownerKeyID {
+		return 0, fmt.Errorf("%w: revocation list owner %q != %q", ErrUntrustedOwner, revList.Owner.KeyID, ownerKeyID)
+	}
+	raw, err := json.Marshal(revList)
+	if err != nil {
+		return 0, err
+	}
+	if int64(len(raw)) > MaxRevocationListSize {
+		return 0, fmt.Errorf("%w: revocation list size %d exceeds limit %d", backend.ErrTooLarge, len(raw), MaxRevocationListSize)
+	}
+
+	var (
+		wg        sync.WaitGroup
+		mu        sync.Mutex
+		okCount   int
+		errs      []error
+		staleErrs []error
+	)
+	for _, node := range s.nodes {
+		wg.Add(1)
+		go func(ep NodeEndpoint) {
+			defer wg.Done()
+			if err := s.putRevocationOnNode(ctx, ep, key, ownerKeyID, ownerEdPub, revList, raw); err != nil {
+				mu.Lock()
+				if errors.Is(err, ErrStaleRevocation) {
+					staleErrs = append(staleErrs, err)
+				} else {
+					errs = append(errs, fmt.Errorf("%s: %w", ep.Name, err))
+				}
+				mu.Unlock()
+				return
+			}
+			mu.Lock()
+			okCount++
+			mu.Unlock()
+		}(node)
+	}
+	wg.Wait()
+	if len(staleErrs) > 0 {
+		return okCount, fmt.Errorf("%w: %v", ErrStaleRevocation, errors.Join(staleErrs...))
+	}
+	if okCount < s.writeQuorum {
+		return okCount, fmt.Errorf("%w: wrote revocation list to %d/%d (need %d): %v", ErrQuorumFailed, okCount, len(s.nodes), s.writeQuorum, errors.Join(errs...))
+	}
+	return okCount, nil
+}
+
+func (s *ReplicatedStore) putRevocationOnNode(ctx context.Context, ep NodeEndpoint, key, ownerKeyID string, ownerEdPub ed25519.PublicKey, revList *SignedRevocationList, raw []byte) error {
+	const maxCASAttempts = 8
+	for attempt := 0; attempt < maxCASAttempts; attempt++ {
+		curRaw, curVer, err := ep.Backend.Get(ctx, key, MaxRevocationListSize)
+		if err != nil {
+			if errors.Is(err, backend.ErrNotFound) {
+				_, putErr := ep.Backend.PutIfAbsent(ctx, key, raw)
+				if putErr == nil {
+					return nil
+				}
+				if errors.Is(putErr, backend.ErrConflict) {
+					continue
+				}
+				return putErr
+			}
+			return err
+		}
+		var cur SignedRevocationList
+		if json.Unmarshal(curRaw, &cur) == nil && cur.Verify(ownerEdPub) == nil && cur.Owner.KeyID == ownerKeyID {
+			if revocationNewer(&cur, revList) {
+				return fmt.Errorf("%w: %s holds seq=%d epoch=%d, refusing seq=%d epoch=%d",
+					ErrStaleRevocation, ep.Name, cur.Seq, cur.CurrentEpoch, revList.Seq, revList.CurrentEpoch)
+			}
+			if cur.Seq == revList.Seq && cur.CurrentEpoch == revList.CurrentEpoch {
+				if bytes.Equal(curRaw, raw) {
+					return nil
+				}
+				return fmt.Errorf("%w: %s holds conflicting revocation list at seq=%d epoch=%d",
+					ErrStaleRevocation, ep.Name, cur.Seq, cur.CurrentEpoch)
+			}
+		}
+		_, putErr := ep.Backend.PutIfVersion(ctx, key, raw, curVer)
+		if putErr == nil {
+			return nil
+		}
+		if errors.Is(putErr, backend.ErrConflict) {
+			continue
+		}
+		return putErr
+	}
+	return fmt.Errorf("%w: %s exceeded CAS retry limit", ErrStaleRevocation, ep.Name)
 }
 
 // GetLatestRevocationList fetches the highest-Seq valid SignedRevocationList
-// signed by ownerEdPub across all reachable nodes. Returns (nil, nil) if none exists.
+// signed by ownerEdPub across all reachable nodes. Returns (nil, nil) only when
+// every replica reports genuine absence (backend.ErrNotFound); fails closed
+// with an error if no valid record could be obtained after retrieval or
+// verification failures.
 func (s *ReplicatedStore) GetLatestRevocationList(ctx context.Context, ownerKeyID string, ownerEdPub ed25519.PublicKey) (*SignedRevocationList, error) {
 	key, err := RevocationKey(ownerKeyID)
 	if err != nil {
 		return nil, err
 	}
-	var best *SignedRevocationList
+	var (
+		best       *SignedRevocationList
+		hadFailure bool
+		lastErr    error
+	)
 	for _, ep := range s.nodes {
-		raw, _, err := ep.Backend.Get(ctx, key, 4<<20)
+		raw, _, err := ep.Backend.Get(ctx, key, MaxRevocationListSize)
 		if err != nil {
+			if errors.Is(err, backend.ErrNotFound) {
+				continue
+			}
+			hadFailure = true
+			lastErr = fmt.Errorf("%s: %w", ep.Name, err)
 			continue
 		}
 		var r SignedRevocationList
 		if err := json.Unmarshal(raw, &r); err != nil {
+			hadFailure = true
+			lastErr = fmt.Errorf("%w: %s: %v", ErrInvalidManifest, ep.Name, err)
 			continue
 		}
 		if err := r.Verify(ownerEdPub); err != nil {
+			hadFailure = true
+			lastErr = fmt.Errorf("%s: %w", ep.Name, err)
 			continue
 		}
-		if best == nil || r.Seq > best.Seq || (r.Seq == best.Seq && r.CurrentEpoch > best.CurrentEpoch) {
+		if r.Owner.KeyID != ownerKeyID {
+			hadFailure = true
+			lastErr = fmt.Errorf("%w: %s revocation list owner %q != %q", ErrUntrustedOwner, ep.Name, r.Owner.KeyID, ownerKeyID)
+			continue
+		}
+		if best == nil || revocationNewer(&r, best) {
 			copyR := r
 			best = &copyR
 		}
+	}
+	if best == nil && hadFailure {
+		return nil, fmt.Errorf("%w: revocation list for %s: %w", ErrAllReplicasFailed, ownerKeyID, lastErr)
 	}
 	return best, nil
 }
 
 // GetTombstone fetches and verifies any owner-signed DeletionTombstone for
-// artifactID across all reachable nodes. Returns (nil, nil) if none exists.
+// artifactID across all reachable nodes. Returns (nil, nil) only when every
+// replica reports genuine absence (backend.ErrNotFound); fails closed with an
+// error if no valid tombstone could be obtained after retrieval or verification
+// failures.
 func (s *ReplicatedStore) GetTombstone(ctx context.Context, artifactID string, ownerEdPub ed25519.PublicKey) (*DeletionTombstone, error) {
 	key, err := TombstoneKey(artifactID)
 	if err != nil {
 		return nil, err
 	}
+	var (
+		hadFailure bool
+		lastErr    error
+	)
 	for _, ep := range s.nodes {
-		raw, _, err := ep.Backend.Get(ctx, key, 1<<20)
+		raw, _, err := ep.Backend.Get(ctx, key, MaxTombstoneSize)
 		if err != nil {
+			if errors.Is(err, backend.ErrNotFound) {
+				continue
+			}
+			hadFailure = true
+			lastErr = fmt.Errorf("%s: %w", ep.Name, err)
 			continue
 		}
 		var t DeletionTombstone
 		if err := json.Unmarshal(raw, &t); err != nil {
+			hadFailure = true
+			lastErr = fmt.Errorf("%w: %s: %v", ErrInvalidManifest, ep.Name, err)
 			continue
 		}
 		if err := t.Verify(ownerEdPub); err != nil {
+			hadFailure = true
+			lastErr = fmt.Errorf("%s: %w", ep.Name, err)
 			continue
 		}
-		if t.ArtifactID == artifactID {
-			return &t, nil
+		if t.ArtifactID != artifactID {
+			hadFailure = true
+			lastErr = fmt.Errorf("%w: %s tombstone artifact_id %q != %q", ErrInvalidManifest, ep.Name, t.ArtifactID, artifactID)
+			continue
 		}
+		return &t, nil
+	}
+	if hadFailure {
+		return nil, fmt.Errorf("%w: tombstone for %s: %w", ErrAllReplicasFailed, artifactID, lastErr)
 	}
 	return nil, nil
 }

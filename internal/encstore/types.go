@@ -47,6 +47,7 @@ var (
 	ErrPlaintextMismatch = errors.New("encstore: decrypted plaintext digest mismatch")
 	ErrAllReplicasFailed = errors.New("encstore: all storage replicas failed or returned corrupted data")
 	ErrQuorumFailed      = errors.New("encstore: replication write quorum not met")
+	ErrStaleRevocation   = errors.New("encstore: stale revocation list cannot replace newer sequence")
 )
 
 // ArtifactKind enumerates the five portable decentralized artifact kinds
@@ -463,12 +464,15 @@ func (m *SignedManifest) FindEnvelope(recipientKeyID string) (KeyEnvelope, bool)
 }
 
 // RevocationEntry records when a peer was revoked and the first epoch in which
-// the peer MUST NOT receive key envelopes.
+// the peer MUST NOT receive key envelopes. If the peer is later reauthorized at
+// a strictly newer epoch, ReauthorizedAtEpoch records the first epoch in which
+// access resumes while preserving revocation for earlier revoked epochs.
 type RevocationEntry struct {
-	PeerKeyID      string    `json:"peer_key_id"`
-	RevokedAtEpoch uint64    `json:"revoked_at_epoch"`
-	RevokedAt      time.Time `json:"revoked_at"`
-	Reason         string    `json:"reason,omitempty"`
+	PeerKeyID           string    `json:"peer_key_id"`
+	RevokedAtEpoch      uint64    `json:"revoked_at_epoch"`
+	ReauthorizedAtEpoch uint64    `json:"reauthorized_at_epoch,omitempty"`
+	RevokedAt           time.Time `json:"revoked_at"`
+	Reason              string    `json:"reason,omitempty"`
 }
 
 // SignedRevocationList is the owner-signed list of revoked peers (by epoch)
@@ -518,6 +522,11 @@ func (r *SignedRevocationList) Verify(expectedOwnerEdPub ed25519.PublicKey) erro
 	if len(expectedOwnerEdPub) > 0 && !slices.Equal(ownerEdPub, expectedOwnerEdPub) {
 		return fmt.Errorf("%w: revocation list signed by unexpected owner", ErrUntrustedOwner)
 	}
+	for _, entry := range r.RevokedPeers {
+		if entry.ReauthorizedAtEpoch != 0 && entry.ReauthorizedAtEpoch <= entry.RevokedAtEpoch {
+			return fmt.Errorf("%w: invalid revocation epoch interval [%d, %d) for peer %s", ErrInvalidManifest, entry.RevokedAtEpoch, entry.ReauthorizedAtEpoch, entry.PeerKeyID)
+		}
+	}
 	sig, err := hex.DecodeString(r.SignatureHex)
 	if err != nil || len(sig) != ed25519.SignatureSize {
 		return fmt.Errorf("%w: invalid revocation list signature hex", ErrBadSignature)
@@ -532,13 +541,15 @@ func (r *SignedRevocationList) Verify(expectedOwnerEdPub ed25519.PublicKey) erro
 	return nil
 }
 
-// IsPeerRevoked reports whether peerKeyID was revoked at or before epoch.
+// IsPeerRevoked reports whether peerKeyID is revoked for epoch (i.e. revoked at
+// or before epoch and not subsequently reauthorized at or before epoch).
 func (r *SignedRevocationList) IsPeerRevoked(peerKeyID string, epoch uint64) bool {
 	if r == nil {
 		return false
 	}
 	for _, entry := range r.RevokedPeers {
-		if entry.PeerKeyID == peerKeyID && epoch >= entry.RevokedAtEpoch {
+		if entry.PeerKeyID == peerKeyID && epoch >= entry.RevokedAtEpoch &&
+			(entry.ReauthorizedAtEpoch == 0 || epoch < entry.ReauthorizedAtEpoch) {
 			return true
 		}
 	}

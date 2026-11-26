@@ -17,6 +17,7 @@ package encstore
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -40,6 +41,10 @@ const (
 
 	// MaxChunkSize caps per-chunk memory (4 MiB).
 	MaxChunkSize = 4 << 20
+
+	// minManifestBytesPerChunk is a conservative lower bound on serialized
+	// manifest bytes added per chunk (CipherChunkRef + encrypted PlainChunkMeta).
+	minManifestBytesPerChunk = 256
 )
 
 // Vault manages an owner's cryptographic identity, monotonic key epoch,
@@ -48,17 +53,24 @@ const (
 type Vault struct {
 	owner *Identity
 
+	revPubMu sync.Mutex // serializes revocation sync, mutation, and publication (lock order: revPubMu -> mu)
+
 	mu              sync.Mutex
 	currentEpoch    uint64
 	revSeq          uint64
+	revDirty        bool
+	revDirtyGen     uint64
 	authorizedPeers map[string]PublicIdentity
-	revokedPeers    map[string]RevocationEntry
+	pendingReauth   map[string]struct{}
+	revokedPeers    map[string][]RevocationEntry
 	revokedConsents map[string]struct{}
 	localDEKCache   map[string][][]byte // artifactID -> cached DEKs (zeroed on CryptoShred)
 	artifactHistory map[string][]string // artifactID -> manifestCIDs written by this vault
 }
 
-// NewVault creates a new Vault at epoch 1 for owner.
+// NewVault creates a new Vault at epoch 1 for owner. Any existing persisted
+// revocation state for owner in a ReplicatedStore is automatically loaded and
+// merged before mutations or artifact writes.
 func NewVault(owner *Identity) (*Vault, error) {
 	if owner == nil {
 		return nil, errors.New("encstore: nil owner identity")
@@ -67,7 +79,8 @@ func NewVault(owner *Identity) (*Vault, error) {
 		owner:           owner,
 		currentEpoch:    1,
 		authorizedPeers: make(map[string]PublicIdentity),
-		revokedPeers:    make(map[string]RevocationEntry),
+		pendingReauth:   make(map[string]struct{}),
+		revokedPeers:    make(map[string][]RevocationEntry),
 		revokedConsents: make(map[string]struct{}),
 		localDEKCache:   make(map[string][][]byte),
 		artifactHistory: make(map[string][]string),
@@ -85,8 +98,9 @@ func (v *Vault) CurrentEpoch() uint64 {
 }
 
 // AuthorizePeer grants peer decryption access for future artifacts written by
-// this vault. If peer was previously revoked, re-authorization requires a
-// strictly newer epoch (caller must explicitly re-authorize).
+// this vault. If peer was previously revoked, re-authorization advances to a
+// strictly newer epoch and marks the updated authorization state for
+// publication to the replicated store before any subsequent write.
 func (v *Vault) AuthorizePeer(peer PublicIdentity) error {
 	if _, _, err := peer.Validate(); err != nil {
 		return err
@@ -94,7 +108,54 @@ func (v *Vault) AuthorizePeer(peer PublicIdentity) error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	v.authorizedPeers[peer.KeyID] = peer
-	delete(v.revokedPeers, peer.KeyID)
+	v.pendingReauth[peer.KeyID] = struct{}{}
+	if closeOpenPeerRevocation(v.revokedPeers, peer.KeyID, v.currentEpoch+1) {
+		v.currentEpoch++
+		v.revDirty = true
+		v.revDirtyGen++
+	}
+	return nil
+}
+
+// ReauthorizePeer authorizes peer and immediately syncs, advances the epoch if
+// peer was previously revoked, and publishes the updated SignedRevocationList
+// across store.
+func (v *Vault) ReauthorizePeer(ctx context.Context, store *ReplicatedStore, peer PublicIdentity) (*SignedRevocationList, error) {
+	if _, _, err := peer.Validate(); err != nil {
+		return nil, err
+	}
+	return v.mutateAndPublishRevocation(ctx, store,
+		func(cand *vaultRevState) bool {
+			cand.authorizedPeers[peer.KeyID] = peer
+			delete(cand.pendingReauth, peer.KeyID)
+			if closeOpenPeerRevocation(cand.revokedPeers, peer.KeyID, cand.currentEpoch+1) {
+				cand.currentEpoch++
+				cand.revDirty = true
+			}
+			return cand.revDirty
+		},
+		func(cand *vaultRevState) {
+			v.authorizedPeers[peer.KeyID] = peer
+			delete(v.pendingReauth, peer.KeyID)
+		},
+	)
+}
+
+// SyncRevocationState loads and merges the owner's authenticated persisted
+// SignedRevocationList from store into this vault.
+func (v *Vault) SyncRevocationState(ctx context.Context, store *ReplicatedStore) error {
+	if store == nil {
+		return nil
+	}
+	v.revPubMu.Lock()
+	defer v.revPubMu.Unlock()
+	persisted, err := store.GetLatestRevocationList(ctx, v.owner.KeyID, v.owner.Ed25519Pub)
+	if err != nil {
+		return err
+	}
+	v.mu.Lock()
+	v.mergeRevocationListLocked(persisted)
+	v.mu.Unlock()
 	return nil
 }
 
@@ -186,9 +247,19 @@ func (v *Vault) PutArtifact(ctx context.Context, store *ReplicatedStore, req Put
 	if chunkSize > MaxChunkSize {
 		chunkSize = MaxChunkSize
 	}
+	numChunks := (len(req.Data) + chunkSize - 1) / chunkSize
+	if int64(numChunks) > MaxManifestSize/minManifestBytesPerChunk {
+		return nil, fmt.Errorf("%w: %w: %d chunks would exceed max manifest size %d (increase chunk_size)", ErrInvalidManifest, backend.ErrTooLarge, numChunks, MaxManifestSize)
+	}
 	workers := req.Concurrency
 	if workers <= 0 {
 		workers = min(max(runtime.GOMAXPROCS(0), 2), 8)
+	}
+
+	// Load any persisted revocation state and publish any pending peer
+	// reauthorizations before snapshotting epoch and recipient envelopes.
+	if err := v.syncAndPublishAuthState(ctx, store); err != nil {
+		return nil, err
 	}
 
 	// Snapshot epoch and authorized recipients deterministically.
@@ -224,7 +295,6 @@ func (v *Vault) PutArtifact(ctx context.Context, store *ReplicatedStore, req Put
 	ptRootB3Hex := hex.EncodeToString(ptRootB3[:])
 	ptRootS256Hex := hex.EncodeToString(ptRootS256[:])
 
-	numChunks := (len(req.Data) + chunkSize - 1) / chunkSize
 	cipherRefs := make([]CipherChunkRef, numChunks)
 	plainMetas := make([]PlainChunkMeta, numChunks)
 	cipherFrames := make([][]byte, numChunks)
@@ -362,6 +432,10 @@ func (v *Vault) PutArtifact(ctx context.Context, store *ReplicatedStore, req Put
 		zeroBytes(dek)
 		return nil, err
 	}
+	if int64(len(manifestBytes)) > MaxManifestSize {
+		zeroBytes(dek)
+		return nil, fmt.Errorf("%w: %w: serialized manifest size %d exceeds limit %d (increase chunk_size)", ErrInvalidManifest, backend.ErrTooLarge, len(manifestBytes), MaxManifestSize)
+	}
 
 	// Replicate ciphertext chunks concurrently across independent storage nodes.
 	repStart := time.Now()
@@ -471,7 +545,7 @@ func (v *Vault) PutArtifact(ctx context.Context, store *ReplicatedStore, req Put
 
 // RevokePeer removes peerKeyID from future key distribution, increments the
 // vault's key epoch, signs an updated SignedRevocationList, and replicates it
-// to all independent nodes in store.
+// monotonically to all independent nodes in store.
 func (v *Vault) RevokePeer(ctx context.Context, store *ReplicatedStore, peerKeyID, reason string) (*SignedRevocationList, error) {
 	if err := ValidateSegment(peerKeyID); err != nil {
 		return nil, err
@@ -479,62 +553,192 @@ func (v *Vault) RevokePeer(ctx context.Context, store *ReplicatedStore, peerKeyI
 	if peerKeyID == v.owner.KeyID {
 		return nil, errors.New("encstore: owner cannot revoke self")
 	}
-	v.mu.Lock()
-	delete(v.authorizedPeers, peerKeyID)
-	v.currentEpoch++
-	v.revSeq++
-	v.revokedPeers[peerKeyID] = RevocationEntry{
-		PeerKeyID:      peerKeyID,
-		RevokedAtEpoch: v.currentEpoch,
-		RevokedAt:      time.Now().UTC(),
-		Reason:         reason,
-	}
-	revList := v.buildRevocationListLocked()
-	v.mu.Unlock()
-
-	if err := revList.Sign(v.owner); err != nil {
-		return nil, err
-	}
-	if store != nil {
-		if err := v.publishRevocationList(ctx, store, revList); err != nil {
-			return nil, err
-		}
-	}
-	return revList, nil
+	return v.mutateAndPublishRevocation(ctx, store,
+		func(cand *vaultRevState) bool {
+			delete(cand.authorizedPeers, peerKeyID)
+			delete(cand.pendingReauth, peerKeyID)
+			cand.currentEpoch++
+			now := time.Now().UTC()
+			entries := cand.revokedPeers[peerKeyID]
+			updated := false
+			for i := range entries {
+				if entries[i].ReauthorizedAtEpoch == 0 {
+					entries[i].RevokedAt = now
+					entries[i].Reason = reason
+					updated = true
+					break
+				}
+			}
+			if !updated {
+				entries = append(entries, RevocationEntry{
+					PeerKeyID:      peerKeyID,
+					RevokedAtEpoch: cand.currentEpoch,
+					RevokedAt:      now,
+					Reason:         reason,
+				})
+			}
+			cand.revokedPeers[peerKeyID] = entries
+			return true
+		},
+		func(cand *vaultRevState) {
+			delete(v.authorizedPeers, peerKeyID)
+			delete(v.pendingReauth, peerKeyID)
+		},
+	)
 }
 
 // RevokeConsent marks consentID as revoked in the owner's SignedRevocationList
-// and replicates the updated revocation list across store.
+// and replicates the updated revocation list monotonically across store.
 func (v *Vault) RevokeConsent(ctx context.Context, store *ReplicatedStore, consentID string) (*SignedRevocationList, error) {
 	if err := ValidateSegment(consentID); err != nil {
 		return nil, err
 	}
-	v.mu.Lock()
-	v.revokedConsents[consentID] = struct{}{}
-	v.revSeq++
-	revList := v.buildRevocationListLocked()
-	v.mu.Unlock()
-
-	if err := revList.Sign(v.owner); err != nil {
-		return nil, err
-	}
-	if store != nil {
-		if err := v.publishRevocationList(ctx, store, revList); err != nil {
-			return nil, err
-		}
-	}
-	return revList, nil
+	return v.mutateAndPublishRevocation(ctx, store,
+		func(cand *vaultRevState) bool {
+			cand.revokedConsents[consentID] = struct{}{}
+			return true
+		},
+		nil,
+	)
 }
 
-func (v *Vault) buildRevocationListLocked() *SignedRevocationList {
-	peers := make([]RevocationEntry, 0, len(v.revokedPeers))
-	for _, entry := range v.revokedPeers {
-		peers = append(peers, entry)
-	}
-	sort.Slice(peers, func(i, j int) bool { return peers[i].PeerKeyID < peers[j].PeerKeyID })
+type vaultRevState struct {
+	currentEpoch    uint64
+	revSeq          uint64
+	revDirty        bool
+	revDirtyGen     uint64
+	authorizedPeers map[string]PublicIdentity
+	pendingReauth   map[string]struct{}
+	revokedPeers    map[string][]RevocationEntry
+	revokedConsents map[string]struct{}
+}
 
-	consents := make([]string, 0, len(v.revokedConsents))
-	for cid := range v.revokedConsents {
+func (v *Vault) snapshotRevStateLocked() vaultRevState {
+	auth := make(map[string]PublicIdentity, len(v.authorizedPeers))
+	for k, p := range v.authorizedPeers {
+		auth[k] = p
+	}
+	pending := make(map[string]struct{}, len(v.pendingReauth))
+	for k := range v.pendingReauth {
+		pending[k] = struct{}{}
+	}
+	revPeers := make(map[string][]RevocationEntry, len(v.revokedPeers))
+	for k, list := range v.revokedPeers {
+		cp := make([]RevocationEntry, len(list))
+		copy(cp, list)
+		revPeers[k] = cp
+	}
+	revConsents := make(map[string]struct{}, len(v.revokedConsents))
+	for k := range v.revokedConsents {
+		revConsents[k] = struct{}{}
+	}
+	return vaultRevState{
+		currentEpoch:    v.currentEpoch,
+		revSeq:          v.revSeq,
+		revDirty:        v.revDirty,
+		revDirtyGen:     v.revDirtyGen,
+		authorizedPeers: auth,
+		pendingReauth:   pending,
+		revokedPeers:    revPeers,
+		revokedConsents: revConsents,
+	}
+}
+
+func hasOpenPeerRevocation(revokedPeers map[string][]RevocationEntry, peerKeyID string) bool {
+	for _, entry := range revokedPeers[peerKeyID] {
+		if entry.ReauthorizedAtEpoch == 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func closeOpenPeerRevocation(revokedPeers map[string][]RevocationEntry, peerKeyID string, reauthEpoch uint64) bool {
+	entries := revokedPeers[peerKeyID]
+	changed := false
+	for i := range entries {
+		if entries[i].ReauthorizedAtEpoch == 0 {
+			eff := reauthEpoch
+			if eff <= entries[i].RevokedAtEpoch {
+				eff = entries[i].RevokedAtEpoch + 1
+			}
+			entries[i].ReauthorizedAtEpoch = eff
+			changed = true
+		}
+	}
+	if changed {
+		revokedPeers[peerKeyID] = entries
+	}
+	return changed
+}
+
+func mergeRevocationEntries(dst map[string][]RevocationEntry, entries []RevocationEntry) {
+	for _, pEntry := range entries {
+		list := dst[pEntry.PeerKeyID]
+		matched := false
+		for i := range list {
+			if list[i].RevokedAtEpoch == pEntry.RevokedAtEpoch {
+				if pEntry.ReauthorizedAtEpoch != 0 &&
+					(list[i].ReauthorizedAtEpoch == 0 || pEntry.ReauthorizedAtEpoch > list[i].ReauthorizedAtEpoch) {
+					list[i].ReauthorizedAtEpoch = pEntry.ReauthorizedAtEpoch
+				}
+				if list[i].Reason == "" && pEntry.Reason != "" {
+					list[i].Reason = pEntry.Reason
+				}
+				if list[i].RevokedAt.IsZero() && !pEntry.RevokedAt.IsZero() {
+					list[i].RevokedAt = pEntry.RevokedAt
+				}
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			list = append(list, pEntry)
+			sort.Slice(list, func(i, j int) bool {
+				return list[i].RevokedAtEpoch < list[j].RevokedAtEpoch
+			})
+		}
+		dst[pEntry.PeerKeyID] = list
+	}
+}
+
+func (v *Vault) mergeRevocationListLocked(persisted *SignedRevocationList) {
+	if persisted == nil {
+		return
+	}
+	if persisted.CurrentEpoch > v.currentEpoch {
+		v.currentEpoch = persisted.CurrentEpoch
+	}
+	if persisted.Seq > v.revSeq {
+		v.revSeq = persisted.Seq
+	}
+	for _, cid := range persisted.RevokedConsents {
+		v.revokedConsents[cid] = struct{}{}
+	}
+	mergeRevocationEntries(v.revokedPeers, persisted.RevokedPeers)
+	for _, entry := range persisted.RevokedPeers {
+		if entry.ReauthorizedAtEpoch == 0 && hasOpenPeerRevocation(v.revokedPeers, entry.PeerKeyID) {
+			if _, reauthing := v.pendingReauth[entry.PeerKeyID]; !reauthing {
+				delete(v.authorizedPeers, entry.PeerKeyID)
+			}
+		}
+	}
+}
+
+func (v *Vault) buildRevocationListFromState(s vaultRevState) *SignedRevocationList {
+	var peers []RevocationEntry
+	for _, list := range s.revokedPeers {
+		peers = append(peers, list...)
+	}
+	sort.Slice(peers, func(i, j int) bool {
+		if peers[i].PeerKeyID != peers[j].PeerKeyID {
+			return peers[i].PeerKeyID < peers[j].PeerKeyID
+		}
+		return peers[i].RevokedAtEpoch < peers[j].RevokedAtEpoch
+	})
+
+	consents := make([]string, 0, len(s.revokedConsents))
+	for cid := range s.revokedConsents {
 		consents = append(consents, cid)
 	}
 	sort.Strings(consents)
@@ -542,24 +746,147 @@ func (v *Vault) buildRevocationListLocked() *SignedRevocationList {
 	return &SignedRevocationList{
 		Version:         FormatVersion,
 		Owner:           v.owner.Public("owner"),
-		CurrentEpoch:    v.currentEpoch,
-		Seq:             v.revSeq,
+		CurrentEpoch:    s.currentEpoch,
+		Seq:             s.revSeq,
 		RevokedPeers:    peers,
 		RevokedConsents: consents,
 		UpdatedAt:       time.Now().UTC(),
 	}
 }
 
+func (v *Vault) syncAndPublishAuthState(ctx context.Context, store *ReplicatedStore) error {
+	if store == nil {
+		return nil
+	}
+	_, err := v.mutateAndPublishRevocation(ctx, store,
+		func(cand *vaultRevState) bool {
+			pendingIDs := make([]string, 0, len(cand.pendingReauth))
+			for pid := range cand.pendingReauth {
+				pendingIDs = append(pendingIDs, pid)
+			}
+			sort.Strings(pendingIDs)
+			nextEpoch := cand.currentEpoch + 1
+			advanced := false
+			for _, pid := range pendingIDs {
+				if closeOpenPeerRevocation(cand.revokedPeers, pid, nextEpoch) {
+					advanced = true
+				}
+			}
+			if advanced {
+				cand.currentEpoch = nextEpoch
+				cand.revDirty = true
+			}
+			return cand.revDirty
+		},
+		func(cand *vaultRevState) {
+			for pid := range cand.pendingReauth {
+				if !hasOpenPeerRevocation(v.revokedPeers, pid) {
+					delete(v.pendingReauth, pid)
+				}
+			}
+		},
+	)
+	return err
+}
+
+func (v *Vault) mutateAndPublishRevocation(
+	ctx context.Context,
+	store *ReplicatedStore,
+	mutate func(*vaultRevState) bool,
+	onCommit func(*vaultRevState),
+) (*SignedRevocationList, error) {
+	v.revPubMu.Lock()
+	defer v.revPubMu.Unlock()
+
+	if store == nil {
+		v.mu.Lock()
+		defer v.mu.Unlock()
+		cand := v.snapshotRevStateLocked()
+		needPublish := mutate(&cand)
+		if !needPublish {
+			if onCommit != nil {
+				onCommit(&cand)
+			}
+			return nil, nil
+		}
+		cand.revSeq++
+		revList := v.buildRevocationListFromState(cand)
+		if err := revList.Sign(v.owner); err != nil {
+			return nil, err
+		}
+		if cand.currentEpoch > v.currentEpoch {
+			v.currentEpoch = cand.currentEpoch
+		}
+		if cand.revSeq > v.revSeq {
+			v.revSeq = cand.revSeq
+		}
+		v.mergeRevocationListLocked(revList)
+		if onCommit != nil {
+			onCommit(&cand)
+		}
+		if v.revDirtyGen == cand.revDirtyGen {
+			v.revDirty = false
+		}
+		return revList, nil
+	}
+
+	const maxPublishAttempts = 8
+	for attempt := 0; attempt < maxPublishAttempts; attempt++ {
+		persisted, err := store.GetLatestRevocationList(ctx, v.owner.KeyID, v.owner.Ed25519Pub)
+		if err != nil {
+			return nil, err
+		}
+
+		v.mu.Lock()
+		v.mergeRevocationListLocked(persisted)
+		cand := v.snapshotRevStateLocked()
+		v.mu.Unlock()
+
+		needPublish := mutate(&cand)
+		if !needPublish {
+			if onCommit != nil {
+				v.mu.Lock()
+				onCommit(&cand)
+				v.mu.Unlock()
+			}
+			return persisted, nil
+		}
+
+		cand.revSeq++
+		revList := v.buildRevocationListFromState(cand)
+		if err := revList.Sign(v.owner); err != nil {
+			return nil, err
+		}
+
+		if err := v.publishRevocationList(ctx, store, revList); err != nil {
+			if errors.Is(err, ErrStaleRevocation) {
+				continue
+			}
+			return nil, err
+		}
+
+		v.mu.Lock()
+		if cand.currentEpoch > v.currentEpoch {
+			v.currentEpoch = cand.currentEpoch
+		}
+		if cand.revSeq > v.revSeq {
+			v.revSeq = cand.revSeq
+		}
+		v.mergeRevocationListLocked(revList)
+		if onCommit != nil {
+			onCommit(&cand)
+		}
+		if v.revDirtyGen == cand.revDirtyGen {
+			v.revDirty = false
+		}
+		v.mu.Unlock()
+		return revList, nil
+	}
+	return nil, fmt.Errorf("%w: exceeded revocation publish retry limit", ErrStaleRevocation)
+}
+
 func (v *Vault) publishRevocationList(ctx context.Context, store *ReplicatedStore, revList *SignedRevocationList) error {
-	key, err := RevocationKey(v.owner.KeyID)
-	if err != nil {
-		return err
-	}
-	raw, err := json.Marshal(revList)
-	if err != nil {
-		return err
-	}
-	_, err = store.PutQuorum(ctx, key, raw)
+	_, err := store.PutRevocationQuorum(ctx, v.owner.KeyID, v.owner.Ed25519Pub, revList)
 	return err
 }
 
@@ -638,6 +965,9 @@ func (v *Vault) CryptoShred(ctx context.Context, store *ReplicatedStore, artifac
 	tBytes, err := json.Marshal(tombstone)
 	if err != nil {
 		return nil, err
+	}
+	if int64(len(tBytes)) > MaxTombstoneSize {
+		return nil, fmt.Errorf("%w: %w: serialized tombstone size %d exceeds limit %d", ErrInvalidManifest, backend.ErrTooLarge, len(tBytes), MaxTombstoneSize)
 	}
 	replicas, err := store.PutQuorum(ctx, tk, tBytes)
 	if err != nil {
@@ -882,6 +1212,8 @@ type ExportResult struct {
 // verified ciphertext chunks, latest revocation list, and an owner-signed
 // AuthorizedBundleIndex) directly into a standalone pkg/backend/file VFS
 // directory. Zero Hanzo accounts or non-VFS archive formats are used.
+// Tombstoned artifacts are rejected fail-closed so offline migration can never
+// strip cryptographic erasure state.
 func (v *Vault) ExportAuthorizedBundle(ctx context.Context, src *ReplicatedStore, exportDir string, manifestCIDs []string) (*ExportResult, error) {
 	if src == nil {
 		return nil, errors.New("encstore: nil source store")
@@ -889,31 +1221,99 @@ func (v *Vault) ExportAuthorizedBundle(ctx context.Context, src *ReplicatedStore
 	if len(manifestCIDs) == 0 {
 		return nil, errors.New("encstore: at least one manifestCID is required for export")
 	}
+
+	type verifiedExportManifest struct {
+		cid      string
+		manifest *SignedManifest
+		raw      []byte
+	}
+	manifests := make([]verifiedExportManifest, 0, len(manifestCIDs))
+	ownerPubs := map[string]ed25519.PublicKey{
+		v.owner.KeyID: v.owner.Ed25519Pub,
+	}
+
+	// Pre-validate every manifest and verify none has been tombstoned before
+	// writing anything into exportDir.
+	for _, mCID := range manifestCIDs {
+		m, rawM, err := src.GetVerifiedManifest(ctx, mCID, nil)
+		if err != nil {
+			return nil, fmt.Errorf("encstore: export fetch manifest %s: %w", mCID, err)
+		}
+		ownerEdPub, _, err := m.Owner.Validate()
+		if err != nil {
+			return nil, fmt.Errorf("encstore: export manifest %s owner: %w", mCID, err)
+		}
+		tombstone, err := src.GetTombstone(ctx, m.ArtifactID, ownerEdPub)
+		if err != nil {
+			return nil, fmt.Errorf("encstore: export check tombstone %s: %w", m.ArtifactID, err)
+		}
+		if tombstone != nil {
+			return nil, fmt.Errorf("%w: cannot export tombstoned artifact %s (deleted at epoch %d: %s)", ErrTombstoned, m.ArtifactID, tombstone.DeletedAtEpoch, tombstone.Reason)
+		}
+		ownerPubs[m.Owner.KeyID] = ownerEdPub
+		manifests = append(manifests, verifiedExportManifest{
+			cid:      mCID,
+			manifest: m,
+			raw:      rawM,
+		})
+	}
+
+	// Fetch owner revocation lists fail-closed before writing to exportDir.
+	ownerIDs := make([]string, 0, len(ownerPubs))
+	for id := range ownerPubs {
+		ownerIDs = append(ownerIDs, id)
+	}
+	sort.Strings(ownerIDs)
+
+	type revRecord struct {
+		key string
+		raw []byte
+	}
+	var revRecords []revRecord
+	for _, ownerID := range ownerIDs {
+		revList, err := src.GetLatestRevocationList(ctx, ownerID, ownerPubs[ownerID])
+		if err != nil {
+			return nil, fmt.Errorf("encstore: export fetch revocation list for %s: %w", ownerID, err)
+		}
+		if revList == nil {
+			continue
+		}
+		rKey, err := RevocationKey(ownerID)
+		if err != nil {
+			return nil, err
+		}
+		rawR, err := json.Marshal(revList)
+		if err != nil {
+			return nil, err
+		}
+		if int64(len(rawR)) > MaxRevocationListSize {
+			return nil, fmt.Errorf("%w: %w: serialized revocation list size %d exceeds limit %d", ErrInvalidManifest, backend.ErrTooLarge, len(rawR), MaxRevocationListSize)
+		}
+		revRecords = append(revRecords, revRecord{key: rKey, raw: rawR})
+	}
+
 	dstBackend, err := backend.Open(ctx, "file://"+exportDir)
 	if err != nil {
 		return nil, fmt.Errorf("encstore: open export file backend: %w", err)
 	}
 	defer dstBackend.Close()
 
-	entries := make([]BundleArtifactEntry, 0, len(manifestCIDs))
+	entries := make([]BundleArtifactEntry, 0, len(manifests))
 	var (
 		chunksWritten int
 		bytesWritten  int64
 	)
 
-	for _, mCID := range manifestCIDs {
-		m, rawM, err := src.GetVerifiedManifest(ctx, mCID, nil)
-		if err != nil {
-			return nil, fmt.Errorf("encstore: export fetch manifest %s: %w", mCID, err)
-		}
-		mKey, err := ManifestKey(mCID)
+	for _, item := range manifests {
+		m := item.manifest
+		mKey, err := ManifestKey(item.cid)
 		if err != nil {
 			return nil, err
 		}
-		if err := dstBackend.Put(ctx, mKey, rawM); err != nil {
+		if err := dstBackend.Put(ctx, mKey, item.raw); err != nil {
 			return nil, err
 		}
-		bytesWritten += int64(len(rawM))
+		bytesWritten += int64(len(item.raw))
 
 		for _, ref := range m.CipherChunks {
 			frame, _, err := src.GetVerifiedChunk(ctx, ref.CiphertextCID, ref.CiphertextSize)
@@ -935,23 +1335,15 @@ func (v *Vault) ExportAuthorizedBundle(ctx context.Context, src *ReplicatedStore
 			ArtifactID:  m.ArtifactID,
 			Kind:        m.Kind,
 			Epoch:       m.Epoch,
-			ManifestCID: mCID,
+			ManifestCID: item.cid,
 		})
 	}
 
-	hasRev := false
-	if revList, err := src.GetLatestRevocationList(ctx, v.owner.KeyID, v.owner.Ed25519Pub); err == nil && revList != nil {
-		if rKey, err := RevocationKey(v.owner.KeyID); err == nil {
-			rawR, err := json.Marshal(revList)
-			if err != nil {
-				return nil, err
-			}
-			if err := dstBackend.Put(ctx, rKey, rawR); err != nil {
-				return nil, err
-			}
-			bytesWritten += int64(len(rawR))
-			hasRev = true
+	for _, rr := range revRecords {
+		if err := dstBackend.Put(ctx, rr.key, rr.raw); err != nil {
+			return nil, err
 		}
+		bytesWritten += int64(len(rr.raw))
 	}
 
 	index := &AuthorizedBundleIndex{
@@ -959,7 +1351,7 @@ func (v *Vault) ExportAuthorizedBundle(ctx context.Context, src *ReplicatedStore
 		Owner:            v.owner.Public("owner"),
 		ExportedAt:       time.Now().UTC(),
 		Artifacts:        entries,
-		HasRevocationLog: hasRev,
+		HasRevocationLog: len(revRecords) > 0,
 	}
 	if err := index.Sign(v.owner); err != nil {
 		return nil, err
@@ -967,6 +1359,9 @@ func (v *Vault) ExportAuthorizedBundle(ctx context.Context, src *ReplicatedStore
 	idxBytes, err := json.Marshal(index)
 	if err != nil {
 		return nil, err
+	}
+	if int64(len(idxBytes)) > MaxBundleIndexSize {
+		return nil, fmt.Errorf("%w: %w: serialized bundle index size %d exceeds limit %d", ErrInvalidManifest, backend.ErrTooLarge, len(idxBytes), MaxBundleIndexSize)
 	}
 	if err := dstBackend.Put(ctx, BundleIndexKey(), idxBytes); err != nil {
 		return nil, err
@@ -1006,33 +1401,45 @@ type RestoreResult struct {
 
 // RestoreAndVerify restores and verifies an exported AuthorizedBundleIndex from
 // any independent ReplicatedStore (e.g., backed by a fresh file:// directory or
-// independent HTTP node with zero Hanzo account).
+// independent HTTP node with zero Hanzo account). Each replica's bundle index
+// is decoded and cryptographically verified before acceptance, failing over
+// cleanly across corrupted replicas.
 func RestoreAndVerify(ctx context.Context, independentStore *ReplicatedStore, reader *Identity, policy ReadPolicy) (*RestoreResult, error) {
 	start := time.Now()
 	if independentStore == nil {
 		return nil, errors.New("encstore: nil independent store")
 	}
 	var (
-		rawIdx  []byte
+		idx     AuthorizedBundleIndex
+		found   bool
 		lastErr error
 	)
 	for _, ep := range independentStore.Nodes() {
-		data, _, err := ep.Backend.Get(ctx, BundleIndexKey(), 4<<20)
-		if err == nil {
-			rawIdx = data
-			break
+		data, _, err := ep.Backend.Get(ctx, BundleIndexKey(), MaxBundleIndexSize)
+		if err != nil {
+			lastErr = fmt.Errorf("%s: %w", ep.Name, err)
+			continue
 		}
-		lastErr = err
+		var cand AuthorizedBundleIndex
+		if err := json.Unmarshal(data, &cand); err != nil {
+			independentStore.quarantine(ep.Name, "invalid bundle index JSON")
+			lastErr = fmt.Errorf("%w: %s: decode bundle index: %v", ErrInvalidManifest, ep.Name, err)
+			continue
+		}
+		if err := cand.Verify(policy.TrustedOwnerEdPubs); err != nil {
+			independentStore.quarantine(ep.Name, "invalid bundle index signature or owner")
+			lastErr = fmt.Errorf("%s: %w", ep.Name, err)
+			continue
+		}
+		idx = cand
+		found = true
+		break
 	}
-	if rawIdx == nil {
-		return nil, fmt.Errorf("%w: bundle index not found: %v", ErrAllReplicasFailed, lastErr)
-	}
-	var idx AuthorizedBundleIndex
-	if err := json.Unmarshal(rawIdx, &idx); err != nil {
-		return nil, fmt.Errorf("%w: decode bundle index: %v", ErrInvalidManifest, err)
-	}
-	if err := idx.Verify(policy.TrustedOwnerEdPubs); err != nil {
-		return nil, err
+	if !found {
+		if lastErr == nil {
+			lastErr = backend.ErrNotFound
+		}
+		return nil, fmt.Errorf("%w: bundle index: %w", ErrAllReplicasFailed, lastErr)
 	}
 
 	restored := make([]RestoredArtifact, 0, len(idx.Artifacts))
