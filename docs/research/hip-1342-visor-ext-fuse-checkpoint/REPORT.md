@@ -31,18 +31,18 @@ All regimes execute against the same local host disk and live `pkg/backend/s3` +
 
 | Regime | Burst Write (MB/s / GB/s) | Plain NVMe Ref (MB/s) | Burst vs NVMe | Fsync p50 (ms) | Plain NVMe Fsync p50 (ms) | Fsync p50 Ratio | Fsync Mean (ms) | Fsync S3 Reqs | Clean-Close S3 Reqs | S3 Publish (ms) | Bit-Exact |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|
-| `plain_nvme_baseline` | 2850.4 MB/s (2.784 GB/s) | 2850.4 MB/s | 1.00x | 4.000 | 4.000 | 1.00x | 4.531 | 0 | 0 | 0.00 | PASS |
-| `gofer_hop_baseline` | 36.1 MB/s (0.035 GB/s) | 2850.4 MB/s | 0.01x | 1.945 | 4.000 | 0.49x | 2.065 | 0 | 0 | 64.81 | PASS |
-| `ext_fuse_socket_fd` | 163.2 MB/s (0.159 GB/s) | 2850.4 MB/s | 0.06x | 1.876 | 4.000 | 0.47x | 2.916 | 0 | 0 | 47.54 | PASS |
-| `ext_fuse_s3_checkpoint_restore` | 158.9 MB/s (0.155 GB/s) | 2850.4 MB/s | 0.06x | 1.867 | 4.000 | 0.47x | 2.483 | 0 | 0 | 48.65 | PASS |
+| `plain_nvme_baseline` | 3238.9 MB/s (3.163 GB/s) | 3238.9 MB/s | 1.00x | 4.000 | 4.000 | 1.00x | 4.499 | 0 | 0 | 0.00 | PASS |
+| `gofer_hop_baseline` | 23.2 MB/s (0.023 GB/s) | 3238.9 MB/s | 0.01x | 2.594 | 4.000 | 0.65x | 2.736 | 0 | 0 | 150.55 | PASS |
+| `ext_fuse_socket_fd` | 70.8 MB/s (0.069 GB/s) | 3238.9 MB/s | 0.02x | 2.375 | 4.000 | 0.59x | 2.547 | 0 | 0 | 51.23 | PASS |
+| `ext_fuse_s3_checkpoint_restore` | 51.6 MB/s (0.050 GB/s) | 3238.9 MB/s | 0.02x | 2.363 | 4.000 | 0.59x | 2.853 | 0 | 0 | 54.09 | PASS |
 
 ### Key Takeaways from Positive Regimes
 
-- **Eliminating the host-side gofer hop (`ext_fuse_socket_fd` vs `gofer_hop_baseline`):** Direct host socket FD FUSE achieves **163.2 MB/s (0.159 GB/s)** vs **36.1 MB/s** through the synchronous gofer hop (**4.52x** burst speedup; `432` intermediate gofer hops eliminated) while keeping `fsync` p50 at **1.876 ms** vs **4.000 ms** plain NVMe (**0.47x** ratio).
+- **Eliminating the host-side gofer hop (`ext_fuse_socket_fd` vs `gofer_hop_baseline`):** Direct host socket FD FUSE achieves **70.8 MB/s (0.069 GB/s)** vs **23.2 MB/s** through the synchronous gofer hop (**3.05x** burst speedup; `432` intermediate gofer hops eliminated) while keeping `fsync` p50 at **2.375 ms** vs **4.000 ms** plain NVMe (**0.59x** ratio).
 - **Issue `#31` invariant checks on this 2-vCPU VM:**
   - `Zero synchronous S3 requests on clean close`: **`0`** (target: `0`) — **PASS**.
-  - `Acknowledged data published to S3 within 5 s`: **`47.54 ms`** (target: `< 5000 ms`) — **PASS**.
-  - `Fsync latency <= 1.5x plain NVMe`: **`0.47x`** p50 (`1.876 ms` vs `4.000 ms` plain NVMe) — **PASS** on this host. Note that on a 2-vCPU virtualized overlayfs runner, per-op journal sealing and single-core scheduling cap unbatched burst write speed (`0.159 GB/s` vs `2.784 GB/s` plain NVMe page-cache write); hardware qualification against the `>= 1.1 GB/s` node target must run on dedicated multi-core NVMe benchmark hardware.
+  - `Acknowledged data published to S3 within 5 s`: **`51.23 ms`** (target: `< 5000 ms`) — **PASS**.
+  - `Fsync latency <= 1.5x plain NVMe`: **`0.59x`** p50 (`2.375 ms` vs `4.000 ms` plain NVMe) — **PASS** on this host. Note that on a 2-vCPU virtualized overlayfs runner, per-op journal sealing and single-core scheduling cap unbatched burst write speed (`0.069 GB/s` vs `3.163 GB/s` plain NVMe page-cache write); hardware qualification against the `>= 1.1 GB/s` node target must run on dedicated multi-core NVMe benchmark hardware.
 
 ## 4. S3 Checkpoint/Restore & Cross-Node Migration Telemetry
 
@@ -50,17 +50,17 @@ All regimes execute against the same local host disk and live `pkg/backend/s3` +
 |---|---:|---:|
 | Raw Guest Memory | 8.00 MiB | 8.00 MiB |
 | Stored Page Bytes on S3 (PQ Encrypted) | 1.39 MiB | 8.21 MiB |
-| Stored Manifest Bytes on S3 | 37115 B | 50121 B |
+| Stored Manifest Bytes on S3 | 37200 B | 50292 B |
 | Total / Zero-Elided / Deduped / Uploaded Pages | 128 / 44 / 41 / 43 | 128 / 0 / 0 / 128 |
 | Effective Reduction Ratio (`Raw / Stored`) | 5.76x | 0.97x |
 | S3 PUT Ops (Checkpoint) / S3 GET Ops (Restore) | 44 / 44 | 129 / 129 |
-| Checkpoint Wall Time | 61.69 ms | 232.38 ms |
-| Cross-Node Restore Wall Time (Total) | 171.69 ms | 270.48 ms |
-|   - Manifest Fetch & Signature Verify | 1.46 ms | 1.06 ms |
-|   - Memory Fetch, PQ Decrypt & BLAKE3 Verify | 39.05 ms | 150.95 ms |
-|   - External VFS Round+1 Attach & FD Check | 131.18 ms | 118.47 ms |
+| Checkpoint Wall Time | 73.75 ms | 243.80 ms |
+| Cross-Node Restore Wall Time (Total) | 119.16 ms | 231.97 ms |
+|   - Manifest Fetch & Signature Verify | 1.30 ms | -2.84 ms |
+|   - Memory Fetch, PQ Decrypt & BLAKE3 Verify | 45.34 ms | 166.49 ms |
+|   - External VFS Round+1 Attach & FD Check | 72.52 ms | 68.32 ms |
 | Clean-Close VFS S3 Requests | 0 | 0 |
-| S3 VFS Publication Latency | 48.65 ms | 36.25 ms |
+| S3 VFS Publication Latency | 54.09 ms | 82.33 ms |
 | Unprivileged / Rootful Restore Verified | true / true | true / true |
 | Bit-Exact Memory & VFS Verification | true / true | true / true |
 
@@ -68,13 +68,13 @@ All regimes execute against the same local host disk and live `pkg/backend/s3` +
 
 | Negative Regime | Measured Throughput | Plain NVMe Ref | Ratio vs NVMe | Per-Op p50 (ms) | Plain NVMe p50 (ms) | p50 Ratio | Clean-Close S3 Reqs | Verification |
 |---|---:|---:|---:|---:|---:|---:|---:|:---:|
-| `neg_unquiesced_dirty_checkpoint` | n/a (rejected) | 2850.4 MB/s | n/a | n/a | 4.000 | n/a | 0 | FAIL-CLOSED (`ErrUnquiescedVolume`) |
-| `neg_tiny_sync_4k_metadata_storm` | 8.36 MB/s | 90.42 MB/s | 0.09x | 0.185 | 0.039 | 4.70x | 0 | PASS (honest slowdown) |
-| `neg_uncompressed_high_entropy_memory_checkpoint` | 169.2 MB/s | 2850.4 MB/s | 0.06x | 3.057 | 4.000 | 0.76x | 0 | PASS (0.97x ratio, bandwidth-bound) |
+| `neg_unquiesced_dirty_checkpoint` | n/a (rejected) | 3238.9 MB/s | n/a | n/a | 4.000 | n/a | 0 | FAIL-CLOSED (`ErrUnquiescedVolume`) |
+| `neg_tiny_sync_4k_metadata_storm` | 11.58 MB/s | 30.63 MB/s | 0.38x | 0.160 | 0.106 | 1.51x | 0 | PASS (honest slowdown) |
+| `neg_uncompressed_high_entropy_memory_checkpoint` | 192.4 MB/s | 3238.9 MB/s | 0.06x | 3.488 | 4.000 | 0.87x | 0 | PASS (0.97x ratio, bandwidth-bound) |
 
 1. **`neg_unquiesced_dirty_checkpoint` (Fail-Closed Correctness Guard):**
    - Invoking `CheckpointSandbox` while the external VFS volume still holds dirty, unquiesced writes fails closed immediately with `visorfuse: external VFS volume is not quiesced and flushed` and writes **`0` S3 checkpoint objects**, preventing split-brain filesystem state on cross-node restore.
 2. **`neg_tiny_sync_4k_metadata_storm` (Per-Op Framing Overhead):**
-   - Under a pure `4 KiB` synchronous single-op metadata storm (`64` files: `create + write(4K) + lookup + getattr + flush + release` per file), direct socket-FD FUSE achieves **8.36 MB/s** vs **90.42 MB/s** plain NVMe (**0.09x** throughput ratio) and **0.185 ms** vs **0.039 ms** p50 per-file latency (**4.70x** latency overhead; `1` synchronous S3 requests during the storm, `0` on clean close). Even after eliminating the gofer hop, 6 discrete AF_UNIX round-trips + journal record sealing per 4 KiB file remain substantially slower than in-kernel local VFS syscalls.
+   - Under a pure `4 KiB` synchronous single-op metadata storm (`64` files: `create + write(4K) + lookup + getattr + flush + release` per file), direct socket-FD FUSE achieves **11.58 MB/s** vs **30.63 MB/s** plain NVMe (**0.38x** throughput ratio) and **0.160 ms** vs **0.106 ms** p50 per-file latency (**1.51x** latency overhead; `1` synchronous S3 requests during the storm, `0` on clean close). Even after eliminating the gofer hop, 6 discrete AF_UNIX round-trips + journal record sealing per 4 KiB file remain substantially slower than in-kernel local VFS syscalls.
 3. **`neg_uncompressed_high_entropy_memory_checkpoint` (High-Entropy Memory Bandwidth Floor):**
-   - When all `8 MiB` of guest memory are cryptographic random bytes, zero-page elision (`0`), dedup (`0`), and compression (`0` pages) yield **0.97x** ratio (slightly below `1.0x` due to `vfs.Hybrid` ML-KEM-768+X25519 envelope framing), increasing S3 PUTs from `44` to `129` and cross-node restore wall time from **171.69 ms** to **270.48 ms** (**1.58x** slower restore).
+   - When all `8 MiB` of guest memory are cryptographic random bytes, zero-page elision (`0`), dedup (`0`), and compression (`0` pages) yield **0.97x** ratio (slightly below `1.0x` due to `vfs.Hybrid` ML-KEM-768+X25519 envelope framing), increasing S3 PUTs from `44` to `129` and cross-node restore wall time from **119.16 ms** to **231.97 ms** (**1.95x** slower restore).

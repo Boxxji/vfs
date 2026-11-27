@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,6 +18,14 @@ import (
 	"github.com/hanzoai/vfs"
 	"github.com/zeebo/blake3"
 )
+
+// SavedHandle captures a live FUSE wire handle ID and its bound VFS inode ID
+// at ReleaseRound time so RestoreToNode can reconstruct the exact handle table
+// and allocator on the destination node before resuming the guest.
+type SavedHandle struct {
+	Handle uint64 `json:"handle"`
+	Inode  uint64 `json:"inode"`
+}
 
 // QuiesceReceipt records the state of the external VFS volume immediately after
 // FlushAndQuiesce completes and publishes all dirty data to object storage.
@@ -110,18 +119,20 @@ type ExternalFUSEServer struct {
 
 	ioMu sync.RWMutex // RLock for FUSE ops; Lock for FlushAndQuiesce / ReleaseRound
 
-	stateMu       sync.Mutex
-	quiesced      bool
-	released      bool
-	closed        bool
-	dirtySinceQ   int64
-	quiesceRec    QuiesceReceipt
-	releaseToken  VolumeReleaseToken
-	nextHandle    uint64
-	handles       map[uint64]*openHandle
-	workerSem     chan struct{}
-	wg            sync.WaitGroup
-	initCompleted atomic.Bool
+	stateMu         sync.Mutex
+	quiesced        bool
+	released        bool
+	closed          bool
+	dirtySinceQ     int64
+	quiesceRec      QuiesceReceipt
+	releaseToken    VolumeReleaseToken
+	nextHandle      uint64
+	handles         map[uint64]*openHandle
+	savedHandles    []SavedHandle
+	savedNextHandle uint64
+	workerSem       chan struct{}
+	wg              sync.WaitGroup
+	initCompleted   atomic.Bool
 
 	// Operation counters.
 	initCalls    atomic.Int64
@@ -210,6 +221,93 @@ func (s *ExternalFUSEServer) ReleaseToken() (VolumeReleaseToken, bool) {
 		return VolumeReleaseToken{}, false
 	}
 	return s.releaseToken, true
+}
+
+// SavedHandles returns the open FUSE wire handle bindings and next-handle
+// allocator watermark captured at ReleaseRound (or currently live if not yet
+// released), sorted deterministically by Handle ID.
+func (s *ExternalFUSEServer) SavedHandles() ([]SavedHandle, uint64) {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	if s.released {
+		out := append([]SavedHandle(nil), s.savedHandles...)
+		return out, s.savedNextHandle
+	}
+	out := make([]SavedHandle, 0, len(s.handles))
+	for id, h := range s.handles {
+		out = append(out, SavedHandle{Handle: id, Inode: uint64(h.ino)})
+	}
+	slices.SortFunc(out, func(a, b SavedHandle) int {
+		if a.Handle < b.Handle {
+			return -1
+		}
+		if a.Handle > b.Handle {
+			return 1
+		}
+		return 0
+	})
+	return out, s.nextHandle
+}
+
+// RestoreHandles rebinds saved FUSE wire handle IDs to newly opened *vfs.File
+// objects on the restored volume and advances the handle allocator strictly
+// past both nextHandle and every restored wire handle ID so resumed guests can
+// continue READ/WRITE/FSYNC/RELEASE on original handle IDs without collisions.
+func (s *ExternalFUSEServer) RestoreHandles(ctx context.Context, saved []SavedHandle, nextHandle uint64) error {
+	s.ioMu.Lock()
+	defer s.ioMu.Unlock()
+
+	opened := make([]*openHandle, 0, len(saved))
+	seen := make(map[uint64]struct{}, len(saved))
+	maxID := uint64(0)
+
+	cleanup := func() {
+		for _, h := range opened {
+			_ = h.file.Close()
+		}
+	}
+
+	for _, sh := range saved {
+		if sh.Handle == 0 || sh.Inode == 0 {
+			cleanup()
+			return fmt.Errorf("%w: invalid saved handle (%d, inode %d)", ErrCheckpointTampered, sh.Handle, sh.Inode)
+		}
+		if _, dup := seen[sh.Handle]; dup {
+			cleanup()
+			return fmt.Errorf("%w: duplicate saved handle %d", ErrCheckpointTampered, sh.Handle)
+		}
+		seen[sh.Handle] = struct{}{}
+		f, err := s.vol.Open(ctx, vfs.InodeID(sh.Inode))
+		if err != nil {
+			cleanup()
+			return fmt.Errorf("visorfuse: restore FUSE handle %d (inode %d): %w", sh.Handle, sh.Inode, err)
+		}
+		opened = append(opened, &openHandle{id: sh.Handle, ino: vfs.InodeID(sh.Inode), file: f})
+		if sh.Handle > maxID {
+			maxID = sh.Handle
+		}
+	}
+
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	for _, h := range opened {
+		if _, exists := s.handles[h.id]; exists {
+			for _, oh := range opened {
+				if cur := s.handles[oh.id]; cur != oh {
+					_ = oh.file.Close()
+				}
+			}
+			return fmt.Errorf("%w: saved handle %d collides with existing handle", ErrCheckpointTampered, h.id)
+		}
+		s.handles[h.id] = h
+	}
+	if maxID+1 > s.nextHandle {
+		s.nextHandle = maxID + 1
+	}
+	if nextHandle > s.nextHandle {
+		s.nextHandle = nextHandle
+	}
+	return nil
 }
 
 // Metrics returns a consistent snapshot of FUSE operation and lifecycle stats.
@@ -376,7 +474,8 @@ func (s *ExternalFUSEServer) unquiesceOnFailure() {
 // ReleaseRound implements Step 2 of the VFS-outside-checkpoint protocol:
 //   - verifies the volume is cleanly quiesced and flushed (fails closed with
 //     ErrUnquiescedVolume otherwise),
-//   - closes all open FUSE file handles locally (zero synchronous S3 requests),
+//   - snapshots all live open FUSE handle IDs and closes them locally (zero
+//     synchronous S3 requests),
 //   - cleanly closes *vfs.Volume so its journal retires locally with zero
 //     synchronous S3 requests, releasing ownership so another node may Attach at
 //     NextRound = ReleasedRound + 1.
@@ -412,12 +511,25 @@ func (s *ExternalFUSEServer) ReleaseRound(ctx context.Context) (VolumeReleaseTok
 		beforeS3 = s.counter.Snapshot().TotalRequests()
 	}
 
-	// Close all open file handles locally (zero S3 requests).
+	// Snapshot open wire handle IDs deterministically before closing handles
+	// locally (zero S3 requests) so RestoreToNode can rebind them identically.
 	s.stateMu.Lock()
+	saved := make([]SavedHandle, 0, len(s.handles))
 	for id, h := range s.handles {
+		saved = append(saved, SavedHandle{Handle: id, Inode: uint64(h.ino)})
 		_ = h.file.Close()
 		delete(s.handles, id)
 	}
+	slices.SortFunc(saved, func(a, b SavedHandle) int {
+		if a.Handle < b.Handle {
+			return -1
+		}
+		if a.Handle > b.Handle {
+			return 1
+		}
+		return 0
+	})
+	savedNext := s.nextHandle
 	s.stateMu.Unlock()
 
 	// Cleanly close the Volume: stops publisher, closes and retires empty
@@ -448,6 +560,8 @@ func (s *ExternalFUSEServer) ReleaseRound(ctx context.Context) (VolumeReleaseTok
 	s.stateMu.Lock()
 	s.released = true
 	s.releaseToken = tok
+	s.savedHandles = saved
+	s.savedNextHandle = savedNext
 	s.stateMu.Unlock()
 	return tok, nil
 }

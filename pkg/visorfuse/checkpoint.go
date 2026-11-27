@@ -48,6 +48,7 @@ const (
 // the external VFS mount so it can be cleanly re-bound on the target node.
 type OpenDescriptor struct {
 	FD     int         `json:"fd"`
+	Handle uint64      `json:"handle,omitempty"`
 	Path   string      `json:"path"`
 	Inode  uint64      `json:"inode"`
 	Offset int64       `json:"offset"`
@@ -134,21 +135,25 @@ type PageRef struct {
 	KeyID        string `json:"key_id,omitempty"`
 }
 
-// CheckpointStats captures exact storage, dedup, compression, and timing telemetry.
+// CheckpointStats captures exact storage, dedup, compression, and runtime
+// upload telemetry. Deterministic content statistics are signed into the S3
+// manifest; post-upload runtime telemetry fields (StoredManifestSize, S3PutOps,
+// LostACKRecovered, CheckpointDuration) are tagged json:"-" so populating them
+// after manifest upload never invalidates ManifestDigest or Signature.
 type CheckpointStats struct {
 	RawMemoryBytes     uint64        `json:"raw_memory_bytes"`
 	StoredPageBytes    uint64        `json:"stored_page_bytes"`
-	StoredManifestSize uint64        `json:"stored_manifest_bytes"`
+	StoredManifestSize uint64        `json:"-"`
 	TotalPages         int           `json:"total_pages"`
 	ZeroPages          int           `json:"zero_pages"`
 	DedupedPages       int           `json:"deduped_pages"`
 	UploadedPages      int           `json:"uploaded_pages"`
 	CompressedPages    int           `json:"compressed_pages"`
-	S3PutOps           int           `json:"s3_put_ops"`
-	LostACKRecovered   int           `json:"lost_ack_recovered"`
+	S3PutOps           int           `json:"-"`
+	LostACKRecovered   int           `json:"-"`
 	Encrypted          bool          `json:"encrypted"`
 	CompressionRatio   float64       `json:"compression_ratio"`
-	CheckpointDuration time.Duration `json:"checkpoint_duration_ns"`
+	CheckpointDuration time.Duration `json:"-"`
 }
 
 // CheckpointManifest is the signed, deterministic root descriptor stored on S3
@@ -167,6 +172,8 @@ type CheckpointManifest struct {
 	VFSRelease      VolumeReleaseToken `json:"vfs_release"`
 	MountSpecDigest string             `json:"mount_spec_digest"`
 	Descriptors     []OpenDescriptor   `json:"descriptors,omitempty"`
+	SavedHandles    []SavedHandle      `json:"saved_handles,omitempty"`
+	NextHandle      uint64             `json:"next_handle,omitempty"`
 	Registers       []byte             `json:"registers,omitempty"`
 	Env             map[string]string  `json:"env,omitempty"`
 	PageSize        int                `json:"page_size"`
@@ -179,11 +186,21 @@ type CheckpointManifest struct {
 }
 
 // PageObjectKey returns the backend.ValidKey-compliant S3 object key for a
-// content-addressed memory page scoped strictly to (tenantID, volumeID).
+// plaintext content-addressed memory page scoped strictly to (tenantID, volumeID).
 func PageObjectKey(tenantID, volumeID, plainDigest string) string {
+	return PageObjectKeyForPolicy(tenantID, volumeID, plainDigest, false)
+}
+
+// PageObjectKeyForPolicy returns the backend.ValidKey-compliant S3 object key
+// scoped to (tenantID, volumeID) and separated by encryption policy so an
+// encrypted checkpoint never collides with or reuses an earlier plaintext page.
+func PageObjectKeyForPolicy(tenantID, volumeID, plainDigest string, encrypted bool) string {
 	shard := "00"
 	if len(plainDigest) >= 2 {
 		shard = plainDigest[:2]
+	}
+	if encrypted {
+		return "ckpt/" + tenantID + "/" + volumeID + "/p/e/" + shard + "/" + plainDigest
 	}
 	return "ckpt/" + tenantID + "/" + volumeID + "/p/" + shard + "/" + plainDigest
 }
@@ -450,7 +467,7 @@ func CheckpointSandbox(ctx context.Context, server *ExternalFUSEServer, snap San
 			continue
 		}
 
-		objKey := PageObjectKey(snap.TenantID, snap.VolumeID, plainDigest)
+		objKey := PageObjectKeyForPolicy(snap.TenantID, snap.VolumeID, plainDigest, cfg.Cipher != nil)
 		if err := backend.ValidKey(objKey); err != nil {
 			return nil, fmt.Errorf("%w: invalid page key %q: %v", ErrInvalidMountConfig, objKey, err)
 		}
@@ -509,6 +526,24 @@ func CheckpointSandbox(ctx context.Context, server *ExternalFUSEServer, snap San
 		pages = append(pages, ref)
 	}
 
+	savedHandles, nextHandle := server.SavedHandles()
+	savedByHandle := make(map[uint64]uint64, len(savedHandles))
+	for _, sh := range savedHandles {
+		savedByHandle[sh.Handle] = sh.Inode
+	}
+	descs := append([]OpenDescriptor(nil), snap.Descriptors...)
+	for i := range descs {
+		if descs[i].Handle != 0 {
+			if _, exists := savedByHandle[descs[i].Handle]; !exists && descs[i].Inode != 0 {
+				savedHandles = append(savedHandles, SavedHandle{Handle: descs[i].Handle, Inode: descs[i].Inode})
+				savedByHandle[descs[i].Handle] = descs[i].Inode
+			}
+			if descs[i].Handle >= nextHandle {
+				nextHandle = descs[i].Handle + 1
+			}
+		}
+	}
+
 	manifest := &CheckpointManifest{
 		FormatVersion:   CheckpointFormatVersion,
 		CheckpointID:    snap.CheckpointID,
@@ -521,7 +556,9 @@ func CheckpointSandbox(ctx context.Context, server *ExternalFUSEServer, snap San
 		GID:             snap.GID,
 		VFSRelease:      token,
 		MountSpecDigest: spec.CanonicalDigest(),
-		Descriptors:     append([]OpenDescriptor(nil), snap.Descriptors...),
+		Descriptors:     descs,
+		SavedHandles:    savedHandles,
+		NextHandle:      nextHandle,
 		Registers:       append([]byte(nil), snap.Registers...),
 		Env:             snap.Env,
 		PageSize:        pageSize,
@@ -530,7 +567,10 @@ func CheckpointSandbox(ctx context.Context, server *ExternalFUSEServer, snap San
 		Pages:           pages,
 	}
 
-	// Compute compression/dedup ratio cleanly before sealing stats into manifest.
+	// Compute deterministic content stats cleanly before signing the manifest.
+	// Runtime upload telemetry fields (S3PutOps, LostACKRecovered,
+	// StoredManifestSize, CheckpointDuration) are tagged json:"-" so updating
+	// them after upload never mutates the signed canonical manifest bytes.
 	if stats.StoredPageBytes > 0 {
 		stats.CompressionRatio = float64(stats.RawMemoryBytes) / float64(stats.StoredPageBytes)
 	} else if stats.RawMemoryBytes > 0 {
@@ -538,7 +578,6 @@ func CheckpointSandbox(ctx context.Context, server *ExternalFUSEServer, snap San
 	} else {
 		stats.CompressionRatio = 1.0
 	}
-	stats.CheckpointDuration = time.Since(t0)
 	manifest.Stats = stats
 
 	mdigest, err := computeManifestDigest(manifest)
@@ -586,6 +625,29 @@ func CheckpointSandbox(ctx context.Context, server *ExternalFUSEServer, snap San
 	return manifest, nil
 }
 
+// Verify checks the cryptographic digest, keyed BLAKE3 signature, and release
+// token of a CheckpointManifest.
+func (m *CheckpointManifest) Verify(hmacKey []byte) error {
+	if m == nil {
+		return fmt.Errorf("%w: nil manifest", ErrCheckpointTampered)
+	}
+	if m.FormatVersion != CheckpointFormatVersion {
+		return fmt.Errorf("%w: unsupported format version %d", ErrCheckpointTampered, m.FormatVersion)
+	}
+	wantDigest, err := computeManifestDigest(m)
+	if err != nil {
+		return err
+	}
+	if subtle.ConstantTimeCompare([]byte(m.ManifestDigest), []byte(wantDigest)) != 1 {
+		return fmt.Errorf("%w: manifest digest mismatch", ErrCheckpointTampered)
+	}
+	wantSig := signManifestDigest(hmacKey, m.TenantID, m.VolumeID, m.CheckpointID, m.ManifestDigest)
+	if subtle.ConstantTimeCompare([]byte(m.Signature), []byte(wantSig)) != 1 {
+		return fmt.Errorf("%w: manifest signature mismatch", ErrCheckpointTampered)
+	}
+	return m.VFSRelease.Verify()
+}
+
 // putPageIdempotent uploads a content-addressed page via PutIfAbsent, safely
 // reconciling both cross-checkpoint dedup and transient lost-ACK errors by
 // cryptographically verifying any existing object on ErrConflict.
@@ -616,7 +678,8 @@ func putPageIdempotent(
 			}, true, recovered, puts, nil
 		}
 		if errors.Is(err, backend.ErrConflict) {
-			// Verify the existing object on S3 matches plainDigest bit-for-bit.
+			// Verify the existing object on S3 matches plainDigest bit-for-bit
+			// AND obeys the exact encryption policy requested by this checkpoint.
 			existing, _, gerr := cfg.Store.Get(ctx, objKey, maxPageBytes)
 			if gerr != nil {
 				return PageRef{}, false, recovered, puts, fmt.Errorf("visorfuse: verify existing page %s: %w", objKey, gerr)
@@ -624,6 +687,11 @@ func putPageIdempotent(
 			eflags, ekid, plain, verr := decodeAndVerifyPage(existing, cfg.Cipher, tenantID, volumeID, plainDigest, rawLen)
 			if verr != nil {
 				return PageRef{}, false, recovered, puts, verr
+			}
+			wantEncrypted := flags&ckptFlagEncrypted != 0
+			gotEncrypted := eflags&ckptFlagEncrypted != 0
+			if wantEncrypted != gotEncrypted {
+				return PageRef{}, false, recovered, puts, fmt.Errorf("%w: existing page %s encryption policy mismatch (got encrypted=%v, want %v)", ErrCheckpointTampered, objKey, gotEncrypted, wantEncrypted)
 			}
 			if len(plain) != rawLen {
 				return PageRef{}, false, recovered, puts, fmt.Errorf("%w: existing page length mismatch", ErrCheckpointTampered)
@@ -639,7 +707,7 @@ func putPageIdempotent(
 				RawLen:       rawLen,
 				StoredLen:    len(existing),
 				Compressed:   eflags&ckptFlagCompressed != 0,
-				Encrypted:    eflags&ckptFlagEncrypted != 0,
+				Encrypted:    gotEncrypted,
 				KeyID:        ekid,
 			}, attempt > 0, recovered, puts, nil
 		}
@@ -774,11 +842,13 @@ type RestoredSandbox struct {
 // RestoreToNode performs fail-closed cross-node restoration:
 //  1. Validates TargetMountSpec (zero guest priv, zero gofer hop, allowlisted host FD),
 //  2. Fetches, unseals, and verifies manifest BLAKE3 digest, keyed MAC, tenant/volume
-//     isolation, and VFSRelease token,
+//     isolation, signed mount policy digest, and VFSRelease token,
 //  3. Enforces unprivileged/rootful restore policy (rejects unauthorized escalation),
 //  4. Fetches and cryptographically verifies every memory page + full memory BLAKE3 digest,
-//  5. Re-attaches the external VFS volume at ReleasedRound+1 on the target node,
-//  6. Verifies all saved open FUSE file descriptors exist at the exact published generation.
+//  5. Re-attaches the external VFS volume at ReleasedRound+1 on the target node and
+//     requires an exact match with VFSRelease.PublishedHeadSeq,
+//  6. Verifies all saved open descriptors and reconstructs the live FUSE handle
+//     table and allocator before returning the restored server.
 func RestoreToNode(ctx context.Context, req RestoreRequest) (*RestoredSandbox, error) {
 	tTotal := time.Now()
 	if err := ValidateMountSpec(req.TargetMountSpec); err != nil {
@@ -843,21 +913,8 @@ func RestoreToNode(ctx context.Context, req RestoreRequest) (*RestoredSandbox, e
 		return nil, fmt.Errorf("%w: manifest checkpoint_id mismatch", ErrCheckpointTampered)
 	}
 
-	// Verify manifest BLAKE3 digest and constant-time keyed signature.
-	wantDigest, err := computeManifestDigest(&manifest)
-	if err != nil {
-		return nil, err
-	}
-	if subtle.ConstantTimeCompare([]byte(manifest.ManifestDigest), []byte(wantDigest)) != 1 {
-		return nil, fmt.Errorf("%w: manifest digest mismatch", ErrCheckpointTampered)
-	}
-	wantSig := signManifestDigest(req.HMACKey, manifest.TenantID, manifest.VolumeID, manifest.CheckpointID, manifest.ManifestDigest)
-	if subtle.ConstantTimeCompare([]byte(manifest.Signature), []byte(wantSig)) != 1 {
-		return nil, fmt.Errorf("%w: manifest signature mismatch", ErrCheckpointTampered)
-	}
-
-	// Verify VFS release token (proves VFS was cleanly flushed and released).
-	if err := manifest.VFSRelease.Verify(); err != nil {
+	// Verify manifest BLAKE3 digest, constant-time keyed signature, and VFS release token.
+	if err := manifest.Verify(req.HMACKey); err != nil {
 		return nil, err
 	}
 	if manifest.VFSRelease.TenantID != req.TargetTenantID {
@@ -865,6 +922,14 @@ func RestoreToNode(ctx context.Context, req RestoreRequest) (*RestoredSandbox, e
 	}
 	if manifest.VFSRelease.VolumeID != req.TargetVolumeID {
 		return nil, ErrVolumeMismatch
+	}
+
+	// Enforce the signed OCI mount policy (ReadOnly, Destination, MaxWrite,
+	// SocketKind, NoGuestPriv, NoGoferHop, tenant/volume) before attaching or
+	// exposing the volume on the target node.
+	targetMountDigest := req.TargetMountSpec.CanonicalDigest()
+	if subtle.ConstantTimeCompare([]byte(targetMountDigest), []byte(manifest.MountSpecDigest)) != 1 {
+		return nil, fmt.Errorf("%w: target mount policy digest %s != signed checkpoint mount_spec_digest %s", ErrInvalidMountConfig, targetMountDigest, manifest.MountSpecDigest)
 	}
 
 	// Verify unprivileged / rootful restore policy.
@@ -889,6 +954,9 @@ func RestoreToNode(ctx context.Context, req RestoreRequest) (*RestoredSandbox, e
 			metrics.ZeroPagesSkipped++
 			continue
 		}
+		if manifest.Stats.Encrypted && !pref.Encrypted {
+			return nil, fmt.Errorf("%w: encrypted checkpoint references plaintext page %d", ErrCheckpointTampered, pref.Index)
+		}
 		// Enforce strict tenant+volume key prefix isolation on every page ref.
 		if !strings.HasPrefix(pref.ObjectKey, expectedPrefix) {
 			return nil, fmt.Errorf("%w: page key %q escapes tenant/volume prefix %q", ErrTenantMismatch, pref.ObjectKey, expectedPrefix)
@@ -910,9 +978,13 @@ func RestoreToNode(ctx context.Context, req RestoreRequest) (*RestoredSandbox, e
 			if subtle.ConstantTimeCompare([]byte(gotStoredDigest), []byte(pref.StoredDigest)) != 1 {
 				return nil, fmt.Errorf("%w: stored digest mismatch for page %d", ErrCheckpointTampered, pref.Index)
 			}
-			_, _, dec, err := decodeAndVerifyPage(rawPage, req.CheckpointCipher, req.TargetTenantID, req.TargetVolumeID, pref.PlainDigest, pref.RawLen)
+			eflags, _, dec, err := decodeAndVerifyPage(rawPage, req.CheckpointCipher, req.TargetTenantID, req.TargetVolumeID, pref.PlainDigest, pref.RawLen)
 			if err != nil {
 				return nil, err
+			}
+			gotEncrypted := eflags&ckptFlagEncrypted != 0
+			if gotEncrypted != pref.Encrypted {
+				return nil, fmt.Errorf("%w: page %d envelope encryption flag (%v) != manifest (%v)", ErrCheckpointTampered, pref.Index, gotEncrypted, pref.Encrypted)
 			}
 			if len(dec) != pref.RawLen {
 				return nil, fmt.Errorf("%w: page %d length %d != %d", ErrCheckpointTampered, pref.Index, len(dec), pref.RawLen)
@@ -948,9 +1020,11 @@ func RestoreToNode(ctx context.Context, req RestoreRequest) (*RestoredSandbox, e
 		return nil, fmt.Errorf("visorfuse: re-attach external VFS at round %d: %w", nextRound, err)
 	}
 	vStats := vol.Stats()
-	if vStats.Seq < manifest.VFSRelease.PublishedHeadSeq {
+	// Require exact filesystem Head generation match so restoring an earlier
+	// checkpoint never pairs stale guest memory with newer diverged writes.
+	if vStats.Seq != manifest.VFSRelease.PublishedHeadSeq {
 		_ = vol.Close()
-		return nil, fmt.Errorf("%w: target VFS head seq %d < published seq %d", ErrCheckpointTampered, vStats.Seq, manifest.VFSRelease.PublishedHeadSeq)
+		return nil, fmt.Errorf("%w: target VFS head seq %d != checkpoint published seq %d", ErrCheckpointTampered, vStats.Seq, manifest.VFSRelease.PublishedHeadSeq)
 	}
 
 	// Verify all saved open descriptors exist on the restored external VFS volume.
@@ -972,6 +1046,27 @@ func RestoreToNode(ctx context.Context, req RestoreRequest) (*RestoredSandbox, e
 		restoredDescs = append(restoredDescs, rd)
 	}
 
+	// Collect and validate all saved FUSE wire handle bindings.
+	handlesToRestore := append([]SavedHandle(nil), manifest.SavedHandles...)
+	seenHandle := make(map[uint64]struct{}, len(handlesToRestore))
+	for _, sh := range handlesToRestore {
+		seenHandle[sh.Handle] = struct{}{}
+	}
+	for _, rd := range restoredDescs {
+		if rd.Handle != 0 {
+			if _, ok := seenHandle[rd.Handle]; !ok {
+				handlesToRestore = append(handlesToRestore, SavedHandle{Handle: rd.Handle, Inode: rd.Inode})
+				seenHandle[rd.Handle] = struct{}{}
+			}
+		}
+	}
+	for _, sh := range handlesToRestore {
+		if _, err := vol.Stat(ctx, vfs.InodeID(sh.Inode)); err != nil {
+			_ = vol.Close()
+			return nil, fmt.Errorf("visorfuse: saved FUSE handle %d inode %d missing: %w", sh.Handle, sh.Inode, err)
+		}
+	}
+
 	var srv *ExternalFUSEServer
 	if req.TargetHostConn != nil {
 		var opts []ServerOption
@@ -982,6 +1077,13 @@ func RestoreToNode(ctx context.Context, req RestoreRequest) (*RestoredSandbox, e
 		if err != nil {
 			_ = vol.Close()
 			return nil, err
+		}
+		if len(handlesToRestore) > 0 || manifest.NextHandle > 1 {
+			if err := srv.RestoreHandles(ctx, handlesToRestore, manifest.NextHandle); err != nil {
+				_ = srv.Close()
+				_ = vol.Close()
+				return nil, err
+			}
 		}
 	}
 	metrics.VFSAttachTime = time.Since(tVFS)

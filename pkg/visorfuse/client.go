@@ -21,6 +21,10 @@ type GuestFUSEClient struct {
 
 	nextUnique atomic.Uint64
 
+	writeSem  chan struct{}
+	closeOnce sync.Once
+	closeErr  error
+
 	mu      sync.Mutex
 	pending map[uint64]chan *Frame
 	closed  bool
@@ -32,27 +36,42 @@ type GuestFUSEClient struct {
 // socket FD) and starts the background response demultiplexer.
 func NewGuestFUSEClient(guestConn io.ReadWriteCloser, kind SocketKind) *GuestFUSEClient {
 	c := &GuestFUSEClient{
-		conn:    NewFrameConn(guestConn, kind),
-		pending: make(map[uint64]chan *Frame),
-		done:    make(chan struct{}),
+		conn:     NewFrameConn(guestConn, kind),
+		writeSem: make(chan struct{}, 1),
+		pending:  make(map[uint64]chan *Frame),
+		done:     make(chan struct{}),
 	}
 	go c.readLoop()
 	return c
 }
 
+func (c *GuestFUSEClient) closeConn() error {
+	c.closeOnce.Do(func() {
+		c.closeErr = c.conn.Close()
+	})
+	return c.closeErr
+}
+
+func (c *GuestFUSEClient) failPending(err error) {
+	c.mu.Lock()
+	c.closed = true
+	if c.readErr == nil {
+		c.readErr = err
+	}
+	for id, ch := range c.pending {
+		close(ch)
+		delete(c.pending, id)
+	}
+	c.mu.Unlock()
+}
+
 func (c *GuestFUSEClient) readLoop() {
 	defer close(c.done)
+	defer func() { _ = c.closeConn() }()
 	for {
 		resp, err := c.conn.ReadFrame()
 		if err != nil {
-			c.mu.Lock()
-			c.closed = true
-			c.readErr = err
-			for id, ch := range c.pending {
-				close(ch)
-				delete(c.pending, id)
-			}
-			c.mu.Unlock()
+			c.failPending(err)
 			return
 		}
 		c.mu.Lock()
@@ -67,39 +86,76 @@ func (c *GuestFUSEClient) readLoop() {
 	}
 }
 
-// Close closes the client socket and waits for the demuxer goroutine to exit.
+// Close closes the client socket exactly once and waits for the demuxer
+// goroutine to exit, releasing the underlying transport even if readLoop has
+// already exited on EOF or a malformed frame.
 func (c *GuestFUSEClient) Close() error {
 	c.mu.Lock()
-	if c.closed {
-		c.mu.Unlock()
-		<-c.done
-		return nil
-	}
 	c.closed = true
 	c.mu.Unlock()
-	err := c.conn.Close()
+	err := c.closeConn()
 	<-c.done
 	return err
 }
 
 func (c *GuestFUSEClient) call(ctx context.Context, req *Frame) (*Frame, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	id := c.nextUnique.Add(1)
 	req.Unique = id
 	ch := make(chan *Frame, 1)
 
+	// Acquire the single-writer turn in a context-aware manner so concurrent
+	// callers unblock immediately on cancellation when a peer stalls reads.
+	select {
+	case c.writeSem <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-c.done:
+		return nil, ErrSessionClosed
+	}
+
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
+		<-c.writeSem
 		return nil, ErrSessionClosed
 	}
 	c.pending[id] = ch
 	c.mu.Unlock()
 
-	if err := c.conn.WriteFrame(req); err != nil {
+	writeDone := make(chan error, 1)
+	go func() {
+		writeDone <- c.conn.WriteFrame(req)
+	}()
+
+	var writeErr error
+	select {
+	case writeErr = <-writeDone:
+		<-c.writeSem
+	case <-ctx.Done():
+		// Interrupting an in-flight write may leave a partial frame on a
+		// stream/pipe transport. Fail-close the session and transport so the
+		// blocked writer unblocks immediately and no subsequent caller can
+		// interleave corrupted framing onto the stream.
+		c.failPending(ctx.Err())
+		_ = c.closeConn()
+		<-writeDone
+		<-c.writeSem
+		return nil, ctx.Err()
+	case <-c.done:
+		_ = c.closeConn()
+		<-writeDone
+		<-c.writeSem
+		return nil, ErrSessionClosed
+	}
+
+	if writeErr != nil {
 		c.mu.Lock()
 		delete(c.pending, id)
 		c.mu.Unlock()
-		return nil, err
+		return nil, writeErr
 	}
 
 	select {
