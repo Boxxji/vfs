@@ -796,6 +796,9 @@ func executeWriteHeavyNegative(ctx context.Context, cfg benchConfig, s3Be backen
 			}
 		}
 
+		// Snapshot counters after warm-up so timed-phase metrics exclude the 128 warm-up reads.
+		warm := eng.Metrics()
+
 		latencies := make([]time.Duration, agents*opsPerAgent)
 		var firstErr atomic.Value
 		startAll := time.Now()
@@ -830,6 +833,23 @@ func executeWriteHeavyNegative(ctx context.Context, cfg benchConfig, s3Be backen
 		}
 
 		m := eng.Metrics()
+		timedReads := m.Reads - warm.Reads
+		timedRAMHits := m.RAMHits - warm.RAMHits
+		timedNVMeHits := m.NVMeHits - warm.NVMeHits
+		timedS3Fetches := m.S3Fetches - warm.S3Fetches
+		timedAdmissions := m.MirrorAdmissions - warm.MirrorAdmissions
+		timedRejections := m.MirrorRejections - warm.MirrorRejections
+		timedInstantDrops := m.MirrorInstantDrops - warm.MirrorInstantDrops
+		timedInvalidations := m.MirrorInvalidations - warm.MirrorInvalidations
+		timedNVMeReadIOPS := m.NVMeReadIOPS - warm.NVMeReadIOPS
+		timedDemotions := m.NVMeDemotionWrites - warm.NVMeDemotionWrites
+		timedWritebackIOPS := m.NVMeWritebackIOPS - warm.NVMeWritebackIOPS
+		timedWritebackBytes := m.NVMeWritebackBytes - warm.NVMeWritebackBytes
+		timedHitRatePct := 0.0
+		if timedReads > 0 {
+			timedHitRatePct = float64(timedRAMHits) / float64(timedReads) * 100.0
+		}
+
 		totalRAM := m.PeakRAMBytes + m.TrackerMetaBytes
 		elapsedSec := elapsed.Seconds()
 		if elapsedSec <= 0 {
@@ -854,23 +874,23 @@ func executeWriteHeavyNegative(ctx context.Context, cfg benchConfig, s3Be backen
 			RAMPerAgentMiB:      round4(m.RAMPerAgentBytes / (1024 * 1024)),
 			RAMBudgetMiB:        round4(float64(ramBudget) / (1024 * 1024)),
 			OverBudget:          m.OverBudget,
-			RAMHitRatePct:       round4(m.RAMHitRate * 100.0),
-			RAMHits:             m.RAMHits,
-			NVMeHits:            m.NVMeHits,
-			S3Fetches:           m.S3Fetches,
-			MirrorAdmissions:    m.MirrorAdmissions,
-			MirrorRejections:    m.MirrorRejections,
-			MirrorInstantDrops:  m.MirrorInstantDrops,
-			MirrorInvalidations: m.MirrorInvalidations,
-			NVMeReadIOPS:        m.NVMeReadIOPS,
-			NVMeDemotionWrites:  m.NVMeDemotionWrites,
-			NVMeWritebackIOPS:   m.NVMeWritebackIOPS,
-			NVMeWritebackBytes:  m.NVMeWritebackBytes,
-			AggregateReadMiBS:   round4((float64(m.Reads) * float64(cfg.BlockSize) / (1024 * 1024)) / elapsedSec),
+			RAMHitRatePct:       round4(timedHitRatePct),
+			RAMHits:             timedRAMHits,
+			NVMeHits:            timedNVMeHits,
+			S3Fetches:           timedS3Fetches,
+			MirrorAdmissions:    timedAdmissions,
+			MirrorRejections:    timedRejections,
+			MirrorInstantDrops:  timedInstantDrops,
+			MirrorInvalidations: timedInvalidations,
+			NVMeReadIOPS:        timedNVMeReadIOPS,
+			NVMeDemotionWrites:  timedDemotions,
+			NVMeWritebackIOPS:   timedWritebackIOPS,
+			NVMeWritebackBytes:  timedWritebackBytes,
+			AggregateReadMiBS:   round4((float64(timedReads) * float64(cfg.BlockSize) / (1024 * 1024)) / elapsedSec),
 			OpsPerSec:           round4(float64(agents*opsPerAgent) / elapsedSec),
-			BLAKE3VerifiedReads: m.Reads,
-			CorruptionRejects:   m.CorruptionRejects,
-			IsolationRejects:    m.IsolationRejects,
+			BLAKE3VerifiedReads: timedReads,
+			CorruptionRejects:   m.CorruptionRejects - warm.CorruptionRejects,
+			IsolationRejects:    m.IsolationRejects - warm.IsolationRejects,
 		})
 	}
 	return results, nil

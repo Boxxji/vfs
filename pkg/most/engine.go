@@ -29,7 +29,10 @@ import (
 	"github.com/hanzoai/vfs/pkg/backend"
 )
 
-var envelopeMagic = [4]byte{'M', 'S', 'T', 'P'}
+var (
+	envelopeMagic       = [4]byte{'M', 'S', 'T', 'P'}
+	privatePayloadMagic = [4]byte{'M', 'S', 'P', 'B'}
+)
 
 // Engine orchestrates the 3-tier RAM (L1) / NVMe (L2) / Hanzo S3 (L3) storage
 // hierarchy for multi-agent shared immutable toolchains and tenant-isolated
@@ -46,6 +49,7 @@ type Engine struct {
 	ciphers    map[Scope]vfs.Cipher
 	agentRAMMu sync.RWMutex
 	agentRAMs  map[string]*ramPool
+	keyMu      [256]sync.Mutex
 
 	// Peak aggregate RAM across all per-agent caches (for per_agent_private_cache).
 	peakTotalRAM atomic.Int64
@@ -62,6 +66,12 @@ type Engine struct {
 	mirrorInvalidations   atomic.Uint64
 	corruptionRejects     atomic.Uint64
 	isolationRejects      atomic.Uint64
+}
+
+func (e *Engine) lockKey(key string) func() {
+	m := &e.keyMu[HashKey(key)&255]
+	m.Lock()
+	return m.Unlock
 }
 
 // NewEngine validates cfg and initializes an Engine across L1 RAM, L2 NVMe,
@@ -276,18 +286,22 @@ func (e *Engine) readExclusive(ctx context.Context, id BlockID, keyHash uint64) 
 			return flightResult{data: data}, nil
 		}
 
-		// Exclusive migration: read from NVMe (or S3); reclaim NVMe slot before
-		// installing in RAM (all concurrent misses for id.Key coalesce on this
-		// singleFlight, so no concurrent eviction of id.Key can interleave).
+		// Exclusive migration: read from NVMe (or S3); attempt RAM admission FIRST
+		// so an oversized block (> RAM budget) retains its NVMe copy instead of
+		// being deleted and forced back to S3 on subsequent reads.
 		fr, err := e.fetchVerifiedShared(fctx, id, false)
 		if err != nil {
 			return flightResult{}, err
 		}
-		if fr.fromNVMe {
-			_ = e.nvme.Delete(fctx, id.Key)
-		}
 
-		evicted := e.sharedRAM.PutExclusive(id.Key, keyHash, fr.data, false)
+		evicted, admitted := e.sharedRAM.PutExclusive(id.Key, keyHash, fr.data, false)
+		if admitted {
+			if fr.fromNVMe {
+				_ = e.nvme.Delete(fctx, id.Key)
+			}
+		} else if fr.fromS3 {
+			_ = e.nvme.WritePromotion(fctx, id.Key, fr.data)
+		}
 		// Demote every evicted victim back to NVMe — real promotion/demotion
 		// writeback IOPS and channel contention!
 		for _, v := range evicted {
@@ -373,7 +387,7 @@ func (e *Engine) readPerAgentPrivate(ctx context.Context, agentID string, id Blo
 		e.nvmeHits.Add(1)
 	}
 
-	evicted := pool.PutExclusive(id.Key, keyHash, res.data, false)
+	evicted, _ := pool.PutExclusive(id.Key, keyHash, res.data, false)
 	for _, v := range evicted {
 		// Private per-agent read-only cache drops clean copies without NVMe demotion.
 		pool.FinishDemotion(v.key)
@@ -467,9 +481,10 @@ func (e *Engine) fetchVerifiedShared(ctx context.Context, id BlockID, populateNV
 }
 
 // PutPrivate stores a mutable tenant/volume-scoped workspace block.
-// Private blocks are encrypted per-volume using the Scope's registered
-// vfs.Cipher (e.g. vfs.Hybrid X25519 + ML-KEM-768) and are strictly excluded
-// from the shared toolchain RAM mirror.
+// Private blocks MUST be encrypted per-volume using the Scope's registered
+// vfs.Cipher (e.g. vfs.Hybrid X25519 + ML-KEM-768), authenticate their
+// (TenantID, VolumeID, Key) identity inside the encrypted envelope, and are
+// strictly excluded from the shared toolchain RAM mirror.
 func (e *Engine) PutPrivate(ctx context.Context, caller Scope, id BlockID, plaintext []byte) error {
 	if id.Class != ClassPrivateWorkspace {
 		e.isolationRejects.Add(1)
@@ -483,16 +498,19 @@ func (e *Engine) PutPrivate(ctx context.Context, caller Scope, id BlockID, plain
 		return fmt.Errorf("%w: caller scope %+v cannot write block scope %+v", ErrTenantIsolation, caller, id.Scope)
 	}
 
-	payload := make([]byte, len(plaintext))
-	copy(payload, plaintext)
-
-	if c, ok := e.cipherForScope(caller); ok {
-		var err error
-		payload, err = sealEnvelope(c, payload)
-		if err != nil {
-			return err
-		}
+	c, ok := e.cipherForScope(caller)
+	if !ok {
+		e.isolationRejects.Add(1)
+		return fmt.Errorf("%w: no volume cipher registered for scope %+v", ErrTenantIsolation, caller)
 	}
+
+	payload, err := sealEnvelope(c, caller, id.Key, plaintext)
+	if err != nil {
+		return err
+	}
+
+	unlock := e.lockKey(id.Key)
+	defer unlock()
 
 	e.writes.Add(1)
 	if err := e.nvme.WriteSync(ctx, id.Key, payload); err != nil {
@@ -505,7 +523,9 @@ func (e *Engine) PutPrivate(ctx context.Context, caller Scope, id BlockID, plain
 }
 
 // ReadPrivate reads a tenant/volume-scoped workspace block, enforcing strict
-// cross-tenant isolation and per-volume PQ decryption via vfs.Cipher.
+// cross-tenant isolation, mandatory per-volume PQ decryption via vfs.Cipher,
+// authenticated (Scope, Key) identity binding, and per-key serialization with
+// concurrent PutPrivate calls so delayed S3 refills never roll back newer writes.
 // Private blocks never enter the shared RAM mirror.
 func (e *Engine) ReadPrivate(ctx context.Context, caller Scope, id BlockID) ([]byte, error) {
 	if id.Class != ClassPrivateWorkspace {
@@ -520,17 +540,27 @@ func (e *Engine) ReadPrivate(ctx context.Context, caller Scope, id BlockID) ([]b
 		return nil, fmt.Errorf("%w: caller scope %+v cannot read block scope %+v", ErrTenantIsolation, caller, id.Scope)
 	}
 
+	c, ok := e.cipherForScope(caller)
+	if !ok {
+		e.isolationRejects.Add(1)
+		return nil, fmt.Errorf("%w: no volume cipher registered for scope %+v", ErrTenantIsolation, caller)
+	}
+
+	unlock := e.lockKey(id.Key)
 	e.reads.Add(1)
 	raw, err := e.nvme.Read(ctx, id.Key)
 	if err != nil {
 		if !errors.Is(err, ErrNotFound) {
+			unlock()
 			return nil, err
 		}
 		if err := sleepWithContext(ctx, e.cfg.RemoteLatency); err != nil {
+			unlock()
 			return nil, err
 		}
 		raw, _, err = e.remote.Get(ctx, id.Key, backend.Unbounded)
 		if err != nil {
+			unlock()
 			if errors.Is(err, backend.ErrNotFound) {
 				return nil, ErrNotFound
 			}
@@ -541,18 +571,16 @@ func (e *Engine) ReadPrivate(ctx context.Context, caller Scope, id BlockID) ([]b
 	} else {
 		e.nvmeHits.Add(1)
 	}
+	unlock()
 
-	if c, ok := e.cipherForScope(caller); ok {
-		plain, err := openEnvelope(c, raw)
-		if err != nil {
-			return nil, err
+	plain, err := openEnvelope(c, caller, id.Key, raw)
+	if err != nil {
+		if errors.Is(err, ErrCorruptBlock) {
+			e.corruptionRejects.Add(1)
 		}
-		return plain, nil
+		return nil, err
 	}
-
-	out := make([]byte, len(raw))
-	copy(out, raw)
-	return out, nil
+	return plain, nil
 }
 
 // AttemptMirrorPrivate explicitly verifies that private workspace blocks can
@@ -578,20 +606,28 @@ func (e *Engine) WriteMutable(ctx context.Context, caller Scope, id BlockID, dat
 		return fmt.Errorf("%w: caller scope %+v cannot mutate %+v", ErrTenantIsolation, caller, id.Scope)
 	}
 
+	unlock := e.lockKey(id.Key)
+	defer unlock()
+
 	e.writes.Add(1)
 	keyHash := HashKey(id.Key)
 
 	switch e.cfg.Regime {
 	case RegimeExclusiveMigration:
 		// Ordinary write-back cache-tier migration: absorb writes in RAM without
-		// synchronous NVMe write-through; flush dirty victims to NVMe only on eviction.
-		evicted := e.sharedRAM.PutExclusive(id.Key, keyHash, data, true)
+		// synchronous NVMe write-through; flush dirty victims to NVMe on eviction.
+		// If the block exceeds a positive RAM budget, write through directly to NVMe
+		// so the write is never silently lost.
+		evicted, admitted := e.sharedRAM.PutExclusive(id.Key, keyHash, data, true)
 		for _, v := range evicted {
 			if err := e.nvme.WriteDemotion(ctx, v.key, v.data); err != nil {
 				e.sharedRAM.FinishDemotion(v.key)
 				return err
 			}
 			e.sharedRAM.FinishDemotion(v.key)
+		}
+		if !admitted {
+			return e.nvme.WriteSync(ctx, id.Key, data)
 		}
 		return nil
 
@@ -601,8 +637,9 @@ func (e *Engine) WriteMutable(ctx context.Context, caller Scope, id BlockID, dat
 			return fmt.Errorf("%w: MOST forbids mirroring mutable blocks in production mode", ErrTenantIsolation)
 		}
 		e.tracker.ObserveWrite(keyHash)
-		// Dual RAM+NVMe mirror ablation: every write MUST synchronously sync
-		// NVMe AND invalidate/refresh the mirrored RAM copy!
+		// Dual RAM+NVMe mirror ablation: held under per-key lock so concurrent
+		// ReadMutable cannot fetch a pre-write NVMe snapshot and re-admit stale
+		// bytes into sharedRAM after invalidation.
 		if e.sharedRAM.Delete(id.Key) {
 			e.mirrorInvalidations.Add(1)
 		}
@@ -629,6 +666,9 @@ func (e *Engine) ReadMutable(ctx context.Context, caller Scope, id BlockID) ([]b
 		return nil, fmt.Errorf("%w: caller scope %+v cannot read %+v", ErrTenantIsolation, caller, id.Scope)
 	}
 
+	unlock := e.lockKey(id.Key)
+	defer unlock()
+
 	e.reads.Add(1)
 	keyHash := HashKey(id.Key)
 
@@ -643,7 +683,7 @@ func (e *Engine) ReadMutable(ctx context.Context, caller Scope, id BlockID) ([]b
 			return nil, err
 		}
 		e.nvmeHits.Add(1)
-		evicted := e.sharedRAM.PutExclusive(id.Key, keyHash, data, false)
+		evicted, _ := e.sharedRAM.PutExclusive(id.Key, keyHash, data, false)
 		for _, v := range evicted {
 			if demErr := e.nvme.WriteDemotion(ctx, v.key, v.data); demErr != nil {
 				e.sharedRAM.FinishDemotion(v.key)
@@ -786,8 +826,72 @@ func (e *Engine) cipherForScope(sc Scope) (vfs.Cipher, bool) {
 	return c, ok
 }
 
-func sealEnvelope(c vfs.Cipher, plaintext []byte) ([]byte, error) {
-	sealed, keyID, err := c.Seal(plaintext)
+func encodeAuthenticatedPrivatePayload(sc Scope, blockKey string, plaintext []byte) []byte {
+	tBytes := []byte(sc.TenantID)
+	vBytes := []byte(sc.VolumeID)
+	kBytes := []byte(blockKey)
+	buf := make([]byte, 4+4+len(tBytes)+4+len(vBytes)+4+len(kBytes)+len(plaintext))
+	off := 0
+	copy(buf[off:off+4], privatePayloadMagic[:])
+	off += 4
+	binary.BigEndian.PutUint32(buf[off:off+4], uint32(len(tBytes)))
+	off += 4
+	copy(buf[off:off+len(tBytes)], tBytes)
+	off += len(tBytes)
+	binary.BigEndian.PutUint32(buf[off:off+4], uint32(len(vBytes)))
+	off += 4
+	copy(buf[off:off+len(vBytes)], vBytes)
+	off += len(vBytes)
+	binary.BigEndian.PutUint32(buf[off:off+4], uint32(len(kBytes)))
+	off += 4
+	copy(buf[off:off+len(kBytes)], kBytes)
+	off += len(kBytes)
+	copy(buf[off:], plaintext)
+	return buf
+}
+
+func decodeAuthenticatedPrivatePayload(sc Scope, blockKey string, frame []byte) ([]byte, error) {
+	if len(frame) < 16 || !bytes.Equal(frame[:4], privatePayloadMagic[:]) {
+		return nil, fmt.Errorf("%w: invalid authenticated private payload header", ErrCorruptBlock)
+	}
+	off := 4
+	readField := func() (string, error) {
+		if off+4 > len(frame) {
+			return "", fmt.Errorf("%w: truncated private payload identity", ErrCorruptBlock)
+		}
+		n := int(binary.BigEndian.Uint32(frame[off : off+4]))
+		off += 4
+		if n < 0 || off+n > len(frame) {
+			return "", fmt.Errorf("%w: truncated private payload field", ErrCorruptBlock)
+		}
+		s := string(frame[off : off+n])
+		off += n
+		return s, nil
+	}
+	gotTenant, err := readField()
+	if err != nil {
+		return nil, err
+	}
+	gotVolume, err := readField()
+	if err != nil {
+		return nil, err
+	}
+	gotKey, err := readField()
+	if err != nil {
+		return nil, err
+	}
+	if gotTenant != sc.TenantID || gotVolume != sc.VolumeID || gotKey != blockKey {
+		return nil, fmt.Errorf("%w: private block identity mismatch (got %s/%s:%s, want %s/%s:%s)",
+			ErrCorruptBlock, gotTenant, gotVolume, gotKey, sc.TenantID, sc.VolumeID, blockKey)
+	}
+	out := make([]byte, len(frame)-off)
+	copy(out, frame[off:])
+	return out, nil
+}
+
+func sealEnvelope(c vfs.Cipher, sc Scope, blockKey string, plaintext []byte) ([]byte, error) {
+	framed := encodeAuthenticatedPrivatePayload(sc, blockKey, plaintext)
+	sealed, keyID, err := c.Seal(framed)
 	if err != nil {
 		return nil, err
 	}
@@ -802,7 +906,7 @@ func sealEnvelope(c vfs.Cipher, plaintext []byte) ([]byte, error) {
 	return out, nil
 }
 
-func openEnvelope(c vfs.Cipher, raw []byte) ([]byte, error) {
+func openEnvelope(c vfs.Cipher, sc Scope, blockKey string, raw []byte) ([]byte, error) {
 	if len(raw) < 6 || !bytes.Equal(raw[:4], envelopeMagic[:]) {
 		return nil, fmt.Errorf("%w: invalid private cipher envelope", ErrCorruptBlock)
 	}
@@ -812,5 +916,9 @@ func openEnvelope(c vfs.Cipher, raw []byte) ([]byte, error) {
 	}
 	keyID := string(raw[6 : 6+idLen])
 	sealed := raw[6+idLen:]
-	return c.Open(sealed, keyID)
+	framed, err := c.Open(sealed, keyID)
+	if err != nil {
+		return nil, err
+	}
+	return decodeAuthenticatedPrivatePayload(sc, blockKey, framed)
 }

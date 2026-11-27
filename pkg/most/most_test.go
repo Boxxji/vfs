@@ -528,6 +528,10 @@ func TestCrossTenantIsolationAndSharedMirrorBoundary(t *testing.T) {
 		AllowedNamespaces: []string{"go-1-27-stdlib"},
 		NVMe:              most.NVMeConfig{Store: nvmeBe, Channels: 4},
 		Remote:            s3Be,
+		VolumeCiphers: map[most.Scope]vfs.Cipher{
+			tenantA: newHybridCipher(t),
+			tenantB: newHybridCipher(t),
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1304,5 +1308,295 @@ func TestNegativeRegime3SingleAgentAmpleRAM(t *testing.T) {
 	if mMOST.RAMPerAgentBytes <= mPin.RAMPerAgentBytes {
 		t.Fatalf("expected MOST RAM/agent (%.0f) > naive pin (%.0f) due to tracker metadata overhead when M=1 and RAM>=WS",
 			mMOST.RAMPerAgentBytes, mPin.RAMPerAgentBytes)
+	}
+}
+
+// TestCodexP1PrivateIORequiresRegisteredCipher verifies PutPrivate and
+// ReadPrivate fail closed with ErrTenantIsolation when a Scope lacks a
+// registered per-volume cipher (never silently storing plaintext).
+func TestCodexP1PrivateIORequiresRegisteredCipher(t *testing.T) {
+	ctx := context.Background()
+	nvmeBe := openFileNVMe(t)
+	_, s3Be := openLiveS3(t, "no-cipher")
+
+	sc := most.Scope{TenantID: "unreg-tenant", VolumeID: "unreg-vol"}
+	eng, err := most.NewEngine(most.Config{
+		Regime:            most.RegimeMOSTSelectiveMirror,
+		RAMBudgetBytes:    64 << 10,
+		AllowedNamespaces: []string{"go-1-27-stdlib"},
+		NVMe:              most.NVMeConfig{Store: nvmeBe, Channels: 2},
+		Remote:            s3Be,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pid, err := most.NewPrivateBlockID(sc, "secret-file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.PutPrivate(ctx, sc, pid, []byte("must-not-write-plaintext")); !errors.Is(err, most.ErrTenantIsolation) {
+		t.Fatalf("PutPrivate without cipher = %v, want ErrTenantIsolation", err)
+	}
+	if _, err := eng.ReadPrivate(ctx, sc, pid); !errors.Is(err, most.ErrTenantIsolation) {
+		t.Fatalf("ReadPrivate without cipher = %v, want ErrTenantIsolation", err)
+	}
+	if _, _, err := nvmeBe.Get(ctx, pid.Key, backend.Unbounded); !errors.Is(err, backend.ErrNotFound) {
+		t.Fatalf("unregistered PutPrivate unexpectedly wrote to NVMe: err=%v", err)
+	}
+	if _, _, err := s3Be.Get(ctx, pid.Key, backend.Unbounded); !errors.Is(err, backend.ErrNotFound) {
+		t.Fatalf("unregistered PutPrivate unexpectedly wrote to S3: err=%v", err)
+	}
+}
+
+// TestCodexP1PrivateEnvelopeAuthenticatesBlockIdentity verifies that swapping
+// ciphertext between two private blocks under the SAME Scope and volume cipher
+// is rejected fail-closed with ErrCorruptBlock.
+func TestCodexP1PrivateEnvelopeAuthenticatesBlockIdentity(t *testing.T) {
+	ctx := context.Background()
+	nvmeBe := openFileNVMe(t)
+	_, s3Be := openLiveS3(t, "swap-id")
+
+	sc := most.Scope{TenantID: "t-swap", VolumeID: "v-swap"}
+	eng, err := most.NewEngine(most.Config{
+		Regime:            most.RegimeMOSTSelectiveMirror,
+		RAMBudgetBytes:    64 << 10,
+		AllowedNamespaces: []string{"go-1-27-stdlib"},
+		NVMe:              most.NVMeConfig{Store: nvmeBe, Channels: 2},
+		Remote:            s3Be,
+		VolumeCiphers:     map[most.Scope]vfs.Cipher{sc: newHybridCipher(t)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	blkA, err := most.NewPrivateBlockID(sc, "block-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	blkB, err := most.NewPrivateBlockID(sc, "block-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.PutPrivate(ctx, sc, blkA, []byte("payload-A")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.PutPrivate(ctx, sc, blkB, []byte("payload-B")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Substitute block B's valid ciphertext into block A's NVMe & S3 keys.
+	rawB, _, err := nvmeBe.Get(ctx, blkB.Key, backend.Unbounded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := nvmeBe.Put(ctx, blkA.Key, rawB); err != nil {
+		t.Fatal(err)
+	}
+	if err := s3Be.Put(ctx, blkA.Key, rawB); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := eng.ReadPrivate(ctx, sc, blkA); !errors.Is(err, most.ErrCorruptBlock) {
+		t.Fatalf("substituted private block ReadPrivate(A) = %v, want ErrCorruptBlock", err)
+	}
+	if eng.Metrics().CorruptionRejects == 0 {
+		t.Fatalf("expected CorruptionRejects > 0 after block identity mismatch")
+	}
+}
+
+// TestCodexP1PrivateCacheRefillCoordinatedWithConcurrentPut verifies that a
+// delayed S3 refill in ReadPrivate cannot overwrite a concurrent PutPrivate on NVMe.
+func TestCodexP1PrivateCacheRefillCoordinatedWithConcurrentPut(t *testing.T) {
+	ctx := context.Background()
+	nvmeBe := openFileNVMe(t)
+	_, s3Be := openLiveS3(t, "priv-race")
+
+	sc := most.Scope{TenantID: "t-race", VolumeID: "v-race"}
+	eng, err := most.NewEngine(most.Config{
+		Regime:            most.RegimeMOSTSelectiveMirror,
+		RAMBudgetBytes:    64 << 10,
+		RemoteLatency:     15 * time.Millisecond,
+		AllowedNamespaces: []string{"go-1-27-stdlib"},
+		NVMe:              most.NVMeConfig{Store: nvmeBe, Channels: 2},
+		Remote:            s3Be,
+		VolumeCiphers:     map[most.Scope]vfs.Cipher{sc: newHybridCipher(t)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pid, err := most.NewPrivateBlockID(sc, "hot-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	v1 := []byte("version-1-old-snapshot")
+	v2 := []byte("version-2-new-committed-write")
+	if err := eng.PutPrivate(ctx, sc, pid, v1); err != nil {
+		t.Fatal(err)
+	}
+	// Evict NVMe copy so ReadPrivate must perform a slow S3 refill.
+	if err := nvmeBe.Delete(ctx, pid.Key); err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	readErrCh := make(chan error, 1)
+	putErrCh := make(chan error, 1)
+	go func() {
+		defer wg.Done()
+		_, err := eng.ReadPrivate(ctx, sc, pid)
+		readErrCh <- err
+	}()
+	time.Sleep(3 * time.Millisecond)
+	go func() {
+		defer wg.Done()
+		putErrCh <- eng.PutPrivate(ctx, sc, pid, v2)
+	}()
+	wg.Wait()
+	if err := <-readErrCh; err != nil {
+		t.Fatalf("concurrent ReadPrivate: %v", err)
+	}
+	if err := <-putErrCh; err != nil {
+		t.Fatalf("concurrent PutPrivate: %v", err)
+	}
+
+	// After PutPrivate(v2) succeeds, subsequent reads MUST see v2 (never rolled back to v1).
+	got, err := eng.ReadPrivate(ctx, sc, pid)
+	if err != nil {
+		t.Fatalf("post-race ReadPrivate: %v", err)
+	}
+	if !bytes.Equal(got, v2) {
+		t.Fatalf("ReadPrivate returned %q after PutPrivate(v2), want %q (stale refill rolled back write)", got, v2)
+	}
+}
+
+// TestCodexP2OversizedExclusiveAdmissionPreservesLowerTier verifies that blocks
+// larger than RAMBudgetBytes are never silently dropped on WriteMutable and
+// never deleted from NVMe on ReadShared(exclusive_tier_migration).
+func TestCodexP2OversizedExclusiveAdmissionPreservesLowerTier(t *testing.T) {
+	ctx := context.Background()
+	nvmeBe := openFileNVMe(t)
+	_, s3Be := openLiveS3(t, "oversized-excl")
+
+	sc := most.Scope{TenantID: "t-big", VolumeID: "v-big"}
+	eng, err := most.NewEngine(most.Config{
+		Regime:            most.RegimeExclusiveMigration,
+		RAMBudgetBytes:    1024, // Smaller than 4 KiB block
+		AllowedNamespaces: []string{"go-1-27-stdlib"},
+		NVMe:              most.NVMeConfig{Store: nvmeBe, Channels: 2},
+		Remote:            s3Be,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Oversized WriteMutable must write through to NVMe and be readable immediately.
+	mutID, err := most.NewPrivateBlockID(sc, "oversized-mut")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bigMut := makeDeterministicBlock(9001, 4096)
+	if err := eng.WriteMutable(ctx, sc, mutID, bigMut); err != nil {
+		t.Fatalf("oversized WriteMutable: %v", err)
+	}
+	gotMut, err := eng.ReadMutable(ctx, sc, mutID)
+	if err != nil {
+		t.Fatalf("oversized ReadMutable: %v", err)
+	}
+	if !bytes.Equal(gotMut, bigMut) {
+		t.Fatalf("oversized ReadMutable payload mismatch")
+	}
+
+	// 2. Oversized ReadShared in exclusive mode must keep NVMe entry intact (no forced S3 re-fetch).
+	bigShared := makeDeterministicBlock(9002, 4096)
+	shID, err := most.NewSharedBlockID("go-1-27-stdlib", bigShared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.PutShared(ctx, shID, bigShared, true); err != nil {
+		t.Fatal(err)
+	}
+	for rep := 0; rep < 3; rep++ {
+		got, err := eng.ReadShared(ctx, "agent-0", shID)
+		if err != nil {
+			t.Fatalf("oversized ReadShared #%d: %v", rep, err)
+		}
+		if !bytes.Equal(got, bigShared) {
+			t.Fatalf("oversized ReadShared payload mismatch")
+		}
+	}
+	if eng.Metrics().S3Fetches != 0 {
+		t.Fatalf("oversized exclusive ReadShared forced %d S3 fetches instead of preserving NVMe copy", eng.Metrics().S3Fetches)
+	}
+}
+
+// TestCodexP2MutableMirrorInvalidationAtomicWithNVMeUpdate verifies that
+// concurrent ReadMutable + WriteMutable under AllowMutableMirrorForStudy never
+// leaves a stale pre-write value pinned in the RAM mirror after a write finishes.
+func TestCodexP2MutableMirrorInvalidationAtomicWithNVMeUpdate(t *testing.T) {
+	ctx := context.Background()
+	nvmeBe := openFileNVMe(t)
+	_, s3Be := openLiveS3(t, "mut-coh")
+
+	sc := most.Scope{TenantID: "t-coh", VolumeID: "v-coh"}
+	eng, err := most.NewEngine(most.Config{
+		Regime:                     most.RegimeMOSTSelectiveMirror,
+		RAMBudgetBytes:             64 << 10,
+		AllowMutableMirrorForStudy: true,
+		AllowedNamespaces:          []string{"go-1-27-stdlib"},
+		NVMe:                       most.NVMeConfig{Store: nvmeBe, Channels: 2},
+		Remote:                     s3Be,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mutID, err := most.NewPrivateBlockID(sc, "coherence-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.SeedMutable(ctx, mutID, []byte("gen-0")); err != nil {
+		t.Fatal(err)
+	}
+
+	const iters = 40
+	stop := make(chan struct{})
+	var rwg sync.WaitGroup
+	for r := 0; r < 4; r++ {
+		rwg.Add(1)
+		go func() {
+			defer rwg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					_, _ = eng.ReadMutable(ctx, sc, mutID)
+				}
+			}
+		}()
+	}
+
+	var last []byte
+	for i := 1; i <= iters; i++ {
+		last = []byte(fmt.Sprintf("gen-%d", i))
+		if err := eng.WriteMutable(ctx, sc, mutID, last); err != nil {
+			close(stop)
+			rwg.Wait()
+			t.Fatalf("WriteMutable iter %d: %v", i, err)
+		}
+	}
+	close(stop)
+	rwg.Wait()
+
+	// Once all writes have completed, RAM mirror MUST NOT serve any stale pre-write value.
+	got, err := eng.ReadMutable(ctx, sc, mutID)
+	if err != nil {
+		t.Fatalf("final ReadMutable: %v", err)
+	}
+	if !bytes.Equal(got, last) {
+		t.Fatalf("stale mutable mirror value %q after final write %q", got, last)
 	}
 }

@@ -107,14 +107,25 @@ func (p *ramPool) peekVictimLocked() (*ramEntry, bool) {
 
 // PutExclusive inserts key into RAM under exclusive-tier semantics, evicting
 // cold entries as needed and placing them into the demoting map until their
-// NVMe demotion writes finish.
-func (p *ramPool) PutExclusive(key string, keyHash uint64, data []byte, dirty bool) []evictedEntry {
+// NVMe demotion writes finish. It returns (evicted, admitted); when a single
+// block exceeds a positive RAM budget, admitted is false and the caller must
+// retain or write through the lower-tier copy.
+func (p *ramPool) PutExclusive(key string, keyHash uint64, data []byte, dirty bool) ([]evictedEntry, bool) {
 	cp := make([]byte, len(data))
 	copy(cp, data)
 	sz := int64(len(cp))
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	if p.budget > 0 && sz > p.budget {
+		// Single block exceeds total RAM budget; cannot fit. Drop any stale
+		// smaller entry for key so callers never observe pre-write RAM bytes.
+		if existing, ok := p.entries[key]; ok {
+			p.removeLocked(existing)
+		}
+		return nil, false
+	}
 
 	if existing, ok := p.entries[key]; ok {
 		p.used -= existing.size
@@ -129,12 +140,7 @@ func (p *ramPool) PutExclusive(key string, keyHash uint64, data []byte, dirty bo
 			p.peak = p.used
 		}
 		p.order.MoveToFront(existing.elem)
-		return nil
-	}
-
-	if p.budget > 0 && sz > p.budget {
-		// Single block exceeds total RAM budget; cannot fit.
-		return nil
+		return nil, true
 	}
 
 	var evicted []evictedEntry
@@ -166,7 +172,7 @@ func (p *ramPool) PutExclusive(key string, keyHash uint64, data []byte, dirty bo
 	if p.used > p.peak {
 		p.peak = p.used
 	}
-	return evicted
+	return evicted, true
 }
 
 // FinishDemotion removes key from the in-flight demoting visibility map once
