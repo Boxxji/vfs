@@ -4,6 +4,7 @@
 package dogi
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -51,6 +52,7 @@ type openStream struct {
 
 type sealedPack struct {
 	id              packID
+	seq             uint64
 	key             string
 	class           LifetimeClass
 	entries         []*packEntry
@@ -79,10 +81,11 @@ type Packer struct {
 	nsPrefix   string
 	classifier *Classifier
 
-	mu      sync.Mutex
-	streams [NumClasses]*openStream
-	packs   map[packID]*sealedPack
-	live    map[string]*liveRecord
+	mu          sync.Mutex
+	streams     [NumClasses]*openStream
+	packs       map[packID]*sealedPack
+	live        map[string]*liveRecord
+	nextPackSeq uint64
 
 	// Cumulative telemetry.
 	totalIngestBytes  int64
@@ -177,7 +180,7 @@ func (p *Packer) PutChunk(ctx context.Context, meta ChunkMeta, data []byte) ([32
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	_, isOverwrite := p.live[cleanPath]
+	prevRec, isOverwrite := p.live[cleanPath]
 	if isOverwrite {
 		p.invalidatePathLocked(cleanPath, meta.Epoch, true)
 	}
@@ -197,6 +200,18 @@ func (p *Packer) PutChunk(ctx context.Context, meta ChunkMeta, data []byte) ([32
 	}
 
 	if err := p.appendToStreamLocked(ctx, cls, entry, frame, meta.Epoch); err != nil {
+		// Restore previously live record and counters so failed auto-flushes leave
+		// packer state and accounting invariants strictly consistent.
+		if isOverwrite {
+			prevRec.entry.live = true
+			p.live[cleanPath] = prevRec
+			p.liveBytes += prevRec.entry.plainLen
+			p.liveChunks++
+			if prevRec.sealed != nil {
+				prevRec.sealed.liveBytes += prevRec.entry.plainLen
+				prevRec.sealed.deadBytes -= prevRec.entry.plainLen
+			}
+		}
 		return [32]byte{}, 0, err
 	}
 
@@ -254,6 +269,12 @@ func (p *Packer) appendToStreamLocked(ctx context.Context, cls LifetimeClass, en
 		streamIdx = 0
 	}
 	st := p.streams[streamIdx]
+	prevBufLen := len(st.buf)
+	prevEntriesLen := len(st.entries)
+	prevPlainSize := st.plainSize
+	prevID := st.id
+	prevLiveRec, hadPrevLive := p.live[entry.path]
+
 	if len(st.buf) == 0 {
 		id, err := newPackID()
 		if err != nil {
@@ -274,7 +295,22 @@ func (p *Packer) appendToStreamLocked(ctx context.Context, cls LifetimeClass, en
 	p.live[entry.path] = &liveRecord{entry: entry, open: st}
 
 	if len(st.buf) >= p.cfg.PackTargetBytes {
-		return p.flushStreamLocked(ctx, streamIdx, epoch)
+		if err := p.flushStreamLocked(ctx, streamIdx, epoch); err != nil {
+			// Roll back stream buffer and live index atomically so a failed upload
+			// never leaves an uncounted frame or dangling open entry.
+			st.buf = st.buf[:prevBufLen]
+			st.entries = st.entries[:prevEntriesLen]
+			st.plainSize = prevPlainSize
+			if prevBufLen == 0 {
+				st.id = prevID
+			}
+			if hadPrevLive {
+				p.live[entry.path] = prevLiveRec
+			} else {
+				delete(p.live, entry.path)
+			}
+			return err
+		}
 	}
 	return nil
 }
@@ -288,11 +324,32 @@ func (p *Packer) flushStreamLocked(ctx context.Context, streamIdx int, epoch uin
 	key := p.packKey(st.id)
 	payload := append([]byte(nil), st.buf...)
 	if _, err := p.be.PutIfAbsent(ctx, key, payload); err != nil {
-		return fmt.Errorf("dogi: put pack %s: %w", key, err)
+		if errors.Is(err, backend.ErrConflict) {
+			// Reconcile ambiguous prior uploads whose acknowledgement was lost:
+			// if the existing immutable object matches byte-for-byte, seal it directly;
+			// otherwise allocate a fresh pack ID and retry without wedging the stream.
+			existing, _, getErr := p.be.Get(ctx, key, int64(len(payload))+1)
+			if getErr == nil && bytes.Equal(existing, payload) {
+				err = nil
+			} else {
+				freshID, idErr := newPackID()
+				if idErr != nil {
+					return idErr
+				}
+				st.id = freshID
+				key = p.packKey(freshID)
+				_, err = p.be.PutIfAbsent(ctx, key, payload)
+			}
+		}
+		if err != nil {
+			return fmt.Errorf("dogi: put pack %s: %w", key, err)
+		}
 	}
 
+	p.nextPackSeq++
 	sp := &sealedPack{
 		id:           st.id,
+		seq:          p.nextPackSeq,
 		key:          key,
 		class:        st.class,
 		entries:      append([]*packEntry(nil), st.entries...),
@@ -344,46 +401,68 @@ func (p *Packer) flushAllLocked(ctx context.Context, epoch uint64) error {
 // ReadPath reads and verifies the currently live chunk for rawPath, using a
 // ranged backend read (GetRange) when the chunk resides in a sealed pack, or
 // directly from the open buffer if not yet flushed.
+//
+// If concurrent GC relocates a live chunk and deletes its old source pack
+// between metadata lookup and GetRange, ReadPath detects the relocation and
+// retries transparently against the current live record.
 func (p *Packer) ReadPath(ctx context.Context, rawPath string) ([]byte, [32]byte, error) {
 	if rawPath == "" {
 		return nil, [32]byte{}, fmt.Errorf("%w: empty path", ErrInvalidChunk)
 	}
 	cleanPath, _, _ := normalizePath(rawPath)
 
-	p.mu.Lock()
-	rec, ok := p.live[cleanPath]
-	if !ok {
-		p.mu.Unlock()
-		return nil, [32]byte{}, fmt.Errorf("%w: %s", ErrChunkNotFound, cleanPath)
-	}
-	chunkID := rec.entry.chunkID
-	off := rec.entry.off
-	frameLen := rec.entry.frameLen
-	var frame []byte
-	var packKey string
-	if rec.open != nil {
-		frame = append([]byte(nil), rec.open.buf[off:off+frameLen]...)
-	} else {
-		packKey = rec.sealed.key
-	}
-	p.mu.Unlock()
-
-	if frame == nil {
-		var err error
-		frame, err = p.be.GetRange(ctx, packKey, off, frameLen)
-		if err != nil {
-			if errors.Is(err, backend.ErrNotFound) {
-				return nil, [32]byte{}, fmt.Errorf("%w: pack %s missing", ErrCorruptPack, packKey)
-			}
-			return nil, [32]byte{}, fmt.Errorf("dogi: read range %s: %w", packKey, err)
+	const maxRelocationRetries = 8
+	for attempt := 0; attempt < maxRelocationRetries; attempt++ {
+		p.mu.Lock()
+		rec, ok := p.live[cleanPath]
+		if !ok {
+			p.mu.Unlock()
+			return nil, [32]byte{}, fmt.Errorf("%w: %s", ErrChunkNotFound, cleanPath)
 		}
-	}
+		chunkID := rec.entry.chunkID
+		off := rec.entry.off
+		frameLen := rec.entry.frameLen
+		var frame []byte
+		var packKey string
+		if rec.open != nil {
+			frame = append([]byte(nil), rec.open.buf[off:off+frameLen]...)
+		} else {
+			packKey = rec.sealed.key
+		}
+		p.mu.Unlock()
 
-	plain, err := decodeChunkFrame(p.cfg.Namespace, chunkID, frame, p.cfg.Sealer)
-	if err != nil {
-		return nil, [32]byte{}, err
+		if frame == nil {
+			var err error
+			frame, err = p.be.GetRange(ctx, packKey, off, frameLen)
+			if err != nil {
+				if errors.Is(err, backend.ErrNotFound) {
+					// Distinguish concurrent GC relocation / deletion from genuine pack corruption.
+					p.mu.Lock()
+					cur, stillLive := p.live[cleanPath]
+					relocated := stillLive && (cur.open != nil ||
+						cur.sealed.key != packKey ||
+						cur.entry.off != off ||
+						cur.entry.chunkID != chunkID)
+					p.mu.Unlock()
+					if !stillLive {
+						return nil, [32]byte{}, fmt.Errorf("%w: %s", ErrChunkNotFound, cleanPath)
+					}
+					if relocated {
+						continue
+					}
+					return nil, [32]byte{}, fmt.Errorf("%w: pack %s missing", ErrCorruptPack, packKey)
+				}
+				return nil, [32]byte{}, fmt.Errorf("dogi: read range %s: %w", packKey, err)
+			}
+		}
+
+		plain, err := decodeChunkFrame(p.cfg.Namespace, chunkID, frame, p.cfg.Sealer)
+		if err != nil {
+			return nil, [32]byte{}, err
+		}
+		return plain, chunkID, nil
 	}
-	return plain, chunkID, nil
+	return nil, [32]byte{}, fmt.Errorf("%w: %s moved concurrently too many times", ErrCorruptPack, cleanPath)
 }
 
 // VerifyAllLive reads back EVERY currently live file from the backend (via

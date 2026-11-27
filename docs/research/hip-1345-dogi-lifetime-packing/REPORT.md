@@ -28,7 +28,7 @@ Library: [`pkg/dogi`](../../../pkg/dogi/). Reproducible benchmark runner: [`cmd/
 | Simulation Horizon | `20` epochs (flush + GC sweep per epoch) |
 | Default Pack Target | `1.00 MiB` (`1048576` bytes, immutable packs via `pkg/backend/file`) |
 | GC Compaction Threshold | `dead_ratio >= 0.50` (100%-dead packs always zero-copy dropped) |
-| Grounded Real Repo Corpus | `319` real repository files (`2.98 MiB` total) |
+| Grounded Real Repo Corpus | `319` real repository files (`2.99 MiB` total) |
 
 Four packing policies execute the exact same deterministic write/delete schedule, pack format, BLAKE3 verification, and collection-time evaluator:
 
@@ -61,10 +61,10 @@ Real repository workspace files interleaved with 20 epochs of short-lived CI/age
 
 | Policy | Ingest | Live Copied (GC) | LiveCopy vs FIFO | WAF | Peak Storage Amp | Mean Storage Amp | S3 PUTs (Packs) | PUTs vs FIFO | Zero-Copy Drops | Compacted Packs | GC GetRange Ops | Bit-Exact |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|
-| `fifo_mixed_baseline` | 43.41 MiB | 7.84 MiB | 0.0% | 1.180x | 1.279x | 1.144x | 79 | 0.0% | 8 | 49 | 380 | PASS |
-| `path_grouped_baseline` | 43.41 MiB | 0.70 MiB | -91.0% | 1.016x | 1.010x | 1.002x | 113 | +43.0% | 53 | 13 | 30 | PASS |
-| `dogi_lifetime_packed` | 43.41 MiB | 0.78 MiB | -90.0% | 1.018x | 1.037x | 1.017x | 111 | +40.5% | 51 | 13 | 40 | PASS |
-| `oracle_lifetime_upper_bound` | 43.41 MiB | 0.70 MiB | -91.0% | 1.016x | 1.010x | 1.002x | 93 | +17.7% | 53 | 13 | 30 | PASS |
+| `fifo_mixed_baseline` | 43.43 MiB | 7.85 MiB | 0.0% | 1.181x | 1.279x | 1.143x | 79 | 0.0% | 8 | 49 | 380 | PASS |
+| `path_grouped_baseline` | 43.43 MiB | 0.70 MiB | -91.0% | 1.016x | 1.010x | 1.002x | 113 | +43.0% | 53 | 13 | 30 | PASS |
+| `dogi_lifetime_packed` | 43.43 MiB | 0.78 MiB | -90.0% | 1.018x | 1.037x | 1.017x | 111 | +40.5% | 51 | 13 | 40 | PASS |
+| `oracle_lifetime_upper_bound` | 43.43 MiB | 0.70 MiB | -91.0% | 1.016x | 1.010x | 1.002x | 93 | +17.7% | 53 | 13 | 30 | PASS |
 
 ### opaque_renamed_paths_online_learning (`Positive Workload`)
 
@@ -72,10 +72,10 @@ Identical multi-tier lifetime dynamics under opaque, non-standard directory name
 
 | Policy | Ingest | Live Copied (GC) | LiveCopy vs FIFO | WAF | Peak Storage Amp | Mean Storage Amp | S3 PUTs (Packs) | PUTs vs FIFO | Zero-Copy Drops | Compacted Packs | GC GetRange Ops | Bit-Exact |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|
-| `fifo_mixed_baseline` | 43.47 MiB | 7.84 MiB | 0.0% | 1.180x | 1.267x | 1.130x | 79 | 0.0% | 8 | 49 | 380 | PASS |
-| `path_grouped_baseline` | 43.47 MiB | 7.84 MiB | 0.0% | 1.180x | 1.267x | 1.130x | 79 | 0.0% | 8 | 49 | 380 | PASS |
-| `dogi_lifetime_packed` | 43.47 MiB | 0.47 MiB | -94.0% | 1.011x | 1.133x | 1.075x | 77 | -2.5% | 46 | 3 | 20 | PASS |
-| `oracle_lifetime_upper_bound` | 43.47 MiB | 0.00 MiB | -100.0% | 1.000x | 1.002x | 1.002x | 80 | +1.3% | 53 | 0 | 0 | PASS |
+| `fifo_mixed_baseline` | 43.48 MiB | 7.85 MiB | 0.0% | 1.181x | 1.267x | 1.130x | 79 | 0.0% | 8 | 49 | 380 | PASS |
+| `path_grouped_baseline` | 43.48 MiB | 7.85 MiB | 0.0% | 1.181x | 1.267x | 1.130x | 79 | 0.0% | 8 | 49 | 380 | PASS |
+| `dogi_lifetime_packed` | 43.48 MiB | 0.47 MiB | -94.0% | 1.011x | 1.133x | 1.075x | 77 | -2.5% | 46 | 3 | 20 | PASS |
+| `oracle_lifetime_upper_bound` | 43.48 MiB | 0.00 MiB | -100.0% | 1.000x | 1.002x | 1.002x | 80 | +1.3% | 53 | 0 | 0 | PASS |
 
 ### neg_uniform_random_lifetime (`Honest Negative Control`)
 
@@ -83,10 +83,10 @@ Honest Negative Control 1: i.i.d. memoryless geometric deletion probability (p=0
 
 | Policy | Ingest | Live Copied (GC) | LiveCopy vs FIFO | WAF | Peak Storage Amp | Mean Storage Amp | S3 PUTs (Packs) | PUTs vs FIFO | Zero-Copy Drops | Compacted Packs | GC GetRange Ops | Bit-Exact |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|
-| `fifo_mixed_baseline` | 29.44 MiB | 15.58 MiB | 0.0% | 1.529x | 1.349x | 1.217x | 65 | 0.0% | 1 | 56 | 513 | PASS |
-| `path_grouped_baseline` | 29.44 MiB | 14.68 MiB | -5.8% | 1.499x | 1.341x | 1.209x | 105 | +61.5% | 4 | 87 | 486 | PASS |
-| `dogi_lifetime_packed` | 29.44 MiB | 15.07 MiB | -3.3% | 1.512x | 1.346x | 1.221x | 69 | +6.2% | 1 | 60 | 498 | PASS |
-| `oracle_lifetime_upper_bound` | 29.44 MiB | 9.66 MiB | -38.0% | 1.328x | 1.161x | 1.061x | 92 | +41.5% | 26 | 47 | 320 | PASS |
+| `fifo_mixed_baseline` | 29.44 MiB | 15.92 MiB | 0.0% | 1.541x | 1.315x | 1.214x | 65 | 0.0% | 1 | 56 | 524 | PASS |
+| `path_grouped_baseline` | 29.44 MiB | 14.68 MiB | -7.8% | 1.499x | 1.341x | 1.209x | 105 | +61.5% | 4 | 87 | 486 | PASS |
+| `dogi_lifetime_packed` | 29.44 MiB | 15.17 MiB | -4.7% | 1.515x | 1.364x | 1.218x | 70 | +7.7% | 3 | 59 | 502 | PASS |
+| `oracle_lifetime_upper_bound` | 29.44 MiB | 9.66 MiB | -39.3% | 1.328x | 1.161x | 1.061x | 92 | +41.5% | 26 | 47 | 320 | PASS |
 
 ### neg_append_only_no_deletes (`Honest Negative Control`)
 
@@ -120,9 +120,9 @@ Honest Negative Control 3: long-lived golden artifacts stored under tmp/golden/*
 
 | Pack Target | FIFO Live Copy | DOGI Live Copy | Live-Copy Reduction | FIFO WAF | DOGI WAF | FIFO Peak Amp | DOGI Peak Amp | FIFO PUTs | DOGI PUTs | DOGI Zero-Copy Drops |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| `0.25 MiB` | 7.88 MiB | 0.79 MiB | **90.0%** | 1.182x | 1.018x | 1.250x | 1.032x | 211 | 215 | 146 |
-| `1.00 MiB` | 7.84 MiB | 0.78 MiB | **90.0%** | 1.180x | 1.018x | 1.279x | 1.037x | 79 | 111 | 51 |
-| `4.00 MiB` | 7.84 MiB | 0.78 MiB | **90.0%** | 1.180x | 1.018x | 1.279x | 1.037x | 39 | 91 | 32 |
+| `0.25 MiB` | 7.54 MiB | 0.79 MiB | **89.5%** | 1.174x | 1.018x | 1.306x | 1.032x | 212 | 215 | 146 |
+| `1.00 MiB` | 7.85 MiB | 0.78 MiB | **90.0%** | 1.181x | 1.018x | 1.279x | 1.037x | 79 | 111 | 51 |
+| `4.00 MiB` | 7.85 MiB | 0.78 MiB | **90.0%** | 1.181x | 1.018x | 1.279x | 1.037x | 39 | 91 | 32 |
 
 ## 5. Correctness, Concurrency, Security, and Regression Evidence
 

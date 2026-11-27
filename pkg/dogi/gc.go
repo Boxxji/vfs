@@ -32,7 +32,7 @@ func (p *Packer) Collect(ctx context.Context, currentEpoch uint64) (GCStats, err
 		PacksScanned: len(p.packs),
 	}
 
-	// Deterministic pack ordering by key so GC behavior is reproducible across runs.
+	// Deterministic pack ordering by monotonic creation sequence (independent of random pack IDs).
 	victims := make([]*sealedPack, 0, len(p.packs))
 	for _, sp := range p.packs {
 		if sp.totalPlainBytes == 0 {
@@ -49,7 +49,7 @@ func (p *Packer) Collect(ctx context.Context, currentEpoch uint64) (GCStats, err
 		}
 	}
 	sort.Slice(victims, func(i, j int) bool {
-		return victims[i].key < victims[j].key
+		return victims[i].seq < victims[j].seq
 	})
 
 	var compactedVictims []*sealedPack
@@ -115,6 +115,7 @@ func (p *Packer) Collect(ctx context.Context, currentEpoch uint64) (GCStats, err
 			// transitions cleanly without double-counting liveBytes.
 			oldEntry.live = false
 			if err := p.appendToStreamLocked(ctx, destClass, relocated, newFrame, currentEpoch); err != nil {
+				oldEntry.live = true
 				return stats, fmt.Errorf("dogi: gc relocate %s: %w", oldEntry.path, err)
 			}
 

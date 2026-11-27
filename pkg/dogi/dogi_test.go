@@ -1013,3 +1013,304 @@ func TestConfigValidationAndEdgeCases(t *testing.T) {
 		t.Fatalf("missing DeletePath = (%v, %v), want (false, nil)", ok, err)
 	}
 }
+
+// TestReconcileUploadedPackAfterLostAck verifies that when PutIfAbsent stores
+// the pack on the backend but its acknowledgement is lost (storetest.Hook.After),
+// a subsequent FlushAll reconciles the existing immutable pack cleanly instead
+// of wedging permanently on backend.ErrConflict.
+func TestReconcileUploadedPackAfterLostAck(t *testing.T) {
+	ctx := context.Background()
+	mem := storetest.NewMem()
+	var mu sync.Mutex
+	failOnce := true
+	be := &storetest.Hook{
+		Backend: mem,
+		After: func(op, key string) error {
+			if op != "putabsent" {
+				return nil
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if failOnce {
+				failOnce = false
+				return errors.New("simulated lost acknowledgement after durable write")
+			}
+			return nil
+		},
+	}
+
+	ns := dogi.Namespace{TenantID: "ack-tenant", VolumeID: "ack-vol"}
+	pk, err := dogi.NewPacker(be, dogi.Config{
+		Namespace:       ns,
+		Policy:          dogi.PolicyDOGILifetime,
+		PackTargetBytes: 16 << 10,
+	})
+	if err != nil {
+		t.Fatalf("NewPacker: %v", err)
+	}
+	payload := []byte("immutable-payload-survives-lost-ack")
+	id, _, err := pk.PutChunk(ctx, dogi.ChunkMeta{Namespace: ns, Path: "pkg/app.go", Epoch: 1}, payload)
+	if err != nil {
+		t.Fatalf("PutChunk: %v", err)
+	}
+
+	// First FlushAll stores the pack on mem, then receives a lost-ACK error.
+	if err := pk.FlushAll(ctx, 1); err == nil {
+		t.Fatalf("expected simulated lost-ACK error on first FlushAll")
+	}
+	// Retry FlushAll: backend returns ErrConflict for the same key; Packer must
+	// reconcile the byte-identical stored pack and seal without wedging.
+	if err := pk.FlushAll(ctx, 1); err != nil {
+		t.Fatalf("retry FlushAll after lost ACK failed: %v", err)
+	}
+	if err := pk.CheckAccountingInvariant(); err != nil {
+		t.Fatalf("CheckAccountingInvariant: %v", err)
+	}
+	if err := pk.VerifyAllLive(ctx, map[string][32]byte{"pkg/app.go": id}); err != nil {
+		t.Fatalf("VerifyAllLive after lost-ACK reconciliation: %v", err)
+	}
+}
+
+type blockingGetRangeBackend struct {
+	backend.Backend
+	mu        sync.Mutex
+	intercept bool
+	entered   chan struct{}
+	release   chan struct{}
+}
+
+func (b *blockingGetRangeBackend) GetRange(ctx context.Context, key string, off, length int64) ([]byte, error) {
+	b.mu.Lock()
+	shouldBlock := b.intercept
+	if shouldBlock {
+		b.intercept = false
+	}
+	b.mu.Unlock()
+	if shouldBlock {
+		close(b.entered)
+		<-b.release
+	}
+	return b.Backend.GetRange(ctx, key, off, length)
+}
+
+// TestReadPathRetriesAcrossConcurrentGCRelocation reproduces a ReadPath pausing
+// right before GetRange while Collect relocates the still-live chunk and deletes
+// its old sealed pack; ReadPath must retry transparently instead of returning
+// spurious ErrCorruptPack.
+func TestReadPathRetriesAcrossConcurrentGCRelocation(t *testing.T) {
+	ctx := context.Background()
+	mem := storetest.NewMem()
+	be := &blockingGetRangeBackend{
+		Backend: mem,
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	ns := dogi.Namespace{TenantID: "race-tenant", VolumeID: "race-vol"}
+	pk, err := dogi.NewPacker(be, dogi.Config{
+		Namespace:            ns,
+		Policy:               dogi.PolicyFIFOMixed,
+		PackTargetBytes:      16 << 10,
+		GCDeadRatioThreshold: 0.50,
+	})
+	if err != nil {
+		t.Fatalf("NewPacker: %v", err)
+	}
+
+	rng := rand.New(rand.NewSource(77))
+	keepPayload := deterministicPayload(rng, "pkg/keep.go", 2048)
+	keepID, _, err := pk.PutChunk(ctx, dogi.ChunkMeta{Namespace: ns, Path: "pkg/keep.go", Epoch: 1}, keepPayload)
+	if err != nil {
+		t.Fatalf("PutChunk keep: %v", err)
+	}
+	for i := 0; i < 4; i++ {
+		p := fmt.Sprintf("tmp/dead_%d.o", i)
+		if _, _, err := pk.PutChunk(ctx, dogi.ChunkMeta{Namespace: ns, Path: p, Epoch: 1}, deterministicPayload(rng, p, 2048)); err != nil {
+			t.Fatalf("PutChunk dead: %v", err)
+		}
+	}
+	if err := pk.FlushAll(ctx, 1); err != nil {
+		t.Fatalf("FlushAll: %v", err)
+	}
+	for i := 0; i < 4; i++ {
+		_, _ = pk.DeletePath(fmt.Sprintf("tmp/dead_%d.o", i), 2)
+	}
+
+	// Arm interceptor so ReadPath pauses right before GetRange on the old sealed pack.
+	be.mu.Lock()
+	be.intercept = true
+	be.mu.Unlock()
+
+	type readRes struct {
+		data []byte
+		id   [32]byte
+		err  error
+	}
+	resCh := make(chan readRes, 1)
+	go func() {
+		d, id, err := pk.ReadPath(ctx, "pkg/keep.go")
+		resCh <- readRes{data: d, id: id, err: err}
+	}()
+
+	// Wait until ReadPath has captured the old pack key and paused before GetRange.
+	<-be.entered
+
+	// Run GC Collect to relocate pkg/keep.go to a fresh pack and delete the old pack.
+	stats, err := pk.Collect(ctx, 2)
+	if err != nil {
+		t.Fatalf("Collect during concurrent ReadPath: %v", err)
+	}
+	if stats.CompactedPacks != 1 || stats.LiveCopyChunks != 1 {
+		t.Fatalf("expected 1 compacted pack and 1 relocated chunk, got %+v", stats)
+	}
+
+	// Resume ReadPath: its initial GetRange hits ErrNotFound on the deleted old pack
+	// and must transparently retry against the relocated live record.
+	close(be.release)
+	res := <-resCh
+	if res.err != nil {
+		t.Fatalf("ReadPath across concurrent GC relocation failed: %v", res.err)
+	}
+	if res.id != keepID || !bytes.Equal(res.data, keepPayload) {
+		t.Fatalf("ReadPath returned wrong payload after concurrent GC relocation")
+	}
+}
+
+// TestPutChunkRollsBackAtomicallyOnUploadError verifies that when PutChunk crosses
+// PackTargetBytes and its automatic upload fails, both the stream buffer and live
+// index are rolled back atomically so CheckAccountingInvariant and subsequent
+// retries stay completely consistent.
+func TestPutChunkRollsBackAtomicallyOnUploadError(t *testing.T) {
+	ctx := context.Background()
+	mem := storetest.NewMem()
+	var mu sync.Mutex
+	failNextPut := true
+	be := &storetest.Hook{
+		Backend: mem,
+		Before: func(op, key string) error {
+			if op != "putabsent" {
+				return nil
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if failNextPut {
+				failNextPut = false
+				return errors.New("injected backend put failure")
+			}
+			return nil
+		},
+	}
+
+	ns := dogi.Namespace{TenantID: "rb-tenant", VolumeID: "rb-vol"}
+	pk, err := dogi.NewPacker(be, dogi.Config{
+		Namespace:       ns,
+		Policy:          dogi.PolicyDOGILifetime,
+		PackTargetBytes: 4 << 10, // Minimum pack size (4 KiB)
+	})
+	if err != nil {
+		t.Fatalf("NewPacker: %v", err)
+	}
+
+	payload := bytes.Repeat([]byte("A"), 5<<10) // Crosses 4 KiB threshold immediately.
+	if _, _, err := pk.PutChunk(ctx, dogi.ChunkMeta{Namespace: ns, Path: "pkg/big.bin", Epoch: 1}, payload); err == nil {
+		t.Fatalf("expected injected upload failure on PutChunk")
+	}
+	if err := pk.CheckAccountingInvariant(); err != nil {
+		t.Fatalf("accounting invariant broken after failed PutChunk: %v", err)
+	}
+	if m := pk.SnapshotMetrics(); m.LiveBytes != 0 || m.LiveChunks != 0 {
+		t.Fatalf("expected 0 live bytes/chunks after rolled-back PutChunk, got bytes=%d chunks=%d", m.LiveBytes, m.LiveChunks)
+	}
+
+	// Retry the exact same PutChunk now that the backend has recovered.
+	id, _, err := pk.PutChunk(ctx, dogi.ChunkMeta{Namespace: ns, Path: "pkg/big.bin", Epoch: 1}, payload)
+	if err != nil {
+		t.Fatalf("retry PutChunk failed: %v", err)
+	}
+	if err := pk.CheckAccountingInvariant(); err != nil {
+		t.Fatalf("accounting invariant broken after retry PutChunk: %v", err)
+	}
+	if m := pk.SnapshotMetrics(); m.LiveBytes != int64(len(payload)) || m.LiveChunks != 1 {
+		t.Fatalf("unexpected live accounting after retry: bytes=%d chunks=%d", m.LiveBytes, m.LiveChunks)
+	}
+	if err := pk.VerifyAllLive(ctx, map[string][32]byte{"pkg/big.bin": id}); err != nil {
+		t.Fatalf("VerifyAllLive after retry: %v", err)
+	}
+
+	// Also verify overwrite rollback keeps the previous live version intact.
+	mu.Lock()
+	failNextPut = true
+	mu.Unlock()
+	payload2 := bytes.Repeat([]byte("B"), 5<<10)
+	if _, _, err := pk.PutChunk(ctx, dogi.ChunkMeta{Namespace: ns, Path: "pkg/big.bin", Epoch: 2}, payload2); err == nil {
+		t.Fatalf("expected injected upload failure on overwrite PutChunk")
+	}
+	if err := pk.CheckAccountingInvariant(); err != nil {
+		t.Fatalf("accounting invariant broken after failed overwrite: %v", err)
+	}
+	if err := pk.VerifyAllLive(ctx, map[string][32]byte{"pkg/big.bin": id}); err != nil {
+		t.Fatalf("previous live chunk lost after failed overwrite: %v", err)
+	}
+}
+
+// TestDeterministicGCOrderIndependentOfRandomPackIDs verifies that repeated runs
+// of identical workloads produce identical GC LiveCopyBytes and PacksUploaded
+// even though pack storage keys use fresh crypto/rand IDs.
+func TestDeterministicGCOrderIndependentOfRandomPackIDs(t *testing.T) {
+	ctx := context.Background()
+	runOnce := func() dogi.Metrics {
+		mem := storetest.NewMem()
+		ns := dogi.Namespace{TenantID: "det", VolumeID: "v"}
+		pk, err := dogi.NewPacker(mem, dogi.Config{
+			Namespace:            ns,
+			Policy:               dogi.PolicyDOGILifetime,
+			PackTargetBytes:      32 << 10,
+			GCDeadRatioThreshold: 0.40,
+		})
+		if err != nil {
+			t.Fatalf("NewPacker: %v", err)
+		}
+		rng := rand.New(rand.NewSource(1345))
+		type liveItem struct {
+			path       string
+			deathEpoch uint64
+		}
+		var items []liveItem
+		for ep := uint64(0); ep < 10; ep++ {
+			var kept []liveItem
+			for _, it := range items {
+				if it.deathEpoch <= ep {
+					_, _ = pk.DeletePath(it.path, ep)
+				} else {
+					kept = append(kept, it)
+				}
+			}
+			items = kept
+			for i := 0; i < 12; i++ {
+				p := fmt.Sprintf("ws/d%d/f_%d_%d.dat", i%3, ep, i)
+				ttl := uint64(1 + rng.Intn(4))
+				if _, _, err := pk.PutChunk(ctx, dogi.ChunkMeta{Namespace: ns, Path: p, Epoch: ep}, deterministicPayload(rng, p, 4<<10)); err != nil {
+					t.Fatalf("PutChunk: %v", err)
+				}
+				items = append(items, liveItem{path: p, deathEpoch: ep + ttl})
+			}
+			if err := pk.FlushAll(ctx, ep); err != nil {
+				t.Fatalf("FlushAll: %v", err)
+			}
+			st, err := pk.Collect(ctx, ep)
+			if err != nil {
+				t.Fatalf("Collect: %v", err)
+			}
+			pk.AdvanceEpoch(ep, st)
+		}
+		return pk.SnapshotMetrics()
+	}
+
+	m1 := runOnce()
+	m2 := runOnce()
+	m3 := runOnce()
+	if m1.LiveCopyBytes != m2.LiveCopyBytes || m1.LiveCopyBytes != m3.LiveCopyBytes ||
+		m1.PacksUploaded != m2.PacksUploaded || m1.PacksUploaded != m3.PacksUploaded ||
+		m1.CompactedPacks != m2.CompactedPacks || m1.CompactedPacks != m3.CompactedPacks {
+		t.Fatalf("GC metrics varied across identical-seed runs: m1=%+v m2=%+v m3=%+v", m1, m2, m3)
+	}
+}
