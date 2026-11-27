@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -321,6 +322,7 @@ func buildPlan(
 	}
 	outs := make([]shardOut, nShards)
 
+	scopePrefix := TenantScopePrefix(target.TenantID, target.VolumeID) + "/"
 	var wg sync.WaitGroup
 	for s := 0; s < nShards; s++ {
 		wg.Add(1)
@@ -352,6 +354,11 @@ func buildPlan(
 					if ch.PackKey == "" || ch.PackLength <= 0 {
 						outs[shardIdx].err = fmt.Errorf("%w: missing remote pack location for chunk %s in %q",
 							ErrCorruptCheckpoint, ch.Digest.Hex(), f.Path)
+						return
+					}
+					if !strings.HasPrefix(ch.PackKey, scopePrefix) {
+						outs[shardIdx].err = fmt.Errorf("%w: remote pack key %q outside target namespace %s",
+							ErrTenantIsolation, ch.PackKey, scopePrefix)
 						return
 					}
 					remote = append(remote, remoteRef{

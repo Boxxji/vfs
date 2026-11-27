@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io/fs"
 	"math/bits"
@@ -179,19 +180,6 @@ func TenantScopePrefix(tenantID, volumeID string) string {
 	th := blake3.Sum256([]byte("parasync-tenant:" + tenantID))
 	vh := blake3.Sum256([]byte("parasync-volume:" + volumeID))
 	return "t-" + hex.EncodeToString(th[:8]) + "/v-" + hex.EncodeToString(vh[:8])
-}
-
-func makePackKey(tenantID, volumeID, ckptID string, packIndex int) (string, error) {
-	ch := blake3.Sum256([]byte("parasync-ckpt:" + ckptID))
-	key := fmt.Sprintf("%s/pack/%s-%04d",
-		TenantScopePrefix(tenantID, volumeID),
-		hex.EncodeToString(ch[:6]),
-		packIndex,
-	)
-	if err := backend.ValidKey(key); err != nil {
-		return "", err
-	}
-	return key, nil
 }
 
 // sealChunkFrame encodes a chunk for storage in a remote pack. When cipher is
@@ -410,43 +398,94 @@ func PublishCheckpoint(ctx context.Context, dir string, store backend.Backend, m
 		entry FileEntry
 		data  []byte
 	}
-	results := make([]fileResult, len(scanned))
-
-	runCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	jobs := make(chan int, len(scanned))
-	for i := range scanned {
-		jobs <- i
+	type packLoc struct {
+		key string
+		off int64
+		len int64
 	}
-	close(jobs)
-
-	var (
-		wg       sync.WaitGroup
-		firstErr error
-		errOnce  sync.Once
-	)
-	setErr := func(e error) {
-		errOnce.Do(func() {
-			firstErr = e
-			cancel()
-		})
+	type pendingRef struct {
+		fileIdx  int
+		chunkIdx int
 	}
 
 	nWorkers := opts.Workers
-	if nWorkers > len(scanned) && len(scanned) > 0 {
-		nWorkers = len(scanned)
+	if nWorkers < 1 {
+		nWorkers = 1
 	}
-	for w := 0; w < nWorkers; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for idx := range jobs {
+
+	entries := make([]FileEntry, len(scanned))
+	locByDigest := make(map[Digest]*packLoc)
+
+	var (
+		packBuf     bytes.Buffer
+		curPackLocs []*packLoc
+		curPackRefs []pendingRef
+	)
+	flushPack := func() error {
+		if packBuf.Len() == 0 {
+			return nil
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		payload := append([]byte(nil), packBuf.Bytes()...)
+		packDigest := SumDigest(payload)
+		packHex := packDigest.Hex()
+		key := fmt.Sprintf("%s/pack/%s/%s", TenantScopePrefix(meta.TenantID, meta.VolumeID), packHex[:2], packHex)
+		if err := backend.ValidKey(key); err != nil {
+			return err
+		}
+		if _, err := store.PutIfAbsent(ctx, key, payload); err != nil && !errors.Is(err, backend.ErrConflict) {
+			return fmt.Errorf("parasync: put immutable pack %s: %w", key, err)
+		}
+		for _, loc := range curPackLocs {
+			loc.key = key
+		}
+		for _, ref := range curPackRefs {
+			entries[ref.fileIdx].Chunks[ref.chunkIdx].PackKey = key
+		}
+		packBuf.Reset()
+		curPackLocs = curPackLocs[:0]
+		curPackRefs = curPackRefs[:0]
+		return nil
+	}
+
+	// Stream files in bounded parallel batches of size nWorkers so retained
+	// payload memory scales with O(workers * file_size + PackMaxBytes) rather
+	// than total checkpoint size.
+	for batchStart := 0; batchStart < len(scanned); batchStart += nWorkers {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		batchEnd := batchStart + nWorkers
+		if batchEnd > len(scanned) {
+			batchEnd = len(scanned)
+		}
+		batchLen := batchEnd - batchStart
+		batchResults := make([]fileResult, batchLen)
+
+		runCtx, cancel := context.WithCancel(ctx)
+		var (
+			wg       sync.WaitGroup
+			firstErr error
+			errOnce  sync.Once
+		)
+		setErr := func(e error) {
+			errOnce.Do(func() {
+				firstErr = e
+				cancel()
+			})
+		}
+
+		for bi := 0; bi < batchLen; bi++ {
+			wg.Add(1)
+			go func(localIdx, globalIdx int) {
+				defer wg.Done()
 				if runCtx.Err() != nil {
 					setErr(runCtx.Err())
 					return
 				}
-				sf := scanned[idx]
+				sf := scanned[globalIdx]
 				data, err := os.ReadFile(sf.absPath)
 				if err != nil {
 					setErr(fmt.Errorf("parasync: read %s: %w", sf.relPath, err))
@@ -461,7 +500,7 @@ func PublishCheckpoint(ctx context.Context, dir string, store backend.Backend, m
 						Digest: sp.Digest,
 					}
 				}
-				results[idx] = fileResult{
+				batchResults[localIdx] = fileResult{
 					entry: FileEntry{
 						Path:       sf.relPath,
 						Size:       int64(len(data)),
@@ -471,92 +510,53 @@ func PublishCheckpoint(ctx context.Context, dir string, store backend.Backend, m
 					},
 					data: data,
 				}
-			}
-		}()
-	}
-	wg.Wait()
-	if firstErr != nil {
-		return nil, firstErr
-	}
+			}(bi, batchStart+bi)
+		}
+		wg.Wait()
+		cancel()
+		if firstErr != nil {
+			return nil, firstErr
+		}
 
-	// Deduplicate and pack unique chunks into immutable pack objects in store.
-	type packLoc struct {
-		key string
-		off int64
-		len int64
-	}
-	locByDigest := make(map[Digest]packLoc)
-
-	var (
-		packBuf bytes.Buffer
-		packIdx int
-		curKey  string
-	)
-	openNewPack := func() error {
-		k, err := makePackKey(meta.TenantID, meta.VolumeID, meta.ID, packIdx)
-		if err != nil {
-			return err
-		}
-		curKey = k
-		packIdx++
-		packBuf.Reset()
-		return nil
-	}
-	flushPack := func() error {
-		if packBuf.Len() == 0 {
-			return nil
-		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		payload := append([]byte(nil), packBuf.Bytes()...)
-		if err := store.Put(ctx, curKey, payload); err != nil {
-			return fmt.Errorf("parasync: put pack %s: %w", curKey, err)
-		}
-		packBuf.Reset()
-		return nil
-	}
-
-	entries := make([]FileEntry, len(results))
-	for i := range results {
-		fe := results[i].entry
-		data := results[i].data
-		for j := range fe.Chunks {
-			ch := &fe.Chunks[j]
-			if loc, ok := locByDigest[ch.Digest]; ok {
-				ch.PackKey = loc.key
+		for bi := 0; bi < batchLen; bi++ {
+			fileIdx := batchStart + bi
+			fe := batchResults[bi].entry
+			data := batchResults[bi].data
+			entries[fileIdx] = fe
+			for j := range entries[fileIdx].Chunks {
+				ch := &entries[fileIdx].Chunks[j]
+				if loc, ok := locByDigest[ch.Digest]; ok {
+					ch.PackOffset = loc.off
+					ch.PackLength = loc.len
+					if loc.key != "" {
+						ch.PackKey = loc.key
+					} else {
+						curPackRefs = append(curPackRefs, pendingRef{fileIdx: fileIdx, chunkIdx: j})
+					}
+					continue
+				}
+				plain := data[ch.Offset : ch.Offset+ch.Length]
+				frame, err := sealChunkFrame(opts.Cipher, plain)
+				if err != nil {
+					return nil, err
+				}
+				if int64(packBuf.Len()) > 0 && int64(packBuf.Len())+int64(len(frame)) > opts.PackMaxBytes {
+					if err := flushPack(); err != nil {
+						return nil, err
+					}
+				}
+				off := int64(packBuf.Len())
+				packBuf.Write(frame)
+				loc := &packLoc{off: off, len: int64(len(frame))}
+				locByDigest[ch.Digest] = loc
+				curPackLocs = append(curPackLocs, loc)
+				curPackRefs = append(curPackRefs, pendingRef{fileIdx: fileIdx, chunkIdx: j})
 				ch.PackOffset = loc.off
 				ch.PackLength = loc.len
-				continue
 			}
-			plain := data[ch.Offset : ch.Offset+ch.Length]
-			frame, err := sealChunkFrame(opts.Cipher, plain)
-			if err != nil {
-				return nil, err
-			}
-			if curKey == "" {
-				if err := openNewPack(); err != nil {
-					return nil, err
-				}
-			} else if int64(packBuf.Len()) > 0 && int64(packBuf.Len())+int64(len(frame)) > opts.PackMaxBytes {
-				if err := flushPack(); err != nil {
-					return nil, err
-				}
-				if err := openNewPack(); err != nil {
-					return nil, err
-				}
-			}
-			off := int64(packBuf.Len())
-			packBuf.Write(frame)
-			loc := packLoc{key: curKey, off: off, len: int64(len(frame))}
-			locByDigest[ch.Digest] = loc
-			ch.PackKey = loc.key
-			ch.PackOffset = loc.off
-			ch.PackLength = loc.len
+			// Release file buffer immediately after packing.
+			batchResults[bi].data = nil
 		}
-		entries[i] = fe
-		// Release file data once packed.
-		results[i].data = nil
 	}
 	if err := flushPack(); err != nil {
 		return nil, err

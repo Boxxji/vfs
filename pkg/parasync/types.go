@@ -271,6 +271,7 @@ func (c *Checkpoint) ValidateStructure() error {
 	if err := c.Chunking.Validate(); err != nil {
 		return err
 	}
+	scopePrefix := TenantScopePrefix(c.TenantID, c.VolumeID) + "/"
 	seen := make(map[string]struct{}, len(c.Files))
 	for i := range c.Files {
 		f := &c.Files[i]
@@ -291,6 +292,10 @@ func (c *Checkpoint) ValidateStructure() error {
 				return fmt.Errorf("%w: invalid chunk %d in %q (off=%d want=%d len=%d)",
 					ErrCorruptCheckpoint, j, f.Path, ch.Offset, off, ch.Length)
 			}
+			if ch.PackKey != "" && !strings.HasPrefix(ch.PackKey, scopePrefix) {
+				return fmt.Errorf("%w: pack key %q outside checkpoint namespace %s",
+					ErrTenantIsolation, ch.PackKey, scopePrefix)
+			}
 			off += ch.Length
 		}
 		if off != f.Size {
@@ -308,10 +313,10 @@ func (c *Checkpoint) ValidateStructure() error {
 
 // ComputeRootDigest computes the domain-separated BLAKE3-256 digest committing
 // to the checkpoint's security scope, chunking parameters, and complete file
-// and chunk manifest.
+// and chunk manifest (including remote pack locators).
 func ComputeRootDigest(c *Checkpoint) Digest {
 	h := blake3.New()
-	writeLenStr(h, "hanzoai/vfs/parasync/root-v1")
+	writeLenStr(h, "hanzoai/vfs/parasync/root-v2")
 	writeLenStr(h, c.TenantID)
 	writeLenStr(h, c.VolumeID)
 	writeLenStr(h, c.CipherSuiteID)
@@ -334,6 +339,9 @@ func ComputeRootDigest(c *Checkpoint) Digest {
 			writeU64(h, uint64(ch.Offset))
 			writeU64(h, uint64(ch.Length))
 			_, _ = h.Write(ch.Digest[:])
+			writeLenStr(h, ch.PackKey)
+			writeU64(h, uint64(ch.PackOffset))
+			writeU64(h, uint64(ch.PackLength))
 		}
 	}
 	var out Digest

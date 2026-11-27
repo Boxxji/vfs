@@ -11,6 +11,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -618,22 +620,10 @@ func Restore(
 		return nil, err
 	}
 
-	// Atomic commit: rename each verified staged file into destDir.
+	// Atomic, symlink-confined transactional commit + obsolete-file reconciliation.
 	commitStart := time.Now()
-	for i := range target.Files {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		finalPath := filepath.Join(destDir, filepath.FromSlash(target.Files[i].Path))
-		if err := os.MkdirAll(filepath.Dir(finalPath), 0o755); err != nil {
-			return nil, fmt.Errorf("parasync: mkdir destination parent for %s: %w", target.Files[i].Path, err)
-		}
-		if err := os.Rename(pool.paths[i], finalPath); err != nil {
-			return nil, fmt.Errorf("parasync: atomic rename %s: %w", target.Files[i].Path, err)
-		}
-		if target.Files[i].Mode != 0 {
-			_ = os.Chmod(finalPath, fs.FileMode(target.Files[i].Mode))
-		}
+	if err := commitStagedTree(ctx, destDir, pool.paths, target.Files); err != nil {
+		return nil, err
 	}
 	commitDur := time.Since(commitStart)
 
@@ -795,4 +785,227 @@ func verifyStagedFiles(ctx context.Context, stagedPaths []string, files []FileEn
 	}
 	wg.Wait()
 	return firstErr
+}
+
+func isParasyncInternalDir(name string) bool {
+	return strings.HasPrefix(name, ".parasync-stage-") || strings.HasPrefix(name, ".parasync-backup-")
+}
+
+// commitStagedTree atomically commits all verified staged files into destDir
+// while enforcing symlink confinement (never traversing symlinks beneath destDir),
+// rolling back all changes on error or cancellation, and reconciling obsolete
+// files absent from the target checkpoint.
+func commitStagedTree(ctx context.Context, destDir string, stagedPaths []string, files []FileEntry) error {
+	fi, err := os.Lstat(destDir)
+	if err != nil {
+		return fmt.Errorf("parasync: lstat destDir: %w", err)
+	}
+	if fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
+		return fmt.Errorf("%w: destination root %q must be a real directory", ErrInvalidPath, destDir)
+	}
+
+	targetSet := make(map[string]struct{}, len(files))
+	targetAncestors := make(map[string]struct{}, len(files))
+
+	// Phase 1: Pre-flight symlink confinement and path-type conflict validation
+	// before mutating any existing destination file.
+	for i := range files {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		rel := files[i].Path
+		targetSet[rel] = struct{}{}
+		segs := strings.Split(rel, "/")
+		cur := destDir
+		for si, seg := range segs {
+			cur = filepath.Join(cur, seg)
+			isLeaf := si == len(segs)-1
+			if !isLeaf {
+				targetAncestors[strings.Join(segs[:si+1], "/")] = struct{}{}
+			}
+			info, lerr := os.Lstat(cur)
+			if lerr != nil {
+				if os.IsNotExist(lerr) {
+					break
+				}
+				return fmt.Errorf("parasync: lstat %q: %w", rel, lerr)
+			}
+			if info.Mode()&os.ModeSymlink != 0 {
+				return fmt.Errorf("%w: symlink traversal blocked at %q", ErrInvalidPath, strings.Join(segs[:si+1], "/"))
+			}
+			if !isLeaf && !info.IsDir() {
+				return fmt.Errorf("%w: non-directory ancestor %q blocks %q", ErrInvalidPath, strings.Join(segs[:si+1], "/"), rel)
+			}
+			if isLeaf && info.IsDir() {
+				return fmt.Errorf("parasync: destination %q is an existing directory", rel)
+			}
+		}
+	}
+
+	// Phase 2: Collect existing non-target regular files to reconcile (never following symlinks).
+	var obsoleteFiles []string
+	var candidateDirs []string
+	var walkErr error
+	var scanDir func(absDir, relPrefix string)
+	scanDir = func(absDir, relPrefix string) {
+		if walkErr != nil {
+			return
+		}
+		entries, rerr := os.ReadDir(absDir)
+		if rerr != nil {
+			walkErr = rerr
+			return
+		}
+		for _, de := range entries {
+			name := de.Name()
+			if relPrefix == "" && isParasyncInternalDir(name) {
+				continue
+			}
+			rel := name
+			if relPrefix != "" {
+				rel = relPrefix + "/" + name
+			}
+			abs := filepath.Join(absDir, name)
+			info, lerr := os.Lstat(abs)
+			if lerr != nil {
+				walkErr = lerr
+				return
+			}
+			if info.Mode()&os.ModeSymlink != 0 {
+				// Do not traverse symlinks; leave untouched unless targeted (already blocked above).
+				continue
+			}
+			if info.IsDir() {
+				scanDir(abs, rel)
+				if _, keep := targetAncestors[rel]; !keep {
+					candidateDirs = append(candidateDirs, rel)
+				}
+				continue
+			}
+			if _, keep := targetSet[rel]; !keep {
+				obsoleteFiles = append(obsoleteFiles, rel)
+			}
+		}
+	}
+	scanDir(destDir, "")
+	if walkErr != nil {
+		return fmt.Errorf("parasync: scan destination for reconciliation: %w", walkErr)
+	}
+
+	// Phase 3: Transactional backup, install, and obsolete removal with full rollback on error.
+	backupDir, err := os.MkdirTemp(destDir, ".parasync-backup-*")
+	if err != nil {
+		return fmt.Errorf("parasync: create backup dir: %w", err)
+	}
+	defer os.RemoveAll(backupDir)
+
+	type movedBackup struct {
+		origAbs   string
+		backupAbs string
+	}
+	var backups []movedBackup
+	var newlyPlaced []string
+	var createdDirs []string
+	backupSeq := 0
+
+	rollback := func() {
+		for i := len(newlyPlaced) - 1; i >= 0; i-- {
+			_ = os.Remove(newlyPlaced[i])
+		}
+		for i := len(backups) - 1; i >= 0; i-- {
+			_ = os.Rename(backups[i].backupAbs, backups[i].origAbs)
+		}
+		for i := len(createdDirs) - 1; i >= 0; i-- {
+			_ = os.Remove(createdDirs[i])
+		}
+	}
+
+	moveToBackup := func(origAbs string) error {
+		backupSeq++
+		bakAbs := filepath.Join(backupDir, fmt.Sprintf("bak-%06d", backupSeq))
+		if err := os.Rename(origAbs, bakAbs); err != nil {
+			return err
+		}
+		backups = append(backups, movedBackup{origAbs: origAbs, backupAbs: bakAbs})
+		return nil
+	}
+
+	// Step A: Move obsolete files aside into backupDir so rollback restores them cleanly.
+	for _, rel := range obsoleteFiles {
+		if err := ctx.Err(); err != nil {
+			rollback()
+			return err
+		}
+		if err := moveToBackup(filepath.Join(destDir, filepath.FromSlash(rel))); err != nil {
+			rollback()
+			return fmt.Errorf("parasync: remove obsolete %s: %w", rel, err)
+		}
+	}
+
+	// Step B: Create missing parent directories safely (no symlinks) and swap staged files in.
+	for i := range files {
+		if err := ctx.Err(); err != nil {
+			rollback()
+			return err
+		}
+		segs := strings.Split(files[i].Path, "/")
+		cur := destDir
+		for si := 0; si < len(segs)-1; si++ {
+			cur = filepath.Join(cur, segs[si])
+			info, lerr := os.Lstat(cur)
+			if lerr != nil {
+				if !os.IsNotExist(lerr) {
+					rollback()
+					return fmt.Errorf("parasync: lstat parent %s: %w", files[i].Path, lerr)
+				}
+				if mkErr := os.Mkdir(cur, 0o755); mkErr != nil {
+					rollback()
+					return fmt.Errorf("parasync: mkdir parent %s: %w", files[i].Path, mkErr)
+				}
+				createdDirs = append(createdDirs, cur)
+				continue
+			}
+			if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+				rollback()
+				return fmt.Errorf("%w: unsafe parent during commit %q", ErrInvalidPath, files[i].Path)
+			}
+		}
+
+		finalPath := filepath.Join(destDir, filepath.FromSlash(files[i].Path))
+		hadExisting := false
+		if info, lerr := os.Lstat(finalPath); lerr == nil {
+			if info.Mode()&os.ModeSymlink != 0 || info.IsDir() {
+				rollback()
+				return fmt.Errorf("%w: unsafe target during commit %q", ErrInvalidPath, files[i].Path)
+			}
+			if err := moveToBackup(finalPath); err != nil {
+				rollback()
+				return fmt.Errorf("parasync: backup existing %s: %w", files[i].Path, err)
+			}
+			hadExisting = true
+		} else if !os.IsNotExist(lerr) {
+			rollback()
+			return fmt.Errorf("parasync: lstat target %s: %w", files[i].Path, lerr)
+		}
+
+		if err := os.Rename(stagedPaths[i], finalPath); err != nil {
+			rollback()
+			return fmt.Errorf("parasync: atomic rename %s: %w", files[i].Path, err)
+		}
+		if !hadExisting {
+			newlyPlaced = append(newlyPlaced, finalPath)
+		}
+		if files[i].Mode != 0 {
+			_ = os.Chmod(finalPath, fs.FileMode(files[i].Mode))
+		}
+	}
+
+	// Step C: Prune now-empty obsolete directories (deepest first).
+	sort.Slice(candidateDirs, func(i, j int) bool {
+		return len(candidateDirs[i]) > len(candidateDirs[j])
+	})
+	for _, rel := range candidateDirs {
+		_ = os.Remove(filepath.Join(destDir, filepath.FromSlash(rel)))
+	}
+	return nil
 }

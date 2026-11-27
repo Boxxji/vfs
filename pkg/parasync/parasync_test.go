@@ -970,3 +970,221 @@ func TestNegativeRegimeUnrelatedBaseZeroOverlap(t *testing.T) {
 	}
 	assertTreeEquals(t, restoreDir, dstFiles)
 }
+
+func TestCodexP1SymlinkTraversalBlockedOnCommit(t *testing.T) {
+	ctx := context.Background()
+	store := openFileStore(t)
+	srcDir := t.TempDir()
+	dstDir := t.TempDir()
+	outsideDir := t.TempDir()
+
+	writeTree(t, dstDir, map[string][]byte{
+		"link/escape.txt": []byte("must-never-escape"),
+	})
+	meta := parasync.CheckpointMeta{ID: "sym-1", TenantID: "t1", VolumeID: "v1", CipherSuiteID: "plain-v1"}
+	cfg := parasync.DefaultFastCDCConfig(testSeed(91))
+	target, err := parasync.PublishCheckpoint(ctx, dstDir, store, meta, cfg, parasync.PublishOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	restoreDir := t.TempDir()
+	if err := os.Symlink(outsideDir, filepath.Join(restoreDir, "link")); err != nil {
+		t.Fatalf("create symlink: %v", err)
+	}
+	_, err = parasync.Restore(ctx, store, nil, srcDir, target, restoreDir, parasync.RestoreOptions{SkipDelta: true, Workers: 2})
+	if !errors.Is(err, parasync.ErrInvalidPath) {
+		t.Fatalf("expected ErrInvalidPath blocking symlink traversal, got %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(outsideDir, "escape.txt")); !os.IsNotExist(statErr) {
+		t.Fatalf("file escaped into outsideDir via symlink!")
+	}
+}
+
+func TestCodexP1AtomicCommitRollbackOnDirectoryConflict(t *testing.T) {
+	ctx := context.Background()
+	store := openFileStore(t)
+	dstDir := t.TempDir()
+
+	writeTree(t, dstDir, map[string][]byte{
+		"a.bin": []byte("new-version-a"),
+		"b.bin": []byte("new-version-b"),
+	})
+	meta := parasync.CheckpointMeta{ID: "atom-1", TenantID: "t1", VolumeID: "v1", CipherSuiteID: "plain-v1"}
+	cfg := parasync.DefaultFastCDCConfig(testSeed(92))
+	target, err := parasync.PublishCheckpoint(ctx, dstDir, store, meta, cfg, parasync.PublishOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	restoreDir := t.TempDir()
+	origA := []byte("original-untouched-a")
+	writeTree(t, restoreDir, map[string][]byte{"a.bin": origA})
+	// Create an existing directory at destDir/b.bin to force commit conflict.
+	if err := os.Mkdir(filepath.Join(restoreDir, "b.bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := parasync.Restore(ctx, store, nil, "", target, restoreDir, parasync.RestoreOptions{SkipDelta: true, Workers: 2}); err == nil {
+		t.Fatalf("expected restore error when destination path is an existing directory")
+	}
+	gotA, err := os.ReadFile(filepath.Join(restoreDir, "a.bin"))
+	if err != nil {
+		t.Fatalf("original a.bin missing after failed commit: %v", err)
+	}
+	if !bytes.Equal(gotA, origA) {
+		t.Fatalf("atomic rollback violated: a.bin changed from %q to %q", origA, gotA)
+	}
+}
+
+func TestCodexP1RepublishDoesNotOverwriteExistingCheckpointPacks(t *testing.T) {
+	ctx := context.Background()
+	store := openFileStore(t)
+	dir1 := t.TempDir()
+	dir2 := t.TempDir()
+
+	files1 := map[string][]byte{"data.bin": makeDeterministicBytes(9301, 48<<10)}
+	files2 := map[string][]byte{"data.bin": makeDeterministicBytes(9302, 48<<10)}
+	writeTree(t, dir1, files1)
+	writeTree(t, dir2, files2)
+
+	// Intentionally reuse identical empty ID across two distinct publications.
+	meta := parasync.CheckpointMeta{ID: "", TenantID: "t1", VolumeID: "v1", CipherSuiteID: "plain-v1"}
+	cfg := parasync.DefaultFastCDCConfig(testSeed(93))
+	ckpt1, err := parasync.PublishCheckpoint(ctx, dir1, store, meta, cfg, parasync.PublishOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ckpt2, err := parasync.PublishCheckpoint(ctx, dir2, store, meta, cfg, parasync.PublishOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Both ckpt1 and ckpt2 MUST remain independently restorable and bit-exact!
+	r1 := t.TempDir()
+	if _, err := parasync.Restore(ctx, store, nil, "", ckpt1, r1, parasync.RestoreOptions{SkipDelta: true, Workers: 2}); err != nil {
+		t.Fatalf("ckpt1 damaged by second publication: %v", err)
+	}
+	assertTreeEquals(t, r1, files1)
+
+	r2 := t.TempDir()
+	if _, err := parasync.Restore(ctx, store, nil, "", ckpt2, r2, parasync.RestoreOptions{SkipDelta: true, Workers: 2}); err != nil {
+		t.Fatalf("ckpt2 restore failed: %v", err)
+	}
+	assertTreeEquals(t, r2, files2)
+}
+
+func TestCodexP1ForeignNamespacePackKeyRejected(t *testing.T) {
+	ctx := context.Background()
+	store := openFileStore(t)
+	dirA := t.TempDir()
+	dirB := t.TempDir()
+
+	sharedBytes := makeDeterministicBytes(9401, 32<<10)
+	writeTree(t, dirA, map[string][]byte{"f.bin": sharedBytes})
+	writeTree(t, dirB, map[string][]byte{"f.bin": sharedBytes})
+
+	cfg := parasync.DefaultFastCDCConfig(testSeed(94))
+	ckptA, err := parasync.PublishCheckpoint(ctx, dirA, store, parasync.CheckpointMeta{
+		ID: "a1", TenantID: "tenant-a", VolumeID: "vol-1", CipherSuiteID: "plain-v1",
+	}, cfg, parasync.PublishOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ckptB, err := parasync.PublishCheckpoint(ctx, dirB, store, parasync.CheckpointMeta{
+		ID: "b1", TenantID: "tenant-b", VolumeID: "vol-1", CipherSuiteID: "plain-v1",
+	}, cfg, parasync.PublishOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Redirect ckptA's remote PackKey into tenant-b's namespace and recompute RootDigest.
+	ckptA.Files[0].Chunks[0].PackKey = ckptB.Files[0].Chunks[0].PackKey
+	ckptA.RootDigest = parasync.ComputeRootDigest(ckptA)
+
+	if err := ckptA.ValidateStructure(); !errors.Is(err, parasync.ErrTenantIsolation) {
+		t.Fatalf("expected ErrTenantIsolation from ValidateStructure on foreign PackKey, got %v", err)
+	}
+	if _, err := parasync.Restore(ctx, store, nil, "", ckptA, t.TempDir(), parasync.RestoreOptions{SkipDelta: true, Workers: 2}); !errors.Is(err, parasync.ErrTenantIsolation) {
+		t.Fatalf("expected ErrTenantIsolation from Restore on foreign PackKey, got %v", err)
+	}
+}
+
+func TestCodexP2ObsoleteFilesReconciledOnInPlaceRestore(t *testing.T) {
+	ctx := context.Background()
+	store := openFileStore(t)
+	v1Dir := t.TempDir()
+	v2Dir := t.TempDir()
+	emptyDir := t.TempDir()
+
+	v1Files := map[string][]byte{
+		"a.bin":        makeDeterministicBytes(9501, 20<<10),
+		"obsolete.bin": makeDeterministicBytes(9502, 20<<10),
+		"olddir/c.bin": makeDeterministicBytes(9503, 12<<10),
+	}
+	v2Files := map[string][]byte{
+		"a.bin": makeDeterministicBytes(9501, 20<<10),
+	}
+	writeTree(t, v1Dir, v1Files)
+	writeTree(t, v2Dir, v2Files)
+
+	cfg := parasync.DefaultFastCDCConfig(testSeed(95))
+	ckptV1, err := parasync.PublishCheckpoint(ctx, v1Dir, store, parasync.CheckpointMeta{
+		ID: "rec-v1", TenantID: "t1", VolumeID: "v1", CipherSuiteID: "plain-v1",
+	}, cfg, parasync.PublishOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ckptV2, err := parasync.PublishCheckpoint(ctx, v2Dir, store, parasync.CheckpointMeta{
+		ID: "rec-v2", TenantID: "t1", VolumeID: "v1", CipherSuiteID: "plain-v1",
+	}, cfg, parasync.PublishOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ckptEmpty, err := parasync.PublishCheckpoint(ctx, emptyDir, store, parasync.CheckpointMeta{
+		ID: "rec-empty", TenantID: "t1", VolumeID: "v1", CipherSuiteID: "plain-v1",
+	}, cfg, parasync.PublishOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Switch in place (sourceDir == destDir == v1Dir) from v1 -> v2.
+	if _, err := parasync.Restore(ctx, store, ckptV1, v1Dir, ckptV2, v1Dir, parasync.RestoreOptions{Workers: 4}); err != nil {
+		t.Fatalf("in-place restore v1 -> v2 failed: %v", err)
+	}
+	assertTreeEquals(t, v1Dir, v2Files)
+	if _, err := os.Stat(filepath.Join(v1Dir, "obsolete.bin")); !os.IsNotExist(err) {
+		t.Fatalf("obsolete.bin was not removed during in-place restore")
+	}
+
+	// Restore empty checkpoint in place -> removes all remaining files.
+	if _, err := parasync.Restore(ctx, store, ckptV2, v1Dir, ckptEmpty, v1Dir, parasync.RestoreOptions{Workers: 4}); err != nil {
+		t.Fatalf("in-place restore v2 -> empty failed: %v", err)
+	}
+	assertTreeEquals(t, v1Dir, map[string][]byte{})
+}
+
+func TestCodexP2BoundedStreamingPublishMultiFile(t *testing.T) {
+	ctx := context.Background()
+	store := openFileStore(t)
+	srcDir := t.TempDir()
+
+	files := make(map[string][]byte, 12)
+	for i := 0; i < 12; i++ {
+		files[fmt.Sprintf("dir-%02d/blob-%02d.bin", i%3, i)] = makeDeterministicBytes(int64(9600+i), 24<<10)
+	}
+	writeTree(t, srcDir, files)
+
+	cfg := parasync.DefaultFastCDCConfig(testSeed(96))
+	ckpt, err := parasync.PublishCheckpoint(ctx, srcDir, store, parasync.CheckpointMeta{
+		ID: "stream-1", TenantID: "t1", VolumeID: "v1", CipherSuiteID: "plain-v1",
+	}, cfg, parasync.PublishOptions{Workers: 2, PackMaxBytes: 32 << 10})
+	if err != nil {
+		t.Fatalf("bounded streaming publish failed: %v", err)
+	}
+	restoreDir := t.TempDir()
+	if _, err := parasync.Restore(ctx, store, nil, "", ckpt, restoreDir, parasync.RestoreOptions{SkipDelta: true, Workers: 2}); err != nil {
+		t.Fatalf("restore after streaming publish failed: %v", err)
+	}
+	assertTreeEquals(t, restoreDir, files)
+}
